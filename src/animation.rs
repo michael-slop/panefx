@@ -138,6 +138,20 @@ pub trait AsciiAnimation {
     /// Advance the simulation by one frame.
     fn step(&mut self);
 
+    /// Did the last `step()` actually change what `cell_at` will return?
+    ///
+    /// Defaults to `true` (always redraw), which is always correct — an effect
+    /// that does not implement this simply gets redrawn every frame as before.
+    ///
+    /// Effects that advance on their own clock can do much better: `rain` ticks
+    /// every 55ms regardless of the panel's fps, so at 20fps roughly one frame
+    /// in ten produces an identical grid. Reporting that lets the supervisor
+    /// skip the glyph loop AND the BitBlt for every panel — and profiling shows
+    /// the renderer, not the simulation, is where the time goes.
+    fn changed(&self) -> bool {
+        true
+    }
+
     /// The glyph and colour to draw at a cell, in ONE call.
     ///
     /// Returning `None` means "draw nothing here" — the renderer skips the

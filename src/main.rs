@@ -81,6 +81,9 @@ fn main() -> anyhow::Result<()> {
     let mut sim_cols = 0usize;
     let mut sim_rows = 0usize;
 
+    // Set whenever something other than the sim changes what should be drawn:
+    // an effect switch, a param change, a config change.
+    let mut force_redraw = true;
     let mut last_poll = Instant::now();
     let mut frame_start;
 
@@ -132,6 +135,7 @@ fn main() -> anyhow::Result<()> {
         // sleep, and new render fields reach draw_animation below.
         if let Some(server) = ctl.as_mut() {
             for (peer, cmd) in server.poll() {
+                force_redraw = true;
                 let reply = handle_command(
                     cmd,
                     &mut cfg,
@@ -170,10 +174,25 @@ fn main() -> anyhow::Result<()> {
 
         // --- advance and draw ---
         if sim_cols > 0 && sim_rows > 0 {
+            let resized = sim.dimensions() != (sim_cols, sim_rows);
             sim.resize(sim_cols, sim_rows);
             sim.step();
-            for p in panels.values_mut() {
-                p.redraw(sim.as_ref(), &cfg);
+
+            // Skip the whole draw when the grid is provably unchanged. The
+            // renderer — not the simulation — is the hot path, so a skipped
+            // frame saves the glyph loop AND the BitBlt for every panel.
+            // `rain` ticks on its own 55ms clock, so ~1 frame in 10 at 20fps is
+            // identical to the last. A resize always forces a redraw, and
+            // `force_redraw` covers effect switches and param changes.
+            if resized || force_redraw || sim.changed() {
+                force_redraw = false;
+                for p in panels.values_mut() {
+                    // A panel whose terminal is on another workspace is hidden;
+                    // drawing into it is wasted work nobody can see.
+                    if p.visible {
+                        p.redraw(sim.as_ref(), &cfg);
+                    }
+                }
             }
         }
 

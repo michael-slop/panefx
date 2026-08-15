@@ -79,6 +79,9 @@ pub struct Panel {
     pub target: HWND,
     pub width: i32,
     pub height: i32,
+    /// Whether the shadowed terminal is currently displayed. A hidden panel is
+    /// not drawn at all — nobody can see it.
+    pub visible: bool,
     /// Built lazily on the first draw, then reused.
     pub gdi: Option<GdiCache>,
 }
@@ -156,6 +159,7 @@ impl Panel {
                 target,
                 width: width.max(1),
                 height: height.max(1),
+                visible: true,
                 gdi: None,
             })
         }
@@ -227,13 +231,15 @@ impl Panel {
         Ok(())
     }
 
-    pub fn show(&self) {
+    pub fn show(&mut self) {
+        self.visible = true;
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
         }
     }
 
-    pub fn hide(&self) {
+    pub fn hide(&mut self) {
+        self.visible = false;
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_HIDE);
         }

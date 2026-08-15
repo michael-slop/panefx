@@ -37,3 +37,10 @@ features = [
 [profile.release]
 opt-level = 3
 lto = true
+# LTO alone still leaves 16 codegen units for a binary; one unit lets the
+# optimiser see the whole crate and inline across module boundaries. The grid
+# loops in waves benefit most.
+codegen-units = 1
+# No unwinding tables. This is a background decoration -- if it panics it should
+# die, not try to unwind through GDI handles.
+panic = "abort"

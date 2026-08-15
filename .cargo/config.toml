@@ -1,0 +1,8 @@
+# Build for THIS machine. The f32 grid passes in waves are trivially
+# vectorisable, but without an explicit target-cpu rustc targets a baseline
+# x86-64 with no AVX2, so they compile to scalar loops.
+#
+# Note this makes the binary non-portable to older CPUs -- fine, panefx is built
+# and run on the same machine.
+[build]
+rustflags = ["-C", "target-cpu=native"]

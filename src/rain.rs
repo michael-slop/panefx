@@ -106,6 +106,9 @@ pub struct Rain {
     accum_ms: u64,
     /// Milliseconds one panel frame represents, set from the configured fps.
     frame_ms: u64,
+    /// Did the last `step()` call actually advance the rain? The 55ms tick is
+    /// independent of the panel fps, so many frames are no-ops.
+    dirty: bool,
     // ---- live-tunable parameters (defaults are the consts above) ----
     /// Rain step interval. The original is emphatic that 55ms is a deliberate
     /// stepped look, so the default stays there — but it is tunable now.
@@ -137,6 +140,7 @@ impl Rain {
             rng: Rng::new(seed),
             accum_ms: 0,
             frame_ms: 50,
+            dirty: true,
             tick_ms: TICK_MS,
             decay: DECAY,
             head: C_HEAD,
@@ -227,6 +231,7 @@ impl AsciiAnimation for Rain {
         self.glyph = vec![' '; cols * rows];
         self.bright = vec![0; cols * rows];
         self.reset_drops();
+        self.dirty = true;
     }
 
     fn dimensions(&self) -> (usize, usize) {
@@ -243,10 +248,12 @@ impl AsciiAnimation for Rain {
         //
         // Frame duration is derived from the configured fps rather than a
         // clock read, so this stays deterministic under test.
+        self.dirty = false;
         self.accum_ms += self.frame_ms;
         while self.accum_ms >= self.tick_ms {
             self.accum_ms -= self.tick_ms;
             self.advance();
+            self.dirty = true;
         }
     }
 
@@ -273,6 +280,10 @@ impl AsciiAnimation for Rain {
             )
         };
         Some((g, colour))
+    }
+
+    fn changed(&self) -> bool {
+        self.dirty
     }
 
     fn background(&self) -> Rgb {
