@@ -1,0 +1,39 @@
+[package]
+name = "panefx"
+version = "0.1.0"
+edition = "2021"
+description = "Animated backdrops pinned behind windows, following a tiling WM's layout"
+
+
+[lib]
+name = "panefx"
+path = "src/lib.rs"
+
+[[bin]]
+name = "panefx"
+path = "src/main.rs"
+
+[[bin]]
+name = "panefx-ctl"
+path = "src/bin/panefx-ctl.rs"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tungstenite = "0.24"
+ratatui = "0.29"
+crossterm = "0.28"
+
+[dependencies.windows]
+version = "0.58"
+features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_System_LibraryLoader",
+]
+
+[profile.release]
+opt-level = 3
+lto = true
