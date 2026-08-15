@@ -69,6 +69,11 @@ pub struct GdiCache {
 
     /// Scratch buffer for the current glyph run. Reused, never reallocated.
     pub run: Vec<u16>,
+    /// Per-character advances for `ExtTextOutW`, parallel to `run`.
+    pub dx: Vec<i32>,
+    /// One row of (glyph, colour), so `cell_at` runs once per cell rather than
+    /// once per colour bucket.
+    pub row_cells: Vec<Option<(char, u32)>>,
     /// Font name as a NUL-terminated UTF-16 buffer, kept alive for CreateFontW.
     pub face_utf16: Vec<u16>,
 }
