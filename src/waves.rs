@@ -36,6 +36,16 @@ pub const RAMP_SPARSE: &str = " .`',:;i!+*%#@";
 const REF_P: [f32; 7] = [0.0, 25.0, 50.0, 75.0, 90.0, 99.0, 100.0];
 const REF_L: [f32; 7] = [0.0, 4.0, 14.0, 28.0, 42.0, 71.0, 89.0];
 
+/// Lookup-table resolution for the shading and remap curves. 257 entries over
+/// [0,1] with linear interpolation between them is far finer than the 10-glyph
+/// ramp can resolve, so the output is visually identical to exact `powf`.
+const LUT_N: usize = 257;
+const LUT_LAST: f32 = (LUT_N - 1) as f32;
+
+/// Distinct ink brightnesses. Matches the Python's `--ink-steps` default of 12.
+/// Quantising is what lets the renderer batch runs — see `cell_at`.
+const INK_STEPS: usize = 12;
+
 const DEFAULT_OCTAVES: usize = 5;
 const DEFAULT_TILT: f32 = 0.62;
 const DEFAULT_SWIRL: f32 = 0.55;
@@ -54,22 +64,34 @@ pub const BACKGROUND: Rgb = Rgb(0x00, 0x00, 0x00);
 /// Clamping, not extrapolating, exactly as numpy does: values below the first
 /// knot return the first y, values above the last return the last y.
 fn interp_ref(x: f32) -> f32 {
-    let last = REF_L[REF_L.len() - 1];
-    let xs: Vec<f32> = REF_L.iter().map(|v| v / last).collect();
-    if x <= xs[0] {
+    // Knots pre-normalised as a const. This used to build a `Vec<f32>` from
+    // REF_L on EVERY CALL — and it is called once per cell, so at 143x85 that
+    // was ~12,000 malloc/free pairs per frame (~243k/sec at 20fps) to
+    // recompute a compile-time constant. It was the single most expensive line
+    // in the program.
+    const XS: [f32; 7] = [
+        0.0,
+        4.0 / 89.0,
+        14.0 / 89.0,
+        28.0 / 89.0,
+        42.0 / 89.0,
+        71.0 / 89.0,
+        1.0,
+    ];
+    if x <= XS[0] {
         return REF_P[0] / 100.0;
     }
-    if x >= xs[xs.len() - 1] {
-        return REF_P[REF_P.len() - 1] / 100.0;
+    if x >= XS[6] {
+        return REF_P[6] / 100.0;
     }
-    for k in 1..xs.len() {
-        if x <= xs[k] {
-            let d = xs[k] - xs[k - 1];
-            let f = if d.abs() < 1e-9 { 0.0 } else { (x - xs[k - 1]) / d };
+    for k in 1..XS.len() {
+        if x <= XS[k] {
+            let d = XS[k] - XS[k - 1];
+            let f = if d.abs() < 1e-9 { 0.0 } else { (x - XS[k - 1]) / d };
             return (REF_P[k - 1] + (REF_P[k] - REF_P[k - 1]) * f) / 100.0;
         }
     }
-    REF_P[REF_P.len() - 1] / 100.0
+    REF_P[6] / 100.0
 }
 
 #[inline]
@@ -146,6 +168,17 @@ pub struct Waves {
     warp_a: Vec<f32>,
     warp_b: Vec<f32>,
     ramp: Vec<char>,
+    /// `ambient + 0.46*l^0.85 + 0.62*l^2.6 + 0.80*l^5.0` sampled over [0,1].
+    /// Constant — the lobe exponents never change.
+    shade_lut: Vec<f32>,
+    /// `interp_ref -> /headroom -> ^0.88 -> ^gamma` sampled over [0,1].
+    /// Depends on `headroom` and `gamma`, so it is rebuilt when those change.
+    remap_lut: Vec<f32>,
+    lut_headroom: i64,
+    lut_gamma: i64,
+    /// Reusable scratch, so a frame allocates nothing.
+    warped: Vec<f32>,
+    lam: Vec<f32>,
     t: f32,
     frame_ms: u64,
 
@@ -181,6 +214,12 @@ impl Waves {
             } else {
                 ramp
             },
+            shade_lut: Vec::new(),
+            remap_lut: Vec::new(),
+            lut_headroom: -1,
+            lut_gamma: -1,
+            warped: Vec::new(),
+            lam: Vec::new(),
             t: 0.0,
             frame_ms: 50,
             octaves: DEFAULT_OCTAVES,
@@ -192,7 +231,36 @@ impl Waves {
             ink: INK,
         };
         w.rebuild_base();
+        w.rebuild_luts();
         w
+    }
+
+    /// Build the shading and remap curves. Called on construction and whenever
+    /// `headroom` or `gamma` changes — never per frame.
+    fn rebuild_luts(&mut self) {
+        if self.shade_lut.is_empty() {
+            self.shade_lut = (0..LUT_N)
+                .map(|i| {
+                    let l = i as f32 / LUT_LAST;
+                    0.10 + 0.46 * l.powf(0.85) + 0.62 * l.powf(2.6) + 0.80 * l.powf(5.0)
+                })
+                .collect();
+        }
+
+        let headroom = self.headroom_milli as f32 / 1000.0;
+        let gamma = (self.gamma_milli as f32 / 1000.0).max(0.05);
+        let floor = 0.055f32;
+        self.remap_lut = (0..LUT_N)
+            .map(|i| {
+                let x = i as f32 / LUT_LAST;
+                let p = interp_ref(x);
+                let lum = (p / headroom).clamp(0.0, 1.0);
+                let v = floor + (1.0 - floor) * lum.powf(0.88);
+                v.clamp(0.0, 1.0).powf(gamma)
+            })
+            .collect();
+        self.lut_headroom = self.headroom_milli;
+        self.lut_gamma = self.gamma_milli;
     }
 
     pub fn set_frame_ms(&mut self, ms: u64) {
@@ -260,6 +328,8 @@ impl Waves {
         self.warp_a = value_noise(h, w, 2.0, 77);
         self.warp_b = value_noise(h, w, 2.7, 91);
         self.lum = vec![0.0; w * h];
+        self.warped = vec![0.0; w * h];
+        self.lam = vec![0.0; w * h];
     }
 
     #[inline]
@@ -282,8 +352,18 @@ impl Waves {
         // "Small on purpose: the crests must stay put, only breathe."
         let amp_px = 0.012 * h.min(w) as f32;
 
+        // Rebuild the remap curve only if its inputs changed.
+        if self.lut_headroom != self.headroom_milli || self.lut_gamma != self.gamma_milli {
+            self.rebuild_luts();
+        }
+
         // --- warp + sample ---
-        let mut warped = vec![0.0f32; w * h];
+        // Scratch buffers, taken out and put back so the borrow checker allows
+        // &mut self methods in between. No allocation per frame.
+        let mut warped = std::mem::take(&mut self.warped);
+        let mut lam = std::mem::take(&mut self.lam);
+        if warped.len() != w * h { warped = vec![0.0f32; w * h]; }
+        if lam.len() != w * h { lam = vec![0.0f32; w * h]; }
         for y in 0..h {
             for x in 0..w {
                 let i = y * w + x;
@@ -315,7 +395,6 @@ impl Waves {
         let n = (lx * lx + ly * ly).sqrt();
         let (lx, ly) = (lx / n, ly / n);
 
-        let mut lam = vec![0.0f32; w * h];
         let mut lam_max = 1e-6f32;
         for y in 0..h {
             for x in 0..w {
@@ -359,10 +438,27 @@ impl Waves {
         //
         // Both normalisations are load-bearing and are NOT interchangeable
         // with one at the end.
+        // The three lobes are a pure function of `l` in [0,1], so they are a
+        // lookup table rather than 3 `powf` per cell. Previously this cost
+        // ~1.2M `powf` calls/sec at 143x85x20fps.
+        //
+        // `powf(5.0)` is exactly l^2 * l^2 * l and needs no table term of its
+        // own, but folding it in costs nothing and keeps the tail to one read.
+        let shade_lut = &self.shade_lut;
+        let lam_scale = LUT_LAST / (lam_max + 1e-6);
+
         let mut vmax = 0.0f32;
         for i in 0..w * h {
-            let l = lam[i] / (lam_max + 1e-6);
-            let v = 0.10 + 0.46 * l.powf(0.85) + 0.62 * l.powf(2.6) + 0.80 * l.powf(5.0);
+            // Linear interpolation between table entries keeps this visually
+            // identical to the exact powf version — the curve is smooth and
+            // 257 entries over [0,1] is far finer than the 10-glyph ramp can
+            // resolve.
+            let fi = (lam[i] * lam_scale).clamp(0.0, LUT_LAST);
+            let i0 = fi as usize;
+            let fr = fi - i0 as f32;
+            let a = shade_lut[i0];
+            let b = shade_lut[(i0 + 1).min(LUT_N - 1)];
+            let v = a + (b - a) * fr;
             lam[i] = v;
             if v > vmax {
                 vmax = v;
@@ -414,18 +510,22 @@ impl Waves {
         let floor = 0.055f32;
         let gamma = (self.gamma_milli as f32 / 1000.0).max(0.05);
 
+        // The whole remap tail — interp_ref, the headroom clamp, powf(0.88) and
+        // powf(gamma) — is a pure function of `x` in [0,1], so it is one table
+        // read per cell instead of an interp plus 2 `powf`.
+        let remap_lut = &self.remap_lut;
+        let x_scale = LUT_LAST / denom;
         for i in 0..w * h {
-            let x = lam[i] / denom;
-            // `np.interp(x, REF_L/REF_L[-1], REF_P/100)` — numpy CLAMPS
-            // outside the knot range rather than extrapolating.
-            let p = interp_ref(x);
-            let lum = (p / headroom).clamp(0.0, 1.0);
-            // Compress toward a small floor rather than clamping to it: a bare
-            // interp pins everything under the first knot to exact zero, which
-            // over-blackens half the field and throws away low-end detail.
-            let v = floor + (1.0 - floor) * lum.powf(0.88);
-            self.lum[i] = v.clamp(0.0, 1.0).powf(gamma);
+            let fi = (lam[i] * x_scale).clamp(0.0, LUT_LAST);
+            let i0 = fi as usize;
+            let fr = fi - i0 as f32;
+            let a = remap_lut[i0];
+            let b = remap_lut[(i0 + 1).min(LUT_N - 1)];
+            self.lum[i] = a + (b - a) * fr;
         }
+
+        self.warped = warped;
+        self.lam = lam;
     }
 }
 
@@ -473,7 +573,21 @@ impl AsciiAnimation for Waves {
         // Glyph choice carries the coarse steps; ink brightness carries
         // everything between them. Together they give a far wider visible
         // gradient than a 10-rung ramp at one brightness ever could.
-        let f = (0.25 + 0.75 * v).clamp(0.0, 1.0);
+        //
+        // The brightness is QUANTISED to `INK_STEPS` levels, and that is a
+        // performance decision as much as an aesthetic one. The renderer
+        // batches runs of identical glyph+colour into one `TextOutW`; a
+        // continuously-varying colour makes every cell its own run, so a lit
+        // field of ~24,000 cells becomes ~24,000 GDI text calls per frame.
+        // That — not the wave maths — was the bulk of this effect's cost
+        // (measured: sim 1.0% of a core, renderer ~72%).
+        //
+        // The Python does exactly the same thing for the same reason: its
+        // `--ink-steps` defaults to 12, quantising "the per-cell grey into a
+        // handful of buckets ... per-character d.text() calls would be cw*ch
+        // times more work per frame for grey steps no eye can separate".
+        let q = ((v * INK_STEPS as f32) as usize).min(INK_STEPS - 1);
+        let f = (0.25 + 0.75 * (q as f32 / (INK_STEPS - 1) as f32)).clamp(0.0, 1.0);
         Some((
             g,
             Rgb(
