@@ -15,7 +15,8 @@
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, InvalidateRect, HBRUSH, PAINTSTRUCT,
+    BeginPaint, DeleteDC, DeleteObject, EndPaint, InvalidateRect, SelectObject, HBRUSH, HDC,
+    HBITMAP, HFONT, HGDIOBJ, PAINTSTRUCT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -33,12 +34,53 @@ use crate::render;
 /// generic `"Window Class"`, so a vague name here would be a real hazard.
 pub const PANEL_CLASS: PCWSTR = w!("PaneFxClass");
 
+/// GDI objects reused across frames.
+///
+/// Before this existed, `draw_animation` created a memory DC, a full-window
+/// compatible bitmap, a solid brush and a font — plus two heap allocations —
+/// **on every frame, for every panel**. `CreateFontW` in particular runs the
+/// font mapper. Measured cost of that churn: `flames` has an essentially free
+/// simulation (one integer pass, no transcendentals, no allocations) yet still
+/// burned ~17% of a core, so the overhead was almost entirely here and every
+/// effect paid it.
+///
+/// Each field records what it was built for, so it can be rebuilt when that
+/// input changes and reused otherwise.
+pub struct GdiCache {
+    /// Memory DC. Valid for the panel's lifetime.
+    pub mem_dc: HDC,
+    /// Off-screen bitmap; must be rebuilt when the panel resizes.
+    pub bitmap: HBITMAP,
+    pub bmp_w: i32,
+    pub bmp_h: i32,
+    /// Whatever was selected into `mem_dc` before our bitmap — must be
+    /// restored before the DC is deleted or GDI leaks the original.
+    pub old_bmp: HGDIOBJ,
+
+    /// Font, plus the inputs it was created from.
+    pub font: HFONT,
+    pub font_face: String,
+    pub font_h: i32,
+    pub old_font: HGDIOBJ,
+
+    /// Background brush, plus the colour it was created for.
+    pub brush: HBRUSH,
+    pub brush_colour: u32,
+
+    /// Scratch buffer for the current glyph run. Reused, never reallocated.
+    pub run: Vec<u16>,
+    /// Font name as a NUL-terminated UTF-16 buffer, kept alive for CreateFontW.
+    pub face_utf16: Vec<u16>,
+}
+
 pub struct Panel {
     pub hwnd: HWND,
     /// The Alacritty window this panel shadows.
     pub target: HWND,
     pub width: i32,
     pub height: i32,
+    /// Built lazily on the first draw, then reused.
+    pub gdi: Option<GdiCache>,
 }
 
 unsafe extern "system" fn wnd_proc(
@@ -114,6 +156,7 @@ impl Panel {
                 target,
                 width: width.max(1),
                 height: height.max(1),
+                gdi: None,
             })
         }
     }
@@ -197,14 +240,40 @@ impl Panel {
     }
 
     /// Repaint from the shared animation.
-    pub fn redraw(&self, anim: &dyn AsciiAnimation, cfg: &crate::config::Config) {
-        render::draw_animation(self.hwnd, anim, cfg, self.width, self.height);
+    pub fn redraw(&mut self, anim: &dyn AsciiAnimation, cfg: &crate::config::Config) {
+        render::draw_animation(self, anim, cfg);
     }
 }
 
 impl Drop for Panel {
     fn drop(&mut self) {
         unsafe {
+            // Free the cached GDI objects BEFORE destroying the window.
+            //
+            // Every panel holds a full-window bitmap; leaking one per panel is
+            // worse than the per-frame cost this cache removes. The originals
+            // must be selected back into the DC first — deleting a DC while our
+            // objects are still selected leaks whatever GDI had there before.
+            if let Some(g) = self.gdi.take() {
+                if !g.old_font.is_invalid() {
+                    SelectObject(g.mem_dc, g.old_font);
+                }
+                if !g.font.is_invalid() {
+                    let _ = DeleteObject(HGDIOBJ(g.font.0));
+                }
+                if !g.old_bmp.is_invalid() {
+                    SelectObject(g.mem_dc, g.old_bmp);
+                }
+                if !g.bitmap.is_invalid() {
+                    let _ = DeleteObject(HGDIOBJ(g.bitmap.0));
+                }
+                if !g.brush.is_invalid() {
+                    let _ = DeleteObject(HGDIOBJ(g.brush.0));
+                }
+                if !g.mem_dc.is_invalid() {
+                    let _ = DeleteDC(g.mem_dc);
+                }
+            }
             let _ = DestroyWindow(self.hwnd);
         }
     }

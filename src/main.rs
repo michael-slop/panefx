@@ -172,7 +172,7 @@ fn main() -> anyhow::Result<()> {
         if sim_cols > 0 && sim_rows > 0 {
             sim.resize(sim_cols, sim_rows);
             sim.step();
-            for p in panels.values() {
+            for p in panels.values_mut() {
                 p.redraw(sim.as_ref(), &cfg);
             }
         }

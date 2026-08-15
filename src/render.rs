@@ -9,7 +9,7 @@ use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreateSolidBrush,
     DeleteDC, DeleteObject, FillRect, GetDC, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
-    TextOutW, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DEFAULT_PITCH, FF_DONTCARE, FW_NORMAL, HDC,
+    TextOutW, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DEFAULT_PITCH, FF_DONTCARE, FW_NORMAL, HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ,
     OUT_TT_PRECIS, SRCCOPY, TRANSPARENT,
 };
 
@@ -86,14 +86,18 @@ pub fn paint_cached(_hdc: HDC, _hwnd: HWND) {
 /// The panel blits its own sub-rect of the shared simulation, so N panels cost
 /// N blits but only ONE simulation step per frame.
 pub fn draw_animation(
-    hwnd: HWND,
+    panel: &mut crate::panel::Panel,
     anim: &dyn AsciiAnimation,
     cfg: &crate::config::Config,
-    width: i32,
-    height: i32,
 ) {
+    let hwnd = panel.hwnd;
+    let (width, height) = (panel.width, panel.height);
     let (cell_w, cell_h) = (cfg.cell_w, cfg.cell_h);
-    let font = if cfg.font.trim().is_empty() { FALLBACK_FONT } else { cfg.font.as_str() };
+    let face_name = if cfg.font.trim().is_empty() {
+        FALLBACK_FONT
+    } else {
+        cfg.font.as_str()
+    };
     if width <= 0 || height <= 0 || cell_w <= 0 || cell_h <= 0 {
         return;
     }
@@ -104,62 +108,117 @@ pub fn draw_animation(
             return;
         }
 
-        // --- off-screen buffer ---
-        let mem_dc = CreateCompatibleDC(hdc);
-        let bitmap = CreateCompatibleBitmap(hdc, width, height);
-        let old_bmp = SelectObject(mem_dc, bitmap);
+        // --- ensure the cache exists and matches the current inputs ---
+        //
+        // Everything below used to be built from scratch every frame, for every
+        // panel. `CreateFontW` alone runs the font mapper; the bitmap is a
+        // full-window DIB allocation. Now each is rebuilt only when the thing it
+        // depends on actually changes.
+        if panel.gdi.is_none() {
+            let mem_dc = CreateCompatibleDC(hdc);
+            if mem_dc.is_invalid() {
+                ReleaseDC(hwnd, hdc);
+                return;
+            }
+            SetBkMode(mem_dc, TRANSPARENT);
+            panel.gdi = Some(crate::panel::GdiCache {
+                mem_dc,
+                bitmap: HBITMAP::default(),
+                bmp_w: 0,
+                bmp_h: 0,
+                old_bmp: HGDIOBJ::default(),
+                font: HFONT::default(),
+                font_face: String::new(),
+                font_h: 0,
+                old_font: HGDIOBJ::default(),
+                brush: HBRUSH::default(),
+                brush_colour: u32::MAX,
+                run: Vec::with_capacity(256),
+                face_utf16: Vec::new(),
+            });
+        }
+        let g = panel.gdi.as_mut().unwrap();
+        let mem_dc = g.mem_dc;
 
-        // Background comes from the animation, not a global constant.
-        let bg = CreateSolidBrush(windows::Win32::Foundation::COLORREF(
-            anim.background().colorref(),
-        ));
+        // Bitmap: rebuild only on resize.
+        if g.bitmap.is_invalid() || g.bmp_w != width || g.bmp_h != height {
+            let new_bmp = CreateCompatibleBitmap(hdc, width, height);
+            let prev = SelectObject(mem_dc, new_bmp);
+            // Keep the DC's ORIGINAL bitmap (from the first swap only), so it
+            // can be restored at Drop. Later swaps return our own old bitmap,
+            // which we delete instead.
+            if g.old_bmp.is_invalid() {
+                g.old_bmp = prev;
+            } else if !g.bitmap.is_invalid() {
+                let _ = DeleteObject(HGDIOBJ(g.bitmap.0));
+            }
+            g.bitmap = new_bmp;
+            g.bmp_w = width;
+            g.bmp_h = height;
+        }
+
+        // Font: rebuild only when the face or the cell height changes.
+        if g.font.is_invalid() || g.font_face != face_name || g.font_h != cell_h {
+            // NOTE: the UTF-16 buffer MUST outlive the CreateFontW call. Writing
+            // `PCWSTR(name.encode_utf16().collect::<Vec<_>>().as_ptr())` inline
+            // creates a temporary that is dropped at the end of the expression,
+            // leaving CreateFontW reading freed memory.
+            g.face_utf16 = face_name
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let new_font = CreateFontW(
+                cell_h,
+                0,
+                0,
+                0,
+                FW_NORMAL.0 as i32,
+                0,
+                0,
+                0,
+                // DEFAULT_CHARSET, never ANSI_CHARSET.
+                //
+                // ANSI_CHARSET makes GDI *silently substitute Arial* for
+                // BigBlueTerm437 Nerd Font Mono — verified with GetTextFaceW on
+                // the real DC. Nothing errors; you just get Arial. Consolas
+                // happens to survive ANSI_CHARSET, which is exactly why this
+                // went unnoticed for so long: the font looked fine until the
+                // face was changed.
+                DEFAULT_CHARSET.0.into(),
+                OUT_TT_PRECIS.0.into(),
+                0,
+                CLEARTYPE_QUALITY.0.into(),
+                (DEFAULT_PITCH.0 | FF_DONTCARE.0).into(),
+                PCWSTR(g.face_utf16.as_ptr()),
+            );
+            let prev = SelectObject(mem_dc, new_font);
+            if g.old_font.is_invalid() {
+                g.old_font = prev;
+            } else if !g.font.is_invalid() {
+                let _ = DeleteObject(HGDIOBJ(g.font.0));
+            }
+            g.font = new_font;
+            g.font_face = face_name.to_string();
+            g.font_h = cell_h;
+        }
+
+        // Brush: rebuild only when the effect's background colour changes.
+        let bg_colour = anim.background().colorref();
+        if g.brush.is_invalid() || g.brush_colour != bg_colour {
+            if !g.brush.is_invalid() {
+                let _ = DeleteObject(HGDIOBJ(g.brush.0));
+            }
+            g.brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(bg_colour));
+            g.brush_colour = bg_colour;
+        }
+
         let full = RECT {
             left: 0,
             top: 0,
             right: width,
             bottom: height,
         };
-        FillRect(mem_dc, &full, bg);
-        let _ = DeleteObject(bg);
-
-        // Monospace font sized to the cell. Matches Alacritty's configured
-        // face so the fire lines up with the terminal grid.
-        //
-        // NOTE: `face` MUST be bound to a local. Writing
-        // `PCWSTR(name.encode_utf16().collect::<Vec<_>>().as_ptr())` inline
-        // creates a temporary Vec that is dropped at the end of the
-        // expression, leaving CreateFontW reading freed memory.
-        let face: Vec<u16> = font.encode_utf16().chain(std::iter::once(0)).collect();
-        let font = CreateFontW(
-            cell_h,
-            0,
-            0,
-            0,
-            FW_NORMAL.0 as i32,
-            0,
-            0,
-            0,
-            // DEFAULT_CHARSET, never ANSI_CHARSET.
-            //
-            // ANSI_CHARSET makes GDI *silently substitute Arial* for
-            // BigBlueTerm437 Nerd Font Mono — verified with GetTextFaceW on the
-            // real DC. Nothing errors; you just get Arial. Consolas happens to
-            // survive ANSI_CHARSET, which is exactly why this went unnoticed
-            // for so long: the font looked fine until the face was changed.
-            //
-            // Nerd Fonts carry huge glyph coverage and report a charset that
-            // ANSI_CHARSET refuses to match. Checking the family resolves in
-            // .NET/GDI+ does NOT catch this — only GetTextFaceW on the DC after
-            // SelectObject tells the truth.
-            DEFAULT_CHARSET.0.into(),
-            OUT_TT_PRECIS.0.into(),
-            0,
-            CLEARTYPE_QUALITY.0.into(),
-            (DEFAULT_PITCH.0 | FF_DONTCARE.0).into(),
-            PCWSTR(face.as_ptr()),
-        );
-        let old_font = SelectObject(mem_dc, font);
-        SetBkMode(mem_dc, TRANSPARENT);
+        FillRect(mem_dc, &full, g.brush);
 
         // Inset to match Alacritty's own text padding, so the animation's
         // bottom row lands on the terminal's bottom text row rather than
@@ -192,7 +251,10 @@ pub fn draw_animation(
         // Runs of identical glyph+colour are batched into a single TextOutW,
         // which matters because these effects produce long horizontal runs.
         let mut current_colour: Option<u32> = None;
-        let mut run: Vec<u16> = Vec::with_capacity(cols.max(1) as usize);
+        // Reused scratch buffer — this used to be a fresh allocation per panel
+        // per frame.
+        let mut run = std::mem::take(&mut g.run);
+        run.clear();
 
         for row in 0..rows {
             let mut run_start_col = 0i32;
@@ -247,11 +309,9 @@ pub fn draw_animation(
         // --- present ---
         let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
 
-        SelectObject(mem_dc, old_font);
-        let _ = DeleteObject(font);
-        SelectObject(mem_dc, old_bmp);
-        let _ = DeleteObject(bitmap);
-        let _ = DeleteDC(mem_dc);
+        // Hand the scratch buffer back for next frame. The DC, bitmap, font and
+        // brush all STAY selected and alive — they are freed in `Panel::drop`.
+        g.run = run;
         ReleaseDC(hwnd, hdc);
     }
 }
