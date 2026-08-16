@@ -1,3 +1,19 @@
+// No console window for the daemon.
+//
+// Without this the daemon is a console subsystem app, so Windows attaches a
+// console to it — a stray terminal window sits on screen for the daemon's whole
+// life, and CLOSING THAT WINDOW KILLS THE DAEMON. It is a background service;
+// it should have no window at all.
+//
+// `panefx-ctl` deliberately does NOT do this: it is a terminal UI and needs its
+// console.
+//
+// Trade-off: `println!` output now goes nowhere when launched normally. That is
+// why startup problems are reported by other means (the font check warns via
+// the control channel's absence, and `-RedirectStandardOutput` still captures
+// output when the daemon is started explicitly for debugging).
+#![windows_subsystem = "windows"]
+
 //! panefx — animated ASCII backdrops behind transparent windows.
 //!
 //! One panel per target window (Alacritty and Neovide by default; see

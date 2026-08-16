@@ -113,8 +113,34 @@ unsafe extern "system" fn wnd_proc(
     }
 }
 
+/// Declare this process PER-MONITOR DPI AWARE.
+///
+/// Must be called before any window is created or any coordinate is read.
+///
+/// Without it Windows treats panefx as a legacy app and hands it *virtualised*
+/// coordinates: on a 2400x1600 display at 150% scaling the process is told the
+/// screen is 1600x1066 and its windows are silently stretched to match. GlazeWM
+/// is DPI-aware and reports REAL pixels over its IPC, so the panel is positioned
+/// in one coordinate space and drawn in another — the panel ends up offset and
+/// oversized, sitting half off the screen.
+///
+/// This never showed up on a 100%-scaling machine, which is why it survived
+/// until panefx was deployed to a laptop running at 150%.
+fn make_dpi_aware() {
+    use windows::Win32::UI::HiDpi::{
+        SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    };
+    unsafe {
+        // Ignore the result: it fails harmlessly if awareness was already set
+        // (for example by an application manifest), and there is nothing useful
+        // to do about it either way.
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+}
+
 /// Register the window class once per process.
 pub fn register_class() -> anyhow::Result<()> {
+    make_dpi_aware();
     unsafe {
         let hinstance = GetModuleHandleW(None)?;
         let wc = WNDCLASSEXW {
