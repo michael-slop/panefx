@@ -33,23 +33,27 @@ ASCII subsystem — the core should hand a renderer a rect and a surface, not a
 character grid. Do not let `AsciiAnimation` become the universal interface by
 default.
 
-Animated ASCII fire panels that sit behind transparent Alacritty windows.
-Green ramp (dark → light) on grey. Windows 11 / pHub.
+Windows 11 / pHub. Four ASCII effects today; the machinery is content-agnostic.
 
-Plan: `C:\Users\micha\.claude\plans\https-github-com-mhearse-panefx-i-wan-serene-popcorn.md`
+Plan: `C:\Users\micha\.claude\plans\https-github-com-mhearse-asciifire-i-wan-serene-popcorn.md`
 
 ## Status (2026-08-15) — WORKING END TO END
 
 | Module | State |
 |---|---|
-| `src/fire.rs` | Done — heat sim, scales flame height to panel |
-| `src/palette.rs` | Done — 8-step green ramp tuned for the 0.6 blend |
-| `src/ipc.rs` | Done — GlazeWM websocket client, verified live |
-| `src/panel.rs` | Done — layered panel window, z-pinning |
-| `src/render.rs` | Done — double-buffered GDI cell blitter |
-| `src/main.rs` | Done — supervisor loop |
+| `src/animation.rs` | Trait + typed params + effect registry |
+| `src/rain.rs` | Port of Michael's `createRain` |
+| `src/flames.rs` | Port of the msimpson gist |
+| `src/waves.rs` | Port of `blackwaves.py` |
+| `src/fire.rs` | Port of `mhearse/asciifire` (legacy) |
+| `src/ipc.rs` | GlazeWM websocket client, on its own thread |
+| `src/control.rs` | Control channel on 127.0.0.1:6124 |
+| `src/config.rs` | Layered defaults / TOML / env, with save |
+| `src/panel.rs` | Panel window + cached GDI objects |
+| `src/render.rs` | ExtTextOutW cell blitter |
+| `src/bin/panefx-ctl.rs` | ratatui control TUI |
 
-**24 unit tests passing. Verified visually on screen, not just by exit code.**
+**66 unit tests passing. Verified visually on screen, not just by exit code.**
 
 **It autostarts with GlazeWM** — it is a function of the WM, not a separate
 service, because it depends on the WM's IPC for all window geometry.
@@ -90,18 +94,6 @@ Also changed outside this repo:
   immediately behind its own terminal, and no panel above any application
   window. The re-pin-every-reconcile strategy beats GlazeWM's own z-ordering.
   **The per-pane architecture works; the WorkerW fallback was not needed.**
-* **CPU: 12.7% of one core** with two 143x85 panels at 20fps.
-
-### The renderer rewrite (worth not undoing)
-
-The first renderer looped over the 8 ramp levels and rescanned the whole grid
-for each — `levels * cols * rows` per panel per frame. That **pegged a full
-core** (15.3 CPU-seconds in 16s wall). It is a tempting structure because it
-minimises `SetTextColor` calls, but the colour switch is far cheaper than the
-rescan. Rewritten to a single pass that tracks the last colour set and batches
-runs of identical glyphs into one `TextOutW`: same output, **8x less CPU**
-(100% -> 12.7% of a core). Verified visually after the change, not just by
-`cargo build`.
 
 ## Verified facts (measured on pHub, not assumed)
 
@@ -124,7 +116,7 @@ runs of identical glyphs into one `TextOutW`: same output, **8x less CPU**
 
 ## The algorithm
 
-Ported from `mhearse/panefx` (`panefx.py`), itself a port of Thiemo
+Ported from `mhearse/asciifire` (`asciifire.py`), itself a port of Thiemo
 Mättig's JS. The original is a **curses** app — TTY-owning, `getmaxyx()`-sized,
 five flat curses colour pairs. Only the algorithm survives; the curses shell is
 discarded, which is what makes a real RGB gradient possible.
@@ -204,7 +196,7 @@ effect. `stays_a_bottom_band_on_a_tall_panel` is the tripwire.
 
 Raise `PANEFX_SEED` (default 65) if a taller flame is ever wanted.
 
-`PANEFX_EFFECT=fire` switches back to the original `mhearse/panefx` port,
+`PANEFX_EFFECT=fire` switches back to the original `mhearse/asciifire` port,
 kept for comparison.
 
 ## The `rain` effect
@@ -394,23 +386,67 @@ splitting it into separate `glyph_at`/`color_at` doubles the per-cell work.
   padding` in `alacritty.toml`, or the fire is not rooted at the bottom of the
   visible text area.
 
-* `PANEFX_EFFECT` — `flames` (default) or `fire`.
+* `PANEFX_EFFECT` — one of `flames`, `rain`, `waves`, `fire`. `PANEFX_ROTATION` takes a comma-separated list, with `PANEFX_ROTATE_SECS` to cycle.
 * `PANEFX_SEED` (65) — flame height for `flames`. Higher climbs further.
 * `PANEFX_CROP_TOP` (0) — pixels chopped off the top of the animation.
   Not needed by `flames`; was added for `fire`'s banding tail.
 
-## CPU
+## Performance — read this before "optimising" anything
 
-**14% of one core** with `rain` at 20fps and the control channel listening
-(~10% before the control listener existed; it polls the socket every frame).
+Measured steady state, 1 panel, 20fps, after the optimisation pass:
 
-For reference, the older `fire` effect measured **22% of one core** with two
-full-height panels at 20fps. This is up from 12.7%
-before dithering, and the dithering is the cause, not a regression to hunt: a
-non-dithered fire produces long uniform runs that batch into a handful of
-`TextOutW` calls per row, whereas a dithered one alternates constantly and
-needs many small ones. That is the price of not having horizontal streaks.
-Halve it by dropping `TARGET_FPS` to 10, which is still fine for a backdrop.
+| effect | before | after |
+|---|---|---|
+| flames | 16.9% | **2.8%** |
+| rain | 14.8% | **4.0%** |
+| waves | 88.7% | **14.0%** |
+| fire | 30.1% | **5.5%** |
+
+**The renderer is the hot path, not the effects.** This is the single most
+useful thing to know here, and it was counter-intuitive: `waves.step()` costs
+1.0% of a core and `cell_at` 0.2%, against ~72% that was in `draw_animation`.
+Do not go hunting in the simulation maths first.
+
+What actually bought the wins, in order of value:
+
+1. **One `ExtTextOutW` per row per colour** (`render.rs`). The old run-batcher
+   broke a run whenever glyph OR colour changed, so a varied field produced
+   **12,242 draw calls per frame** at 143x170. Now each row is read once,
+   bucketed by colour, and drawn with the per-character advance array placing
+   glyphs at their cells.
+2. **Quantised ink** (`waves::INK_STEPS = 12`). Continuously varying colour
+   defeats any batching. The Python does the same thing (`--ink-steps`) for the
+   same reason.
+3. **Cached GDI objects** (`panel::GdiCache`). The DC, bitmap, font and brush
+   used to be recreated every frame per panel; `CreateFontW` runs the font
+   mapper. Rebuilt only when their inputs change.
+4. **IPC on its own thread** (`ipc::IpcThread`). The inline socket read burned
+   5ms of every 50ms frame.
+5. LUTs and allocation removal in `waves` — real, but smaller than expected
+   precisely because the maths was never the bottleneck.
+
+### Measuring it correctly
+
+**Wait ≥8s after switching effects before measuring.** `waves` rebuilds its
+base field on switch and resize; a reading taken 3s in catches that rebuild and
+reports ~60% when steady state is 14%. This produced a phantom "regression"
+during the optimisation pass.
+
+`PANEFX_FPS_LOG=1` prints the achieved frame rate. Use it to tell "slower" apart
+from "no longer throttled, so doing more work per second" — the frame sleep only
+pads out to the budget, so an over-budget frame silently lowers the real rate
+with no catch-up.
+
+### Do not undo these
+
+* `flames` must NOT be parallelised — its kernel is deliberately in-place and
+  forward-walking, and row-splitting changes the output.
+* `Panel::drop` must keep freeing every cached GDI object and restoring the
+  DC's originals. Verified: handles flat at 5 across repeated panel
+  create/destroy cycles.
+* `AsciiAnimation::changed()` defaults to `true`, which is always correct. Only
+  override it where the effect genuinely knows nothing moved.
+
 
 ## Running the fire standalone
 
