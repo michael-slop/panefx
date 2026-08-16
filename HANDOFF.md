@@ -69,14 +69,27 @@ service, because it depends on the WM's IPC for all window geometry.
 
 Rebuild and reinstall:
 ```powershell
-# The running binary locks the output file — stop it FIRST or the build fails
-# with "failed to remove file" and you silently keep the old exe.
-Stop-Process -Name panefx -Force -ErrorAction SilentlyContinue
 cd C:\Users\micha\panefx
-cargo +nightly-x86_64-pc-windows-gnu build --release --offline
-Copy-Item .\target\release\panefx.exe `
-  C:\Users\micha\.glzr\glazewm\scripts\panefx.exe -Force
+.\build.ps1 -Install     # build, install BOTH copies, verify, restart daemon
+.\build.ps1              # dev build only
+.\build.ps1 -Test        # tests only
 ```
+
+**Always use `-Install` rather than copying by hand.** panefx installs to two
+places and they are not interchangeable:
+
+* `~\bin\` — `panefx.exe` + `panefx-ctl.exe`, on PATH, so you can type
+  `panefx-ctl` from any shell.
+* `~\.glzr\glazewm\scripts\` — `panefx.exe` only. GlazeWM launches it from here
+  by absolute path, so **this is the copy that actually runs.**
+
+Copy to only one and you get the worst kind of bug: the build succeeds, the code
+is correct, and the screen does not change — because GlazeWM is still running
+the other copy. The script copies both and hash-verifies them.
+
+It also stops the daemon first, because a running panefx **locks its own
+binary** and the build fails with `failed to remove file ... panefx.exe`, which
+reads like a permissions problem.
 
 Also changed outside this repo:
 * `AppData\Roaming\alacritty\alacritty.toml` — `opacity = 1.0` → `0.6`

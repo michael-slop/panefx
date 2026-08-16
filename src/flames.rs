@@ -46,6 +46,7 @@ fn seed_value() -> i32 {
 }
 
 /// Upper bound for the range assertion in tests; the gist's default.
+#[allow(dead_code)]
 const SEED_VALUE: i32 = 65;
 
 /// Colour thresholds from the original's `color=(4 if b[i]>15 else ...)`.

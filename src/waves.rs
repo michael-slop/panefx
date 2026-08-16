@@ -34,6 +34,11 @@ pub const RAMP_SPARSE: &str = " .`',:;i!+*%#@";
 
 /// Reference distribution: percentile -> luminance, from the measured crop.
 const REF_P: [f32; 7] = [0.0, 25.0, 50.0, 75.0, 90.0, 99.0, 100.0];
+/// The luminance side of the same table. Kept for provenance even though the
+/// normalised values are now inlined as `XS` in `interp_ref` — these are the
+/// numbers measured off the reference clip, and losing them would make the
+/// magic constants in `XS` unexplainable.
+#[allow(dead_code)]
 const REF_L: [f32; 7] = [0.0, 4.0, 14.0, 28.0, 42.0, 71.0, 89.0];
 
 /// Lookup-table resolution for the shading and remap curves. 257 entries over
@@ -522,10 +527,10 @@ impl Waves {
         // Calibrated against the Python's measured glyph histogram at 200x60:
         // '@' 0.3%, '%' 1.1%, '#' 5.4%. `top_rung_stays_rare_like_the_reference`
         // is the tripwire.
-        let headroom = self.headroom_milli as f32 / 1000.0;
-        let floor = 0.055f32;
-        let gamma = (self.gamma_milli as f32 / 1000.0).max(0.05);
-
+        // `headroom`, `floor` and `gamma` are not read here any more — they are
+        // baked into `remap_lut` by `rebuild_luts()`, which reruns whenever
+        // headroom or gamma changes.
+        //
         // The whole remap tail — interp_ref, the headroom clamp, powf(0.88) and
         // powf(gamma) — is a pure function of `x` in [0,1], so it is one table
         // read per cell instead of an interp plus 2 `powf`.
