@@ -393,14 +393,21 @@ splitting it into separate `glyph_at`/`color_at` doubles the per-cell work.
 
 ## Performance — read this before "optimising" anything
 
-Measured steady state, 1 panel, 20fps, after the optimisation pass:
+Measured steady state at 20fps, before vs after the optimisation pass:
 
-| effect | before | after |
-|---|---|---|
-| flames | 16.9% | **2.8%** |
-| rain | 14.8% | **4.0%** |
-| waves | 88.7% | **14.0%** |
-| fire | 30.1% | **5.5%** |
+| effect | before (1 panel) | after, 1 panel | after, 2 panels |
+|---|---|---|---|
+| flames | 16.9% | ~2.8% | 4.5% |
+| rain | 14.8% | ~4.0% | 4.7% |
+| waves | 88.7% | ~14% | 19.1% |
+| fire | 30.1% | ~5.5% | 8.6% |
+
+**Always record the panel count with a CPU figure.** The renderer is per-panel
+while the simulation is shared, so two panels cost noticeably more — and a
+number quoted without its panel count is not comparable to anything. During
+this pass a 14% reading (1 panel) and a 19% reading (2 panels) were briefly
+mistaken for a regression caused by a code change; they were just different
+window layouts.
 
 **The renderer is the hot path, not the effects.** This is the single most
 useful thing to know here, and it was counter-intuitive: `waves.step()` costs
