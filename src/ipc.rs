@@ -19,6 +19,14 @@ use tungstenite::{stream::MaybeTlsStream, Message, WebSocket};
 
 pub const IPC_URL: &str = "ws://localhost:6123";
 
+/// Processes that get a backdrop by default.
+///
+/// Both are winit apps, so both report the generic `"Window Class"` — which is
+/// exactly why the match is on process name. Neovide needs
+/// `transparency = 0.6` in its own config for the backdrop to be visible;
+/// panefx draws BEHIND the window, so an opaque one hides it entirely.
+pub const DEFAULT_TARGETS: &[&str] = &["alacritty", "neovide"];
+
 /// The complete set of events GlazeWM can emit, from `SubscribableEvent` in
 /// `wm-common/src/app_command.rs`. We subscribe to `all` rather than listing
 /// these, but they are recorded here because of what is NOT among them:
@@ -66,7 +74,31 @@ impl Window {
     /// Alacritty's Win32 class is winit's generic `"Window Class"`, which other
     /// winit apps share, so the process name is the real discriminator.
     pub fn is_alacritty(&self) -> bool {
-        self.process_name.eq_ignore_ascii_case("alacritty")
+        self.is_target()
+    }
+
+    /// Does this window get a backdrop?
+    ///
+    /// Matched on PROCESS NAME, never on window class. Both Alacritty and
+    /// Neovide are winit apps and report the same generic `"Window Class"`, so
+    /// matching the class would catch every other winit app on the system.
+    ///
+    /// Override with `PANEFX_TARGETS` (comma-separated, case-insensitive) to
+    /// add or replace the list — e.g. `PANEFX_TARGETS=alacritty,wezterm`.
+    ///
+    /// A target only actually SHOWS the backdrop if it is transparent: panefx
+    /// draws behind the window, so an opaque one hides it completely.
+    pub fn is_target(&self) -> bool {
+        match std::env::var("PANEFX_TARGETS") {
+            Ok(list) if !list.trim().is_empty() => list
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .any(|s| self.process_name.eq_ignore_ascii_case(s)),
+            _ => DEFAULT_TARGETS
+                .iter()
+                .any(|t| self.process_name.eq_ignore_ascii_case(t)),
+        }
     }
 
     /// GlazeWM reports `"shown"` / `"hiding"` / `"hidden"` / `"showing"`.

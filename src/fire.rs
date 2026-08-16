@@ -104,6 +104,11 @@ fn top_fade(row: usize, rows: usize) -> f32 {
 }
 
 pub struct Fire {
+    /// Ramp endpoints. The 8 shades are interpolated between these, so two
+    /// colours control the whole gradient rather than eight hand-picked values.
+    ramp_lo: crate::palette::Rgb,
+    ramp_hi: crate::palette::Rgb,
+    bg: crate::palette::Rgb,
     pub cols: usize,
     pub rows: usize,
     /// Heat per cell in [0.0, 1.0], row-major, row 0 is the TOP of the screen.
@@ -121,6 +126,11 @@ pub struct Fire {
 impl Fire {
     pub fn new(cols: usize, rows: usize, seed: u64) -> Self {
         Fire {
+            // Endpoints of the original green ramp; the 8 shades interpolate
+            // between them.
+            ramp_lo: crate::palette::GREEN_RAMP[1],
+            ramp_hi: crate::palette::GREEN_RAMP[crate::palette::GREEN_RAMP.len() - 1],
+            bg: crate::palette::BACKGROUND,
             cols,
             rows,
             cells: vec![0.0; cols * (rows + 1)],
@@ -271,12 +281,45 @@ impl crate::animation::AsciiAnimation for Fire {
         if idx == 0 {
             None
         } else {
-            Some((RAMP[idx], crate::palette::color_for(idx)))
+            {
+                // Interpolate between the two endpoints across the ramp, so
+                // two colours drive all 8 shades.
+                let t = (idx as f32 - 1.0) / (RAMP.len() - 2).max(1) as f32;
+                let t = t.clamp(0.0, 1.0);
+                let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t) as u8;
+                Some((
+                    RAMP[idx],
+                    crate::palette::Rgb(
+                        lerp(self.ramp_lo.0, self.ramp_hi.0),
+                        lerp(self.ramp_lo.1, self.ramp_hi.1),
+                        lerp(self.ramp_lo.2, self.ramp_hi.2),
+                    ),
+                ))
+            }
         }
     }
 
     fn background(&self) -> crate::palette::Rgb {
-        crate::palette::BACKGROUND
+        self.bg
+    }
+
+    fn params(&self) -> Vec<crate::animation::Param> {
+        use crate::animation::Param;
+        vec![
+            Param::colour("ramp_lo", "ramp low", self.ramp_lo),
+            Param::colour("ramp_hi", "ramp high", self.ramp_hi),
+            Param::colour("bg", "background", self.bg),
+        ]
+    }
+
+    fn set_param(&mut self, key: &str, v: &crate::animation::ParamValue) -> bool {
+        let Some(c) = v.as_rgb() else { return false };
+        match key {
+            "ramp_lo" => { self.ramp_lo = c; true }
+            "ramp_hi" => { self.ramp_hi = c; true }
+            "bg" => { self.bg = c; true }
+            _ => false,
+        }
     }
 }
 

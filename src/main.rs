@@ -1,8 +1,9 @@
-//! panefx — animated ASCII fire behind transparent Alacritty windows.
+//! panefx — animated ASCII backdrops behind transparent windows.
 //!
-//! One panel per Alacritty window, each pinned directly behind its terminal.
-//! A SINGLE fire simulation is shared by every panel; each panel blits its own
-//! sub-rect. N panels therefore cost N blits but only one simulation step.
+//! One panel per target window (Alacritty and Neovide by default; see
+//! `ipc::DEFAULT_TARGETS`), each pinned directly behind it. A SINGLE simulation
+//! is shared by every panel; each panel blits its own sub-rect. N panels
+//! therefore cost N blits but only one simulation step.
 //!
 //! Because GlazeWM emits no move/resize event, the loop is:
 //!   * events (any of them) are a hint that the layout may have changed
@@ -78,19 +79,21 @@ fn main() -> anyhow::Result<()> {
     let mut sim_cols = 0usize;
     let mut sim_rows = 0usize;
 
-    // Set whenever something other than the sim changes what should be drawn:
-    // an effect switch, a param change, a config change.
     // Frame-rate probe (PANEFX_FPS_LOG=1). The sleep only PADS a frame out to
     // the budget — an over-budget frame gets no sleep and no catch-up, so the
     // real rate can drop silently. Needed to tell "this change made things
     // slower" apart from "the loop is no longer throttled so it does more work
     // per second".
     let mut fps_window = Instant::now();
-    let mut frames_this_sec = 0u32;    let mut force_redraw = true;
+    let mut frames_this_sec = 0u32;
+
+    // Set whenever something other than the sim changes what should be drawn:
+    // an effect switch, a param change, a config change.
+    let mut force_redraw = true;
     let mut last_poll = Instant::now();
     let mut frame_start;
 
-        println!(
+    println!(
         "[panefx] running — {} fps, cell {}x{}, font {:?}, effects {:?}",
         cfg.fps, cfg.cell_w, cfg.cell_h, cfg.font, cfg.rotation
     );
@@ -362,7 +365,7 @@ fn reconcile(
     cell: (i32, i32),
 ) {
     let (cell_w, cell_h) = cell;
-    let terminals: Vec<&ipc::Window> = windows.iter().filter(|w| w.is_alacritty()).collect();
+    let terminals: Vec<&ipc::Window> = windows.iter().filter(|w| w.is_target()).collect();
 
     // Drop panels whose terminal is gone.
     let live: std::collections::HashSet<isize> = terminals.iter().map(|w| w.handle).collect();

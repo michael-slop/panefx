@@ -117,6 +117,7 @@ pub struct Rain {
     decay: u8,
     head: Rgb,
     trail: Rgb,
+    bg: Rgb,
 }
 
 impl Rain {
@@ -145,6 +146,7 @@ impl Rain {
             decay: DECAY,
             head: C_HEAD,
             trail: C_TRAIL,
+            bg: BACKGROUND,
         };
         r.reset_drops();
         r
@@ -287,7 +289,7 @@ impl AsciiAnimation for Rain {
     }
 
     fn background(&self) -> Rgb {
-        BACKGROUND
+        self.bg
     }
 
     fn params(&self) -> Vec<crate::animation::Param> {
@@ -298,6 +300,7 @@ impl AsciiAnimation for Rain {
             Param::text("chars", "glyphs", &self.chars.iter().collect::<String>()),
             Param::colour("head", "head colour", self.head),
             Param::colour("trail", "trail colour", self.trail),
+            Param::colour("bg", "background", self.bg),
         ]
     }
 
@@ -340,10 +343,11 @@ impl AsciiAnimation for Rain {
                 None => false,
             },
             "trail" => match v.as_rgb() {
-                Some(c) => {
-                    self.trail = c;
-                    true
-                }
+                Some(c) => { self.trail = c; true }
+                None => false,
+            },
+            "bg" => match v.as_rgb() {
+                Some(c) => { self.bg = c; true }
                 None => false,
             },
             _ => false,

@@ -52,6 +52,9 @@ struct App {
     sel: ListState,
     status: String,
     dirty: bool,
+    /// Caret phase. Toggled by the event loop so the selected row blinks.
+    blink_on: bool,
+    last_blink: std::time::Instant,
     editing: Option<String>,
 }
 
@@ -91,6 +94,8 @@ impl App {
             sel: ListState::default(),
             status: "connected".into(),
             dirty: false,
+            blink_on: true,
+            last_blink: std::time::Instant::now(),
             editing: None,
         };
         app.absorb(&reply);
@@ -383,10 +388,20 @@ fn run<B: Backend>(term: &mut Terminal<B>, app: &mut App) -> anyhow::Result<()> 
     loop {
         term.draw(|f| draw(f, app))?;
 
+        // Blink the caret on a fixed cadence, independent of keypresses.
+        if app.last_blink.elapsed() >= Duration::from_millis(500) {
+            app.blink_on = !app.blink_on;
+            app.last_blink = std::time::Instant::now();
+        }
+
         if !event::poll(Duration::from_millis(120))? {
             continue;
         }
         let Event::Key(k) = event::read()? else { continue };
+        // A keypress means the user is looking at the cursor — show it now
+        // rather than leaving them staring at a blank half-cycle.
+        app.blink_on = true;
+        app.last_blink = std::time::Instant::now();
         if k.kind != KeyEventKind::Press {
             continue;
         }
@@ -515,8 +530,26 @@ fn draw(f: &mut Frame, app: &App) {
             } else {
                 value
             };
+            // A blinking caret on the selected row. The highlight alone is easy
+            // to lose track of against a busy animated backdrop — which is the
+            // whole point of this program, so the cursor has to survive it.
+            let caret = if i == sel {
+                if app.blink_on {
+                    "▌ "
+                } else {
+                    "  "
+                }
+            } else {
+                "  "
+            };
             ListItem::new(Line::from(vec![
-                Span::styled(format!("  {:<18}", row_label(r)), style),
+                Span::styled(
+                    caret,
+                    Style::default()
+                        .fg(Color::LightGreen)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("{:<18}", row_label(r)), style),
                 Span::styled(format!("{:<32}", shown), style),
                 Span::styled(
                     row_bar(r),

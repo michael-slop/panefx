@@ -200,6 +200,7 @@ pub struct Waves {
     /// Luminance below which a cell is not drawn at all, x1000. See `cell_at`.
     dark_cut_milli: i64,
     ink: Rgb,
+    bg: Rgb,
 }
 
 impl Waves {
@@ -250,6 +251,7 @@ impl Waves {
             // dark 500 -> 450 -> 405 -> 345 -> 276, each step judged on screen.
             dark_cut_milli: 276,
             ink: INK,
+            bg: BACKGROUND,
         };
         w.rebuild_base();
         w.rebuild_luts();
@@ -650,7 +652,7 @@ impl AsciiAnimation for Waves {
     }
 
     fn background(&self) -> Rgb {
-        BACKGROUND
+        self.bg
     }
 
     fn params(&self) -> Vec<Param> {
@@ -664,6 +666,7 @@ impl AsciiAnimation for Waves {
             Param::int("tilt", "shear (x1000)", self.tilt_milli, 0, 2000),
             Param::text("chars", "ramp", &self.ramp.iter().collect::<String>()),
             Param::colour("ink", "ink colour", self.ink),
+            Param::colour("bg", "background", self.bg),
         ]
     }
 
@@ -728,10 +731,11 @@ impl AsciiAnimation for Waves {
                 None => false,
             },
             "ink" => match v.as_rgb() {
-                Some(c) => {
-                    self.ink = c;
-                    true
-                }
+                Some(c) => { self.ink = c; true }
+                None => false,
+            },
+            "bg" => match v.as_rgb() {
+                Some(c) => { self.bg = c; true }
                 None => false,
             },
             _ => false,

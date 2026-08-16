@@ -99,6 +99,14 @@ pub struct Flames {
     t_hot: i32,
     t_warm: i32,
     t_cool: i32,
+    // ---- colours ----
+    // One per heat band, plus the background. The gist used curses colour
+    // pairs; drawing into our own window means these can be anything.
+    c_hot: Rgb,
+    c_warm: Rgb,
+    c_cool: Rgb,
+    c_dim: Rgb,
+    bg: Rgb,
     /// Flat heat array. The gist allocates `size + width + 1` so the kernel can
     /// read `b[i+width+1]` on the last row without bounds-checking; we keep
     /// that same slack for the same reason.
@@ -117,6 +125,11 @@ impl Flames {
             t_hot: T_HOT,
             t_warm: T_WARM,
             t_cool: T_COOL,
+            c_hot: C_HOT,
+            c_warm: C_WARM,
+            c_cool: C_COOL,
+            c_dim: C_DIM,
+            bg: BACKGROUND,
             b: vec![0; size + width + 1],
             rng: Rng::new(seed),
         }
@@ -129,13 +142,13 @@ impl Flames {
 
     fn colour_for(&self, v: i32) -> Rgb {
         if v > self.t_hot {
-            C_HOT
+            self.c_hot
         } else if v > self.t_warm {
-            C_WARM
+            self.c_warm
         } else if v > self.t_cool {
-            C_COOL
+            self.c_cool
         } else {
-            C_DIM
+            self.c_dim
         }
     }
 }
@@ -199,7 +212,7 @@ impl AsciiAnimation for Flames {
     }
 
     fn background(&self) -> Rgb {
-        BACKGROUND
+        self.bg
     }
 
     fn params(&self) -> Vec<crate::animation::Param> {
@@ -212,11 +225,30 @@ impl AsciiAnimation for Flames {
             Param::int("t_hot", "hot threshold", self.t_hot as i64, 1, 64),
             Param::int("t_warm", "warm threshold", self.t_warm as i64, 1, 64),
             Param::int("t_cool", "cool threshold", self.t_cool as i64, 1, 64),
+            Param::colour("c_hot", "hot colour", self.c_hot),
+            Param::colour("c_warm", "warm colour", self.c_warm),
+            Param::colour("c_cool", "cool colour", self.c_cool),
+            Param::colour("c_dim", "dim colour", self.c_dim),
+            Param::colour("bg", "background", self.bg),
         ]
     }
 
     fn set_param(&mut self, key: &str, v: &crate::animation::ParamValue) -> bool {
         use crate::animation::clamp_int;
+
+        // Colours first: they are not Int, so the `as_int` guard below would
+        // reject them.
+        if let Some(c) = v.as_rgb() {
+            match key {
+                "c_hot" => { self.c_hot = c; return true; }
+                "c_warm" => { self.c_warm = c; return true; }
+                "c_cool" => { self.c_cool = c; return true; }
+                "c_dim" => { self.c_dim = c; return true; }
+                "bg" => { self.bg = c; return true; }
+                _ => return false,
+            }
+        }
+
         let Some(n) = v.as_int() else { return false };
         match key {
             "seed" => {
