@@ -138,6 +138,23 @@ pub trait AsciiAnimation {
     /// Advance the simulation by one frame.
     fn step(&mut self);
 
+    /// The character cell size this effect wants, in pixels.
+    ///
+    /// `None` (the default) means "use the configured size" — that is what
+    /// `rain`, `flames` and `fire` do, because they are designed to sit on the
+    /// terminal's own text grid.
+    ///
+    /// `waves` overrides it: the blackwaves field wants chunky cells so the
+    /// glyphs read as marks rather than as text, and it looks wrong at the
+    /// terminal's 10x15. Making this per-effect means one effect can be chunky
+    /// without dragging the others with it.
+    ///
+    /// An explicit `PANEFX_CELL_W`/`_H` (or a `cell_w`/`cell_h` set live from
+    /// the TUI) still wins — a user asking for a size means it.
+    fn preferred_cell(&self) -> Option<(i32, i32)> {
+        None
+    }
+
     /// Did the last `step()` actually change what `cell_at` will return?
     ///
     /// Defaults to `true` (always redraw), which is always correct — an effect

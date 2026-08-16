@@ -192,6 +192,8 @@ pub struct Waves {
     /// See the note in compute() — higher than Python's 0.62 because this
     /// port's RNG differs, so the top end needs more headroom for the same look.
     headroom_milli: i64,
+    /// Luminance below which a cell is not drawn at all, x1000. See `cell_at`.
+    dark_cut_milli: i64,
     ink: Rgb,
 }
 
@@ -227,7 +229,21 @@ impl Waves {
             gamma_milli: (DEFAULT_GAMMA * 1000.0) as i64,
             swirl_milli: (DEFAULT_SWIRL * 1000.0) as i64,
             tilt_milli: (DEFAULT_TILT * 1000.0) as i64,
-            headroom_milli: 950,
+            // 1.35, not the 0.95 that matched the Python's histogram exactly.
+            //
+            // Two reasons, both deliberate. Aesthetically Michael wanted the
+            // waves darker. Practically, raising headroom pushes more of the
+            // field down onto the blank glyph, and a cell that renders blank is
+            // a cell the renderer never hands to GDI — this effect's cost is
+            // dominated by how many cells are lit (~24,000 of them at 0.95).
+            //
+            // `top_rung_stays_rare_like_the_reference` still holds: this only
+            // moves the field further toward the dark end the reference already
+            // sits at, never brighter.
+            headroom_milli: 1350,
+            // Tuned live by Michael against the real thing, not derived:
+            // dark 500 -> 450 -> 405 -> 345 -> 276, each step judged on screen.
+            dark_cut_milli: 276,
             ink: INK,
         };
         w.rebuild_base();
@@ -563,6 +579,23 @@ impl AsciiAnimation for Waves {
             return None;
         }
         let v = self.lum[row * self.cols + col];
+
+        // Cells below `dark_cut` are not drawn at all.
+        //
+        // This is a real departure from the Python, and it is deliberate. The
+        // remap's `floor = 0.055` is lifted by `powf(gamma=0.62)` to ~0.166,
+        // which lands on ramp index 2 — so EVERY cell in the field is a drawn
+        // glyph and the grid is 100% lit whatever `headroom` is set to. That is
+        // free in the Python, which rasterises to a PNG. Here every lit cell is
+        // work the renderer hands to GDI, and this effect's whole cost is how
+        // many cells are lit.
+        //
+        // Cutting the near-floor cells removes glyphs that are, through a
+        // 60%-opaque terminal, indistinguishable from the background anyway.
+        if v <= self.dark_cut_milli as f32 / 1000.0 {
+            return None;
+        }
+
         let n = self.ramp.len();
         let idx = ((v * (n - 1) as f32) + 0.5) as usize;
         let idx = idx.min(n - 1);
@@ -598,6 +631,19 @@ impl AsciiAnimation for Waves {
         ))
     }
 
+    /// Chunky on purpose. The blackwaves field wants each glyph to read as a
+    /// mark, not as a character — the Python's own note says 12px "is the
+    /// chosen look: big enough that each glyph reads as a mark, small enough
+    /// that the field still reads as water", and that below ~6 "the glyphs
+    /// collapse into flat dither".
+    ///
+    /// Tuned live by Michael at 15x23 against the real thing. Also cheaper:
+    /// at 15x23 a 1432x1274 panel is 94x54 cells instead of 143x84, which is
+    /// 58% fewer cells to simulate and to draw.
+    fn preferred_cell(&self) -> Option<(i32, i32)> {
+        Some((15, 23))
+    }
+
     fn background(&self) -> Rgb {
         BACKGROUND
     }
@@ -608,6 +654,7 @@ impl AsciiAnimation for Waves {
             Param::int("octaves", "octaves", self.octaves as i64, 1, 8),
             Param::int("gamma", "gamma (x1000)", self.gamma_milli, 100, 2000),
             Param::int("headroom", "headroom (x1000)", self.headroom_milli, 200, 2000),
+            Param::int("darkcut", "dark cutoff (x1000)", self.dark_cut_milli, 0, 900),
             Param::int("swirl", "swirl (x1000)", self.swirl_milli, 0, 3000),
             Param::int("tilt", "shear (x1000)", self.tilt_milli, 0, 2000),
             Param::text("chars", "ramp", &self.ramp.iter().collect::<String>()),
@@ -639,6 +686,10 @@ impl AsciiAnimation for Waves {
                     self.rebuild_base();
                     true
                 }
+                None => false,
+            },
+            "darkcut" => match v.as_int() {
+                Some(n) => { self.dark_cut_milli = clamp_int(n, 0, 900); true }
                 None => false,
             },
             "headroom" => match v.as_int() {

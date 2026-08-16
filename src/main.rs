@@ -112,7 +112,13 @@ fn main() -> anyhow::Result<()> {
         while let Some(msg) = client.try_recv() {
             match msg {
                 ipc::IpcMessage::Windows(windows) => {
-                    reconcile(&mut panels, &windows, &mut sim_cols, &mut sim_rows, &cfg);
+                    {
+                        let cell = match sim.preferred_cell() {
+                            Some(c) if !cfg.cell_explicit => c,
+                            _ => (cfg.cell_w, cfg.cell_h),
+                        };
+                        reconcile(&mut panels, &windows, &mut sim_cols, &mut sim_rows, &cfg, cell);
+                    }
                 }
                 ipc::IpcMessage::LayoutMayHaveChanged => {
                     // No geometry in the event — must ask.
@@ -302,6 +308,9 @@ fn handle_command(
                 return Reply::err(format!("unknown effect '{name}'"));
             }
             *sim = rebuild(cfg, &wanted, sim_cols, sim_rows, 0x5EED_1234);
+            // Effects can prefer different cell sizes, so the grid dimensions
+            // may be wrong for the new one until it is recomputed.
+            *needs_query = true;
             // Point the rotation at the chosen effect so it does not get
             // rotated away a moment later.
             *effect_idx = cfg.rotation.iter().position(|r| *r == wanted).unwrap_or(0);
@@ -350,7 +359,9 @@ fn reconcile(
     sim_cols: &mut usize,
     sim_rows: &mut usize,
     cfg: &config::Config,
+    cell: (i32, i32),
 ) {
+    let (cell_w, cell_h) = cell;
     let terminals: Vec<&ipc::Window> = windows.iter().filter(|w| w.is_alacritty()).collect();
 
     // Drop panels whose terminal is gone.
@@ -391,10 +402,10 @@ fn reconcile(
             // the whole window would be a couple of rows taller than what can
             // actually be shown.
             let (pad_x, pad_y) = (cfg.pad_x, cfg.pad_y);
-            let usable_w = (w.width - pad_x * 2).max(cfg.cell_w);
-            let usable_h = (w.height - pad_y * 2 - cfg.crop_top).max(cfg.cell_h);
-            max_cols = max_cols.max((usable_w / cfg.cell_w).max(1) as usize);
-            max_rows = max_rows.max((usable_h / cfg.cell_h).max(1) as usize);
+            let usable_w = (w.width - pad_x * 2).max(cell_w);
+            let usable_h = (w.height - pad_y * 2 - cfg.crop_top).max(cell_h);
+            max_cols = max_cols.max((usable_w / cell_w).max(1) as usize);
+            max_rows = max_rows.max((usable_h / cell_h).max(1) as usize);
         } else {
             // Terminal is on another workspace — hide rather than draw.
             panel.hide();

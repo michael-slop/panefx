@@ -92,7 +92,12 @@ pub fn draw_animation(
 ) {
     let hwnd = panel.hwnd;
     let (width, height) = (panel.width, panel.height);
-    let (cell_w, cell_h) = (cfg.cell_w, cfg.cell_h);
+    // The effect may ask for its own cell size (waves wants chunky cells), but
+    // an explicit user setting always wins.
+    let (cell_w, cell_h) = match anim.preferred_cell() {
+        Some((w, h)) if !cfg.cell_explicit => (w, h),
+        _ => (cfg.cell_w, cfg.cell_h),
+    };
     let face_name = if cfg.font.trim().is_empty() {
         FALLBACK_FONT
     } else {

@@ -33,6 +33,11 @@ pub struct Config {
     pub font: String,
     pub cell_w: i32,
     pub cell_h: i32,
+    /// True when the user set the cell size explicitly (env var, config file,
+    /// or the TUI). An effect's `preferred_cell()` only applies when this is
+    /// false — asking for a size means it, and must not be silently overridden
+    /// by whichever effect happens to be running.
+    pub cell_explicit: bool,
     pub fps: u64,
     /// Effect names, in rotation order. Always non-empty.
     pub rotation: Vec<String>,
@@ -59,7 +64,13 @@ impl Default for Config {
             font: DEFAULT_FONT.to_string(),
             cell_w: 10,
             cell_h: 15,
-            fps: 20,
+            cell_explicit: false,
+            // 10fps, not 20. This is a backdrop behind a 60%-opaque terminal —
+            // the extra frames are close to invisible in use and the renderer
+            // cost is per-frame per-panel, so halving this halves the whole
+            // program's cost. `panefx-ctl` can raise it live if a particular
+            // effect ever needs to be smoother.
+            fps: 10,
             rotation: DEFAULT_ROTATION.iter().map(|s| s.to_string()).collect(),
             rotate_every: None,
             crop_top: 0,
@@ -107,9 +118,11 @@ impl Config {
         }
         if let Some(v) = env_i32("PANEFX_CELL_W").filter(|v| *v > 0) {
             cfg.cell_w = v;
+            cfg.cell_explicit = true;
         }
         if let Some(v) = env_i32("PANEFX_CELL_H").filter(|v| *v > 0) {
             cfg.cell_h = v;
+            cfg.cell_explicit = true;
         }
         if let Some(v) = env_u64("PANEFX_FPS").filter(|v| *v > 0 && *v <= 120) {
             cfg.fps = v;
@@ -203,6 +216,7 @@ impl Config {
                     if let Ok(n) = v.parse::<i32>() {
                         if n > 0 {
                             self.cell_w = n;
+                            self.cell_explicit = true;
                         }
                     }
                 }
@@ -210,6 +224,7 @@ impl Config {
                     if let Ok(n) = v.parse::<i32>() {
                         if n > 0 {
                             self.cell_h = n;
+                            self.cell_explicit = true;
                         }
                     }
                 }
@@ -343,9 +358,11 @@ impl Config {
             },
             "cell_w" => matches!(as_i64(), Some(n) if n > 0 && n <= 200).then(|| {
                 self.cell_w = as_i64().unwrap() as i32;
+                self.cell_explicit = true;
             }).is_some(),
             "cell_h" => matches!(as_i64(), Some(n) if n > 0 && n <= 200).then(|| {
                 self.cell_h = as_i64().unwrap() as i32;
+                self.cell_explicit = true;
             }).is_some(),
             "fps" => matches!(as_i64(), Some(n) if n > 0 && n <= 120).then(|| {
                 self.fps = as_i64().unwrap() as u64;
