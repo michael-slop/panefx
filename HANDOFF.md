@@ -440,6 +440,27 @@ several attempts). `scp` a `.ps1` and run it with
 `powershell -NoProfile -ExecutionPolicy Bypass -File`. Also note `scp target:bin/x`
 silently did nothing; the explicit `scp target:C:/Users/micha/bin/x` worked.
 
+**A daemon started over SSH DIES when the SSH session ends** — including with
+`Start-Process -WindowStyle Hidden`, which is not enough. The whole process tree
+belongs to the SSH session's job object. This looks exactly like a working
+deployment right up until the user tries `panefx-ctl` and gets "cannot reach the
+daemon", because everything else (binaries on PATH, config, GlazeWM wiring) is
+genuinely fine.
+
+To start it detached for real, use a one-shot scheduled task and then delete it
+so it does not linger as a second launch path:
+
+```powershell
+schtasks /Create /TN "panefx-oneshot" /TR "`"$env:USERPROFILE\bin\panefx.exe`"" /SC ONCE /ST 00:00 /F
+schtasks /Run /TN "panefx-oneshot"
+schtasks /Delete /TN "panefx-oneshot" /F
+```
+
+**Verify by reconnecting in a NEW ssh session** and checking the process is
+still there — checking within the session that started it proves nothing.
+Normally none of this matters: GlazeWM's `startup_commands` launches it at WM
+startup, outside any SSH session.
+
 ## Performance — read this before "optimising" anything
 
 Measured steady state at 20fps, before vs after the optimisation pass:
