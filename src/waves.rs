@@ -1,9 +1,9 @@
 //! blackwaves — procedural ASCII wave field.
 //!
-//! Ported from `C:\Users\micha\blackwaves\blackwaves.py` (LAW 1: source read
-//! before porting). That script's comments record measurements taken off a real
-//! reference clip, and those numbers are the whole design — they are carried
-//! over here verbatim rather than re-derived:
+//! Ported from `blackwaves.py`, my own procedural generator (not public). Its
+//! comments record measurements taken off a real reference clip, and those
+//! numbers ARE the design — they are carried over here verbatim rather than
+//! re-derived:
 //!
 //!   * Reference distribution (695x1230 crop, greyscale):
 //!     `p25=4 p50=14 p75=28 p90=42 p99=71 max~89` — an almost entirely black

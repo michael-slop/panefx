@@ -1,9 +1,9 @@
 //! ASCII rain — ported from Michael's own `createRain`.
 //!
-//! Source read before porting (LAW 1):
-//!   `hellmesh/cmd/hellmesh/landing_page.html:511` (`createRain`), which is
-//!   itself noted there as ported verbatim from `site/static/app.js`.
-//!   Same renderer drives the self.net and pub.net boot screens.
+//! Source read before porting: `createRain` from michaelslop.org's own
+//! `static/app.js`, the renderer behind that site's boot screen. (That file is
+//! not public; the algorithm is reproduced faithfully here and the comments
+//! carry the reasoning that mattered.)
 //!
 //! Kept from the original:
 //!   * the exact CP437 character set, block glyphs included. It is ASCII-not-

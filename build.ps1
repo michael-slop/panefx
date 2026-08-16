@@ -7,9 +7,8 @@
 # Why two install locations:
 #
 #   ~\bin\                        panefx.exe + panefx-ctl.exe, so you can type
-#                                 `panefx-ctl` from any shell. This dir is
-#                                 already on PATH (same place hellmesh.exe
-#                                 lives).
+#                                 `panefx-ctl` from any shell. Assumes this dir
+#                                 is on your PATH; change it if yours differs.
 #   ~\.glzr\glazewm\scripts\      panefx.exe only. GlazeWM's `startup_commands`
 #                                 launches it from here by absolute path, so
 #                                 this copy is what actually runs day to day.
