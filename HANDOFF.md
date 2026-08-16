@@ -404,6 +404,42 @@ splitting it into separate `glyph_at`/`color_at` doubles the per-cell work.
 * `PANEFX_CROP_TOP` (0) — pixels chopped off the top of the animation.
   Not needed by `flames`; was added for `fire`'s banding tail.
 
+## Deploying to another machine
+
+**`target-cpu=native` makes the binary NON-PORTABLE.** `.cargo/config.toml` sets
+it, which is right for the machine it is built on and wrong for every other one.
+pHub is a Ryzen 9800X3D (Zen 5); SloppyLaptopy is an Intel i7-13700H. Copying
+the native binary risks an illegal-instruction crash.
+
+Build a portable one instead:
+
+```powershell
+$env:RUSTFLAGS = "-C target-cpu=x86-64-v2"
+cargo +nightly-x86_64-pc-windows-gnu build --release --offline --target-dir target-portable
+Remove-Item Env:\RUSTFLAGS
+```
+
+`x86-64-v2` is SSE4.2-era — safe on anything from the last decade. Verified
+running on the laptop's Intel CPU with no crash.
+
+### SloppyLaptopy, deployed 2026-08-16
+
+* `~\bin\panefx.exe` + `panefx-ctl.exe` (portable build; `~\bin` already on PATH)
+* `~\.config\panefx\config.toml` — copied from pHub
+* GlazeWM `config.yaml` — panefx **appended** to the existing
+  `startup_commands` / `shutdown_commands`, which already launch Zebar. Append,
+  never replace, or Zebar stops starting. Backup at `config.yaml.bak-panefx`.
+* GlazeWM ignore rule for `panefx` / `PaneFxClass`
+* `alacritty.toml` opacity 1.0 → 0.6
+* `%APPDATA%\neovide\config.toml` — `transparency = 0.6`, `frame = "none"`
+
+No Rust toolchain on the laptop, and none needed — binaries are built on pHub.
+
+**SSH quoting:** nested quotes through PowerShell→SSH mangle reliably (this cost
+several attempts). `scp` a `.ps1` and run it with
+`powershell -NoProfile -ExecutionPolicy Bypass -File`. Also note `scp target:bin/x`
+silently did nothing; the explicit `scp target:C:/Users/micha/bin/x` worked.
+
 ## Performance — read this before "optimising" anything
 
 Measured steady state at 20fps, before vs after the optimisation pass:
