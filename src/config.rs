@@ -287,17 +287,44 @@ impl Config {
     }
 
     /// Render the whole config back to TOML, per-effect sections included.
+    ///
+    /// Comments are REGENERATED, not preserved. This file is rewritten wholesale
+    /// every time the TUI saves, so any hand-written note would be lost on the
+    /// next `s` keypress — which is worse than not having one, because it looks
+    /// like it persisted until it silently does not. Instead the explanations
+    /// live here, in code, and are re-emitted every save.
     pub fn to_toml(&self) -> String {
         let mut s = String::new();
-        s.push_str("# panefx config — written by panefx-ctl\n");
-        s.push_str("# Env vars (PANEFX_*) override anything here.\n\n");
+        s.push_str("# panefx config — rewritten in full whenever panefx-ctl saves.\n");
+        s.push_str("#\n");
+        s.push_str("# Precedence, lowest to highest:\n");
+        s.push_str("#   1. code defaults   2. THIS FILE   3. PANEFX_* env vars\n");
+        s.push_str("#\n");
+        s.push_str("# Comments here are generated from `Config::to_toml`. Editing them by\n");
+        s.push_str("# hand works until the next save, which overwrites the whole file.\n\n");
+
         s.push_str(&format!("font = \"{}\"\n", self.font));
+
+        s.push_str("\n# Backdrop behind a 60%-opaque terminal: extra frames are close to\n");
+        s.push_str("# invisible, and renderer cost is per-frame per-panel.\n");
+        s.push_str(&format!("fps = {}\n", self.fps));
+
+        s.push_str("\n# The terminal's own text cell. Effects that want a different size ask\n");
+        s.push_str("# for one themselves (waves uses 15x23); setting these HERE overrides\n");
+        s.push_str("# that and forces every effect onto this grid.\n");
         s.push_str(&format!("cell_w = {}\n", self.cell_w));
         s.push_str(&format!("cell_h = {}\n", self.cell_h));
-        s.push_str(&format!("fps = {}\n", self.fps));
-        s.push_str(&format!("crop_top = {}\n", self.crop_top));
+
+        s.push_str("\n# Must match `[window] padding` in alacritty.toml, or the animation\n");
+        s.push_str("# does not line up with the terminal's text area.\n");
         s.push_str(&format!("pad_x = {}\n", self.pad_x));
         s.push_str(&format!("pad_y = {}\n", self.pad_y));
+
+        s.push_str("\n# Pixels chopped off the TOP of the animation. 0 draws the full panel.\n");
+        s.push_str(&format!("crop_top = {}\n", self.crop_top));
+
+        s.push_str("\n# flames | rain | waves | fire. A comma-separated list plus a non-zero\n");
+        s.push_str("# rotate_secs cycles between them.\n");
         s.push_str(&format!("rotation = \"{}\"\n", self.rotation.join(", ")));
         s.push_str(&format!(
             "rotate_secs = {}\n",
@@ -306,11 +333,35 @@ impl Config {
         if let Some(c) = &self.chars_override {
             s.push_str(&format!("chars = \"{c}\"\n"));
         }
+        if !self.effect_params.is_empty() {
+            s.push_str("\n# --- per-effect parameters ------------------------------------------\n");
+            s.push_str("# Only sections named after an effect are read as parameters; any\n");
+            s.push_str("# other [section] header is decorative and its keys still set the\n");
+            s.push_str("# top-level fields above.\n");
+        }
         for (effect, params) in &self.effect_params {
             if params.is_empty() {
                 continue;
             }
             s.push_str(&format!("\n[{effect}]\n"));
+            // A one-line reminder of what is non-obvious about each effect.
+            // These are the things that look like bugs if you do not know them.
+            match effect.as_str() {
+                "waves" => {
+                    s.push_str("# darkcut: cells below this luminance are NOT DRAWN. Without it\n");
+                    s.push_str("# every cell is a glyph (the remap floor lands on ramp index 2)\n");
+                    s.push_str("# and the grid is 100% lit. Higher headroom = darker.\n");
+                }
+                "rain" => {
+                    s.push_str("# tick_ms 55 is the original's deliberate stepped look — \"a CRT\n");
+                    s.push_str("# reads better stepped than smooth\". Do not smooth it out.\n");
+                }
+                "flames" => {
+                    s.push_str("# Deliberately a band along the bottom, not a full-height fire.\n");
+                    s.push_str("# See `stays_a_bottom_band_on_a_tall_panel` in flames.rs.\n");
+                }
+                _ => {}
+            }
             for (k, v) in params {
                 // Numbers unquoted, everything else quoted — the parser strips
                 // quotes either way, but this keeps the file readable.
