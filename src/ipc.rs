@@ -183,6 +183,81 @@ impl Client {
     }
 }
 
+/// The GlazeWM socket, moved to its own thread.
+///
+/// The render loop used to call `Client::read()` inline with a 5ms socket
+/// timeout. That is a **blocking syscall on the render thread**: with no
+/// traffic it burned a guaranteed 5ms of every frame — 10% of a 50ms budget at
+/// 20fps — for nothing.
+///
+/// Here the socket thread blocks on the socket as long as it likes and pushes
+/// decoded messages down a channel; the render loop only ever does
+/// `try_recv()`, which never blocks.
+///
+/// Only the socket moves. The panel map, GDI handles and HWNDs all stay on the
+/// render thread — they are thread-affine and `Panel` is deliberately not
+/// `Send`.
+pub struct IpcThread {
+    rx: std::sync::mpsc::Receiver<IpcMessage>,
+    tx_cmd: std::sync::mpsc::Sender<String>,
+}
+
+impl IpcThread {
+    /// Connect, subscribe, and spawn the reader. Fails fast if GlazeWM is not
+    /// running, exactly as the inline client did.
+    pub fn spawn() -> anyhow::Result<Self> {
+        let mut client = Client::connect()?;
+        client.subscribe_all()?;
+        client.request_windows()?;
+        // Long timeout: the thread is allowed to block. It still needs to wake
+        // periodically to notice queued outbound commands.
+        client.set_read_timeout(Some(Duration::from_millis(50)))?;
+
+        let (tx, rx) = std::sync::mpsc::channel::<IpcMessage>();
+        let (tx_cmd, rx_cmd) = std::sync::mpsc::channel::<String>();
+
+        std::thread::Builder::new()
+            .name("panefx-ipc".into())
+            .spawn(move || loop {
+                // Outbound first, so a `query windows` goes out promptly.
+                while let Ok(cmd) = rx_cmd.try_recv() {
+                    if client.send(&cmd).is_err() {
+                        let _ = tx.send(IpcMessage::Closed);
+                        return;
+                    }
+                }
+                match client.read() {
+                    Ok(Some(m)) => {
+                        let closed = matches!(m, IpcMessage::Closed);
+                        // A send error means the render loop is gone; so are we.
+                        if tx.send(m).is_err() || closed {
+                            return;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!("[panefx] IPC read error: {e}");
+                        let _ = tx.send(IpcMessage::Closed);
+                        return;
+                    }
+                }
+            })?;
+
+        Ok(IpcThread { rx, tx_cmd })
+    }
+
+    /// Take whatever has arrived. Never blocks.
+    pub fn try_recv(&self) -> Option<IpcMessage> {
+        self.rx.try_recv().ok()
+    }
+
+    pub fn request_windows(&self) -> anyhow::Result<()> {
+        self.tx_cmd
+            .send("query windows".to_string())
+            .map_err(|_| anyhow::anyhow!("IPC thread has exited"))
+    }
+}
+
 #[derive(Debug)]
 pub enum IpcMessage {
     /// Fresh window list — authoritative geometry.

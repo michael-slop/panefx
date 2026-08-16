@@ -50,7 +50,9 @@ fn main() -> anyhow::Result<()> {
 
     panel::register_class()?;
 
-    let mut client = match ipc::Client::connect() {
+    // The GlazeWM socket lives on its own thread; the render loop only ever
+    // does a non-blocking try_recv. See `ipc::IpcThread` for why.
+    let client = match ipc::IpcThread::spawn() {
         Ok(c) => c,
         Err(e) => {
             eprintln!(
@@ -61,11 +63,6 @@ fn main() -> anyhow::Result<()> {
             return Err(e);
         }
     };
-
-    // Non-blocking-ish reads so the animation keeps running between events.
-    client.set_read_timeout(Some(Duration::from_millis(5)))?;
-    client.subscribe_all()?;
-    client.request_windows()?;
 
     let mut panels: HashMap<isize, Panel> = HashMap::new();
 
@@ -83,7 +80,13 @@ fn main() -> anyhow::Result<()> {
 
     // Set whenever something other than the sim changes what should be drawn:
     // an effect switch, a param change, a config change.
-    let mut force_redraw = true;
+    // Frame-rate probe (PANEFX_FPS_LOG=1). The sleep only PADS a frame out to
+    // the budget — an over-budget frame gets no sleep and no catch-up, so the
+    // real rate can drop silently. Needed to tell "this change made things
+    // slower" apart from "the loop is no longer throttled so it does more work
+    // per second".
+    let mut fps_window = Instant::now();
+    let mut frames_this_sec = 0u32;    let mut force_redraw = true;
     let mut last_poll = Instant::now();
     let mut frame_start;
 
@@ -104,25 +107,20 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        // --- drain IPC ---
+        // --- drain IPC (non-blocking; the socket lives on its own thread) ---
         let mut needs_query = false;
-        loop {
-            match client.read() {
-                Ok(Some(ipc::IpcMessage::Windows(windows))) => {
+        while let Some(msg) = client.try_recv() {
+            match msg {
+                ipc::IpcMessage::Windows(windows) => {
                     reconcile(&mut panels, &windows, &mut sim_cols, &mut sim_rows, &cfg);
                 }
-                Ok(Some(ipc::IpcMessage::LayoutMayHaveChanged)) => {
+                ipc::IpcMessage::LayoutMayHaveChanged => {
                     // No geometry in the event — must ask.
                     needs_query = true;
                 }
-                Ok(Some(ipc::IpcMessage::Closed)) => {
+                ipc::IpcMessage::Closed => {
                     eprintln!("[panefx] GlazeWM closed the IPC connection; exiting.");
                     return Ok(());
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    eprintln!("[panefx] IPC read error: {e}");
-                    return Err(e);
                 }
             }
         }
@@ -194,6 +192,19 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+        }
+
+        frames_this_sec += 1;
+        if fps_window.elapsed() >= Duration::from_secs(5) {
+            if std::env::var("PANEFX_FPS_LOG").is_ok() {
+                println!(
+                    "[panefx] actual {:.1} fps (target {})",
+                    frames_this_sec as f64 / fps_window.elapsed().as_secs_f64(),
+                    cfg.fps
+                );
+            }
+            frames_this_sec = 0;
+            fps_window = Instant::now();
         }
 
         if let Some(rest) = cfg.frame_time().checked_sub(frame_start.elapsed()) {

@@ -1,11 +1,18 @@
 //! Control channel: a localhost TCP listener the TUI talks to.
 //!
 //! Newline-delimited JSON, one command per line, one JSON reply per command.
-//! Deliberately plain: no framing library, no async runtime. The daemon is
-//! strictly single-threaded and the render loop must never block, so the
-//! listener and every accepted stream are set non-blocking and drained once per
-//! frame — the same contract `ipc::Client::read` honours for the GlazeWM socket
-//! (`WouldBlock` means "nothing to do", not an error).
+//! Deliberately plain: no framing library, no async runtime.
+//!
+//! **Threading:** the RENDER LOOP is single-threaded and must never block, so
+//! this listener and every accepted stream are non-blocking and drained once
+//! per frame (`WouldBlock` means "nothing to do", not an error). The daemon as
+//! a whole is no longer single-threaded — the GlazeWM socket was moved to its
+//! own thread (`ipc::IpcThread`) because reading it inline burned 5ms of every
+//! frame. Only that socket moved; the panel map, GDI handles and HWNDs are
+//! thread-affine and stay here.
+//!
+//! This channel could move to a thread too, but it is genuinely non-blocking
+//! already and costs nothing measurable, so it has not earned the complexity.
 //!
 //! Binding is best-effort. If the port is taken, panefx logs and runs headless
 //! rather than refusing to start: a backdrop you cannot tune beats no backdrop.
