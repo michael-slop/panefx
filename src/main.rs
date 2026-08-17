@@ -193,6 +193,10 @@ fn main() -> anyhow::Result<()> {
         if last_poll.elapsed() >= POLL_INTERVAL {
             needs_query = true;
             last_poll = Instant::now();
+            // Monitors can be plugged in, unplugged or resized while the daemon
+            // runs. GlazeWM's monitor events carry no geometry, so the display
+            // list is the only source of truth — same reasoning as window rects.
+            wall.poll_monitors(&cfg);
         }
         if needs_query {
             client.request_windows()?;
@@ -382,8 +386,15 @@ fn handle_command(
             if wanted != wallpaper::OFF && !animation::EFFECTS.contains(&wanted.as_str()) {
                 return Reply::err(format!("unknown effect '{name}' (or 'off')"));
             }
-            // Mirror into config FIRST, so the choice persists on save even if
-            // no wallpaper layer is available to show it right now.
+            // Apply FIRST, mirror into config only on success.
+            //
+            // The other order leaves a rejected value in the config — where it
+            // saves to disk and comes back on the next load — which is the
+            // behaviour `set_field_rejects_bad_values` already forbids for every
+            // other setting.
+            if let Err(e) = wall.set_effect(monitor, &wanted, cfg) {
+                return Reply::err(e);
+            }
             match monitor {
                 Some(i) => {
                     cfg.wallpaper_effects.insert(i, wanted.clone());
@@ -393,9 +404,6 @@ fn handle_command(
                         cfg.wallpaper_effects.insert(m, wanted.clone());
                     }
                 }
-            }
-            if let Err(e) = wall.set_effect(monitor, &wanted, cfg) {
-                return Reply::err(e);
             }
             Reply::with(snapshot(sim, cfg, wall))
         }

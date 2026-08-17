@@ -455,6 +455,49 @@ impl WallpaperSet {
         }
     }
 
+    /// Has the set of monitors changed since the surfaces were built?
+    ///
+    /// Compares index AND geometry, not just the count: swapping a 1080p screen
+    /// for a 1440p one at the same index keeps the count identical while making
+    /// every surface the wrong size.
+    fn monitors_changed(&self, current: &[MonitorInfo]) -> bool {
+        if current.len() != self.surfaces.len() {
+            return true;
+        }
+        current
+            .iter()
+            .zip(self.surfaces.iter())
+            .any(|(m, s)| *m != s.monitor)
+    }
+
+    /// Notice monitors being plugged in, unplugged, or resized.
+    ///
+    /// GlazeWM does emit `monitor_added` / `monitor_removed`, but they arrive as
+    /// a generic "something changed" hint carrying no geometry, so this compares
+    /// against the real display list. Without it a new monitor never gets a
+    /// surface and a changed one keeps drawing at its old size — and because the
+    /// daemon usually outlives several dock/undock cycles, that is the normal
+    /// case rather than a rare one.
+    ///
+    /// Cheap enough for the 500ms poll: `EnumDisplayMonitors` over a handful of
+    /// displays, then an equality check.
+    pub fn poll_monitors(&mut self, cfg: &Config) -> bool {
+        if self.worker.is_none() {
+            return false;
+        }
+        let current = desktop::enumerate_monitors();
+        if !self.monitors_changed(&current) {
+            return false;
+        }
+        println!(
+            "[panefx] monitor layout changed ({} -> {}), rebuilding wallpaper",
+            self.surfaces.len(),
+            current.len()
+        );
+        self.rebuild_surfaces(cfg);
+        true
+    }
+
     /// Recompute occlusion from the window-manager's list.
     ///
     /// Must be handed the UNFILTERED list: a terminal-only view would miss every
@@ -546,13 +589,31 @@ impl WallpaperSet {
             return Err(format!("unknown effect '{name}' (or '{OFF}')"));
         }
         let Some(worker) = self.worker else {
-            // Config was already updated by the caller, so the choice persists
-            // and takes effect if the layer ever becomes available.
+            // No layer to draw into (see `desktop::find`). Report success so the
+            // caller still records the choice: it persists to config and takes
+            // effect if the layer ever becomes available. There is nothing to
+            // validate against here — with no monitors enumerated, any index is
+            // as plausible as another.
             return Ok(());
         };
 
         let targets: Vec<usize> = match monitor {
-            Some(i) => vec![i],
+            Some(i) => {
+                // Naming a monitor that is not attached must SAY SO. Silently
+                // returning ok while changing nothing is the same shape as the
+                // ANSI_CHARSET bug: the call succeeds, nothing errors, and you
+                // simply do not get what you asked for.
+                if !self.surfaces.iter().any(|s| s.monitor.index == i) {
+                    let have: Vec<String> =
+                        self.monitor_indices().iter().map(|n| n.to_string()).collect();
+                    return Err(if have.is_empty() {
+                        format!("no monitor {i} — no monitors are attached")
+                    } else {
+                        format!("no monitor {i} — attached: {}", have.join(", "))
+                    });
+                }
+                vec![i]
+            }
             None => self.monitor_indices(),
         };
 
@@ -857,6 +918,136 @@ mod tests {
         }
         let after = pool.fingerprint(&k).unwrap();
         assert_ne!(during, after, "it must resume when it becomes visible");
+    }
+
+    // ---- monitor hot-plug --------------------------------------------------
+
+    fn surface_for(m: MonitorInfo) -> MonitorSurface {
+        MonitorSurface {
+            monitor: m,
+            panel: None,
+            effect: "flames".into(),
+            sim: None,
+            occluded: false,
+            force_redraw: true,
+        }
+    }
+
+    /// A `WallpaperSet` with surfaces but no real windows, for pure logic tests.
+    fn set_with(monitors: Vec<MonitorInfo>) -> WallpaperSet {
+        let mut w = WallpaperSet {
+            worker: None,
+            error: None,
+            pool: SimPool::new(),
+            surfaces: Vec::new(),
+            last_frame: std::time::Instant::now(),
+            last_worker_try: std::time::Instant::now(),
+        };
+        w.surfaces = monitors.into_iter().map(surface_for).collect();
+        w
+    }
+
+    fn mon_at(index: usize, w: i32, h: i32) -> MonitorInfo {
+        MonitorInfo {
+            index,
+            device: format!(r"\\.\DISPLAY{index}"),
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+            primary: index == 1,
+        }
+    }
+
+    #[test]
+    fn an_unchanged_monitor_list_does_not_rebuild() {
+        // The 500ms poll must be free when nothing has moved, or it churns every
+        // surface (and every simulation) twice a second.
+        let ms = vec![mon_at(1, 1920, 1080), mon_at(3, 1280, 720)];
+        let set = set_with(ms.clone());
+        assert!(!set.monitors_changed(&ms));
+    }
+
+    #[test]
+    fn plugging_in_a_monitor_is_noticed() {
+        let set = set_with(vec![mon_at(1, 1920, 1080)]);
+        let now = vec![mon_at(1, 1920, 1080), mon_at(2, 2560, 1440)];
+        assert!(set.monitors_changed(&now));
+    }
+
+    #[test]
+    fn unplugging_a_monitor_is_noticed() {
+        let set = set_with(vec![mon_at(1, 1920, 1080), mon_at(2, 2560, 1440)]);
+        let now = vec![mon_at(1, 1920, 1080)];
+        assert!(set.monitors_changed(&now));
+    }
+
+    #[test]
+    fn a_resolution_change_is_noticed_even_though_the_count_is_the_same() {
+        // The case a count check would miss entirely: swap a 1080p screen for a
+        // 1440p one and every surface is now the wrong size, silently.
+        let set = set_with(vec![mon_at(1, 1920, 1080)]);
+        let now = vec![mon_at(1, 2560, 1440)];
+        assert!(
+            set.monitors_changed(&now),
+            "same count, different geometry — surfaces would be stale"
+        );
+    }
+
+    #[test]
+    fn a_monitor_moving_is_noticed() {
+        // Rearranging displays changes origins, and a wallpaper positioned from
+        // a stale origin lands on the wrong screen.
+        let set = set_with(vec![mon_at(1, 1920, 1080)]);
+        let mut moved = mon_at(1, 1920, 1080);
+        moved.x = -1920;
+        assert!(set.monitors_changed(&[moved]));
+    }
+
+    #[test]
+    fn naming_an_unattached_monitor_is_an_error_not_a_silent_no_op() {
+        // Returning ok while changing nothing is the ANSI_CHARSET shape: the
+        // call succeeds, nothing errors, and you do not get what you asked for.
+        let cfg = Config::default();
+        let mut set = set_with(vec![mon_at(1, 1920, 1080), mon_at(3, 1280, 720)]);
+        // Pretend the layer exists so we reach the validation rather than the
+        // no-layer early return.
+        set.worker = Some(Workerw {
+            hwnd: windows::Win32::Foundation::HWND(std::ptr::null_mut()),
+            origin: (0, 0),
+        });
+        let err = set
+            .set_effect(Some(9), "waves", &cfg)
+            .expect_err("monitor 9 is not attached");
+        assert!(err.contains('9'), "the message must name the bad index: {err}");
+        assert!(
+            err.contains('1') && err.contains('3'),
+            "and list what IS attached: {err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_effect_is_rejected_before_anything_is_touched() {
+        let cfg = Config::default();
+        let mut set = set_with(vec![mon_at(1, 1920, 1080)]);
+        let err = set.set_effect(Some(1), "banana", &cfg).expect_err("bogus");
+        assert!(err.contains("banana"));
+        assert_eq!(
+            set.surfaces[0].effect, "flames",
+            "a rejected effect must not mutate the surface"
+        );
+    }
+
+    #[test]
+    fn setting_an_effect_with_no_layer_succeeds_so_the_choice_persists() {
+        // No WorkerW (the Windows 11 25H2 case). The daemon still records the
+        // choice, so it applies if the layer ever appears — and so the TUI does
+        // not report a spurious failure for something that is not the user's
+        // fault.
+        let cfg = Config::default();
+        let mut set = set_with(vec![]);
+        assert!(set.worker.is_none());
+        assert!(set.set_effect(Some(3), "waves", &cfg).is_ok());
     }
 
     #[test]

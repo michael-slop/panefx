@@ -824,6 +824,26 @@ mod tests {
     }
 
     #[test]
+    fn an_unplugged_monitors_effect_survives_a_save_and_reload() {
+        // Unplug a monitor and its chosen effect must NOT be discarded, so
+        // plugging it back in restores what the user set rather than silently
+        // reverting to `off`. Keying on the DISPLAY<n> number is what makes this
+        // work — an index into the attached list would renumber and hand the
+        // setting to a different screen.
+        let mut c = Config::default();
+        c.wallpaper_effects.insert(1, "waves".into());
+        c.wallpaper_effects.insert(7, "rain".into()); // not currently attached
+        let mut back = Config::default();
+        back.apply_toml(&c.to_toml());
+        assert_eq!(
+            back.wallpaper_effects.get(&7).map(String::as_str),
+            Some("rain"),
+            "an absent monitor's choice must survive a save/load cycle"
+        );
+        assert_eq!(back.wallpaper_effects.len(), 2);
+    }
+
+    #[test]
     fn a_stray_wallpaper_key_inside_an_effect_section_stays_a_param() {
         // Ordering guard: the prefix match must sit AFTER the effect-section
         // diversion, or a key inside [waves] would reach global state.
