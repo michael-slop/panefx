@@ -19,15 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-NOTE ON SCOPE
-
-This licence covers the SOURCE CODE in this repository only.
-
-It does NOT cover, and cannot grant any rights to, the Baldur's Gate 3 cursor
-artwork that these scripts extract. That artwork is the copyrighted property of
-Larian Studios. This repository contains none of it. Extracting it from a copy
-of the game you own, for your own personal use, is your business; redistributing
-it is not covered by this licence and is not endorsed by this project.
