@@ -68,6 +68,24 @@ pub struct Config {
     /// touching `Config`.
     pub effect_params: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
 
+    /// The DESKTOP's own copy of the same knobs, keyed the same way.
+    ///
+    /// Separate from `effect_params` on purpose: `waves` behind a terminal and
+    /// `waves` on the desktop are the same effect with entirely different jobs.
+    /// The pane version is tuned to stay legible behind 60%-opaque text; the
+    /// wallpaper has a whole screen and no text over it. Sharing one set would
+    /// mean tuning either one wrecks the other.
+    ///
+    /// Shared across monitors — each screen picks its own EFFECT, but two
+    /// screens running `waves` use the same wallpaper-waves values.
+    ///
+    /// An absent entry means "this effect has never been tuned for the
+    /// desktop", and `apply_saved_params` then leaves the effect's own
+    /// constructor defaults alone. That is deliberate: the desktop starts from
+    /// the effect's defaults, NOT from a copy of the pane's values.
+    pub wallpaper_effect_params:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+
     // ---- desktop wallpaper -------------------------------------------------
     /// Frame rate for the desktop wallpaper, independent of `fps`.
     ///
@@ -117,6 +135,7 @@ impl Default for Config {
             // on first run after this became panefx's job.
             opacity: 60,
             effect_params: Default::default(),
+            wallpaper_effect_params: Default::default(),
             // Half the terminal rate. The desktop is scenery.
             wallpaper_fps: 5,
             // EMPTY = wallpapers off. A new feature must not change what the
@@ -138,6 +157,23 @@ impl Default for Config {
 pub fn parse_wallpaper_effect_key(k: &str) -> Option<usize> {
     let rest = k.strip_prefix("wallpaper_")?.strip_suffix("_effect")?;
     rest.parse::<usize>().ok().filter(|n| *n >= 1 && *n <= 64)
+}
+
+/// `wallpaper.waves` -> `Some("waves")`. Anything else -> `None`.
+///
+/// Requiring the suffix to be a REAL effect name is the load-bearing part. The
+/// TOML parser treats any unrecognised `[section]` as decorative and lets its
+/// keys fall through to the top-level fields, so a loose match here would let a
+/// `[wallpaper.anything]` block quietly set `fps`, `cell_w` or `chars`.
+///
+/// A bare `[wallpaper]` deliberately does NOT match: that spelling is already
+/// decorative, and `wallpaper_keys_must_stay_flat_not_a_section` depends on it
+/// staying that way.
+pub fn parse_wallpaper_section(sec: &str) -> Option<String> {
+    let eff = sec.strip_prefix("wallpaper.")?;
+    crate::animation::EFFECTS
+        .contains(&eff)
+        .then(|| eff.to_string())
 }
 
 fn env_str(key: &str) -> Option<String> {
@@ -267,6 +303,24 @@ impl Config {
             };
             let k = k.trim().to_lowercase();
             let v = v.trim().trim_matches('"').trim_matches('\'');
+
+            // `[wallpaper.<effect>]` -> the DESKTOP's copy of that effect's
+            // params.
+            //
+            // MUST come before the EFFECTS check below. Without it,
+            // `wallpaper.waves` matches neither branch, falls through to the
+            // decorative-section path, and every key under it lands in the
+            // top-level match -- where `chars` would be hijacked by waves' ramp
+            // and `fps` by whatever integer happened to be there.
+            if let Some(sec) = section.as_deref() {
+                if let Some(eff) = parse_wallpaper_section(sec) {
+                    self.wallpaper_effect_params
+                        .entry(eff)
+                        .or_default()
+                        .insert(k, v.to_string());
+                    continue;
+                }
+            }
 
             // Only sections NAMED FOR AN EFFECT hold per-effect params.
             //
@@ -522,6 +576,38 @@ impl Config {
                 }
             }
         }
+        // The DESKTOP's copy of the same knobs.
+        //
+        // `[wallpaper.waves]` is read as params only because `waves` is a real
+        // effect name -- see `parse_wallpaper_section`. A bare `[wallpaper]`
+        // header is still decorative and its keys still set the fields above.
+        if self.wallpaper_effect_params.values().any(|m| !m.is_empty()) {
+            s.push_str("
+# --- wallpaper effect parameters -----------------------------------
+");
+            s.push_str("# The desktop's OWN copy of each effect's knobs, independent of the
+");
+            s.push_str("# same effect running behind a terminal. Shared across monitors.
+");
+        }
+        for (effect, params) in &self.wallpaper_effect_params {
+            if params.is_empty() {
+                continue;
+            }
+            s.push_str(&format!("
+[wallpaper.{effect}]
+"));
+            for (k, v) in params {
+                if v.parse::<i64>().is_ok() {
+                    s.push_str(&format!("{k} = {v}
+"));
+                } else {
+                    s.push_str(&format!("{k} = \"{v}\"
+"));
+                }
+            }
+        }
+
         s
     }
 
@@ -539,6 +625,17 @@ impl Config {
     /// `Config` never needs to know an effect's value types.
     pub fn set_effect_param(&mut self, effect: &str, key: &str, value: String) {
         self.effect_params
+            .entry(effect.to_lowercase())
+            .or_default()
+            .insert(key.to_string(), value);
+    }
+
+    /// Record a wallpaper param so it survives a save.
+    ///
+    /// Deliberately a separate map from `set_effect_param`: tuning the desktop
+    /// must not move the terminal backdrop, which is the whole point.
+    pub fn set_wallpaper_effect_param(&mut self, effect: &str, key: &str, value: String) {
+        self.wallpaper_effect_params
             .entry(effect.to_lowercase())
             .or_default()
             .insert(key.to_string(), value);
@@ -949,5 +1046,106 @@ mod tests {
             c.effect_params["waves"].get("wallpaper_1_effect").map(String::as_str),
             Some("rain")
         );
+    }
+
+    // ---- wallpaper effect params -------------------------------------------
+
+    #[test]
+    fn wallpaper_params_live_in_their_own_namespace() {
+        // THE requirement: the same effect, tuned twice, independently.
+        let mut c = Config::default();
+        c.apply_toml("[waves]
+ink = \"#ff0000\"
+
+[wallpaper.waves]
+ink = \"#0000ff\"");
+        assert_eq!(c.effect_params["waves"]["ink"], "#ff0000");
+        assert_eq!(c.wallpaper_effect_params["waves"]["ink"], "#0000ff");
+    }
+
+    #[test]
+    fn tuning_the_pane_does_not_move_the_wallpaper() {
+        let mut c = Config::default();
+        c.set_effect_param("waves", "ink", "#ff0000".into());
+        assert!(c.wallpaper_effect_params.is_empty(), "pane tuning leaked");
+        c.set_wallpaper_effect_param("waves", "ink", "#0000ff".into());
+        assert_eq!(c.effect_params["waves"]["ink"], "#ff0000", "wallpaper tuning leaked");
+    }
+
+    #[test]
+    fn parse_wallpaper_section_is_strict() {
+        assert_eq!(parse_wallpaper_section("wallpaper.waves").as_deref(), Some("waves"));
+        assert_eq!(parse_wallpaper_section("wallpaper.rain").as_deref(), Some("rain"));
+        // A bare [wallpaper] must stay decorative -- another test depends on it.
+        assert_eq!(parse_wallpaper_section("wallpaper"), None);
+        assert_eq!(parse_wallpaper_section("wallpaper."), None);
+        // Not a real effect: must not become a param sink.
+        assert_eq!(parse_wallpaper_section("wallpaper.nonsense"), None);
+        assert_eq!(parse_wallpaper_section("wallpaper.waves.extra"), None);
+        assert_eq!(parse_wallpaper_section("waves"), None);
+        assert_eq!(parse_wallpaper_section("display"), None);
+    }
+
+    #[test]
+    fn an_unknown_dotted_section_stays_decorative() {
+        // The safety story: only REAL effect names become param sinks. Anything
+        // else keeps the old decorative behaviour, so its keys still set the
+        // top-level fields rather than vanishing into a map nothing reads.
+        let mut c = Config::default();
+        c.apply_toml("[wallpaper.nonsense]
+fps = 7");
+        assert_eq!(c.fps, 7, "an unknown dotted section must stay decorative");
+        assert!(c.wallpaper_effect_params.is_empty());
+    }
+
+    #[test]
+    fn a_bare_wallpaper_section_is_still_decorative() {
+        // Guards the same rule from the new feature's side: adding
+        // `[wallpaper.<effect>]` must not accidentally make `[wallpaper]` a
+        // section too.
+        let mut c = Config::default();
+        c.apply_toml("[wallpaper]
+fps = 5");
+        assert_eq!(c.fps, 5);
+        assert_eq!(c.wallpaper_fps, Config::default().wallpaper_fps);
+        assert!(c.wallpaper_effect_params.is_empty());
+    }
+
+    #[test]
+    fn wallpaper_params_round_trip_through_toml() {
+        let mut c = Config::default();
+        c.set_effect_param("waves", "ink", "#ff0000".into());
+        c.set_wallpaper_effect_param("waves", "ink", "#0000ff".into());
+        c.set_wallpaper_effect_param("waves", "darkcut", "400".into());
+        let mut back = Config::default();
+        back.apply_toml(&c.to_toml());
+        assert_eq!(back.effect_params, c.effect_params);
+        assert_eq!(back.wallpaper_effect_params, c.wallpaper_effect_params);
+    }
+
+    #[test]
+    fn wallpaper_sections_do_not_disturb_the_flat_monitor_keys() {
+        // `wallpaper_1_effect` and `[wallpaper.waves]` share a prefix but are
+        // parsed by different rules; neither may swallow the other.
+        let mut c = Config::default();
+        c.apply_toml("wallpaper_1_effect = \"waves\"
+wallpaper_fps = 9
+
+[wallpaper.waves]
+ink = \"#0000ff\"");
+        assert_eq!(c.wallpaper_effects.get(&1).map(String::as_str), Some("waves"));
+        assert_eq!(c.wallpaper_fps, 9);
+        assert_eq!(c.wallpaper_effect_params["waves"]["ink"], "#0000ff");
+        let mut back = Config::default();
+        back.apply_toml(&c.to_toml());
+        assert_eq!(back.wallpaper_effects, c.wallpaper_effects);
+        assert_eq!(back.wallpaper_fps, 9);
+        assert_eq!(back.wallpaper_effect_params, c.wallpaper_effect_params);
+    }
+
+    #[test]
+    fn an_empty_wallpaper_param_map_emits_no_section() {
+        let c = Config::default();
+        assert!(!c.to_toml().contains("[wallpaper."));
     }
 }

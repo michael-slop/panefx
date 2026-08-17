@@ -220,7 +220,7 @@ fn main() -> anyhow::Result<()> {
     let mut effect_idx = 0usize;
     let mut sim: Box<dyn AsciiAnimation> =
         animation::build(&cfg.rotation[0], 0, 0, 0x5EED_1234, &cfg);
-    apply_saved_params(sim.as_mut(), &cfg);
+    apply_saved_params(sim.as_mut(), &cfg, animation::Scope::Pane);
     let mut last_rotate = Instant::now();
 
     // Live control. Absent if the port is taken — panefx still runs.
@@ -459,6 +459,29 @@ fn handle_command(
             })
             .collect(),
         wallpaper_error: wall.error.clone(),
+        // Params for every effect in use on any monitor.
+        //
+        // Built from a throwaway 1x1 instance rather than read off a pooled
+        // sim: a monitor that was just switched on has no sim yet, and showing
+        // an empty param block for an effect named in the row above would look
+        // broken. The probe path is uniform.
+        wallpaper_params: {
+            let mut m = std::collections::BTreeMap::new();
+            for surf in wall.monitors().iter().filter(|s| s.is_on()) {
+                m.entry(surf.effect.clone()).or_insert_with(|| {
+                    let mut probe = animation::build(&surf.effect, 1, 1, 0, cfg);
+                    // Scope::Wallpaper, or the TUI shows built-in defaults while
+                    // the desktop shows the tuned values.
+                    animation::apply_saved_params(
+                        probe.as_mut(),
+                        cfg,
+                        animation::Scope::Wallpaper,
+                    );
+                    probe.params()
+                });
+            }
+            m
+        },
     };
 
     match cmd {
@@ -486,7 +509,7 @@ fn handle_command(
             // Rain captures frame_ms at construction, so fps needs a rebuild.
             if key == "fps" {
                 let name = sim.name().to_string();
-                *sim = rebuild(cfg, &name, sim_cols, sim_rows, 0x5EED_1234);
+                *sim = rebuild(cfg, &name, sim_cols, sim_rows, 0x5EED_1234, animation::Scope::Pane);
             }
             Reply::with(snapshot(sim, cfg, wall))
         }
@@ -496,7 +519,7 @@ fn handle_command(
             if !animation::EFFECTS.contains(&wanted.as_str()) {
                 return Reply::err(format!("unknown effect '{name}'"));
             }
-            *sim = rebuild(cfg, &wanted, sim_cols, sim_rows, 0x5EED_1234);
+            *sim = rebuild(cfg, &wanted, sim_cols, sim_rows, 0x5EED_1234, animation::Scope::Pane);
             // Effects can prefer different cell sizes, so the grid dimensions
             // may be wrong for the new one until it is recomputed.
             *needs_query = true;
@@ -533,7 +556,7 @@ fn handle_command(
         Command::Revert => {
             *cfg = config::Config::load();
             let name = cfg.rotation[0].clone();
-            *sim = rebuild(cfg, &name, sim_cols, sim_rows, 0x5EED_1234);
+            *sim = rebuild(cfg, &name, sim_cols, sim_rows, 0x5EED_1234, animation::Scope::Pane);
             *effect_idx = 0;
             *needs_query = true;
             // The wallpaper must follow the reloaded config too, or revert
@@ -541,6 +564,26 @@ fn handle_command(
             wall.rebuild_surfaces(cfg);
             // Same for opacity: the reloaded config may carry a different one.
             *pending_opacity = Some((cfg.opacity, Instant::now()));
+            Reply::with(snapshot(sim, cfg, wall))
+        }
+
+        Command::WallpaperParam { effect, key, val } => {
+            let eff = effect.trim().to_lowercase();
+            if !animation::EFFECTS.contains(&eff.as_str()) {
+                return Reply::err(format!("unknown effect '{effect}'"));
+            }
+            // Validate against a throwaway BEFORE recording, so a bad key is
+            // rejected rather than persisted -- the same rule `set_field`
+            // follows for every other setting.
+            let mut probe = animation::build(&eff, 1, 1, 0, cfg);
+            if !probe.set_param(&key, &val) {
+                return Reply::err(format!("effect '{eff}' has no param '{key}'"));
+            }
+            cfg.set_wallpaper_effect_param(&eff, &key, val.display());
+            // Push it to every live surface running this effect, in place, so
+            // the change is visible immediately without restarting the
+            // animation.
+            wall.reapply_params(&eff, cfg);
             Reply::with(snapshot(sim, cfg, wall))
         }
 

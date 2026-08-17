@@ -99,6 +99,17 @@ struct App {
     editing: Option<String>,
     /// True when the daemon has a working wallpaper layer.
     wallpaper_ok: bool,
+    /// The last snapshot, kept so moving the cursor can rebuild the wallpaper
+    /// rows locally. `absorb` only runs on a daemon reply, so without this the
+    /// "params follow the highlighted monitor" rule would never fire on a plain
+    /// arrow key.
+    last_snap: serde_json::Value,
+    /// Which effect the Wallpaper tab's param rows belong to.
+    ///
+    /// Load-bearing for dispatch: `Row::Param` is shared with the TUI-Pane tab,
+    /// and without knowing the effect the wallpaper rows would send the pane's
+    /// `param` command and silently retune the terminal backdrop instead.
+    wallpaper_param_effect: String,
 }
 
 struct Conn {
@@ -142,6 +153,8 @@ impl App {
             last_blink: std::time::Instant::now(),
             editing: None,
             wallpaper_ok: false,
+            last_snap: serde_json::Value::Null,
+            wallpaper_param_effect: String::new(),
         };
         app.sel[0].select(Some(0));
         app.sel[1].select(Some(0));
@@ -165,6 +178,28 @@ impl App {
         let cur = self.selected() as isize;
         let next = (cur + delta).rem_euclid(n as isize) as usize;
         self.sel[self.view.idx()].select(Some(next));
+        // On the Wallpaper tab the param rows follow the highlighted monitor,
+        // so moving the cursor changes which rows exist. `absorb` only runs on
+        // a daemon reply, so rebuild locally from the cached snapshot rather
+        // than round-tripping on every arrow key.
+        if self.view == View::Wallpaper {
+            self.rebuild_wallpaper_rows();
+        }
+    }
+
+    /// Rebuild the Wallpaper tab from the cached snapshot.
+    fn rebuild_wallpaper_rows(&mut self) {
+        if self.last_snap.is_null() {
+            return;
+        }
+        let sel = self.sel[View::Wallpaper.idx()].selected().unwrap_or(0);
+        let (rows, eff) = build_wallpaper_rows(&self.last_snap, sel);
+        self.wallpaper_param_effect = eff;
+        let n = rows.len();
+        self.rows[View::Wallpaper.idx()] = rows;
+        // Clamp: the row count changes with the highlighted monitor's effect.
+        let cur = self.sel[View::Wallpaper.idx()].selected().unwrap_or(0);
+        self.sel[View::Wallpaper.idx()].select(Some(if n == 0 { 0 } else { cur.min(n - 1) }));
     }
 
     /// Rebuild the row list from a daemon snapshot.
@@ -279,7 +314,11 @@ impl App {
 
         // ---- wallpaper view ----
         self.wallpaper_ok = snap.get("wallpaper_error").is_none();
-        self.rows[View::Wallpaper.idx()] = build_wallpaper_rows(snap);
+        self.last_snap = snap.clone();
+        let wsel = self.sel[View::Wallpaper.idx()].selected().unwrap_or(0);
+        let (wrows, weff) = build_wallpaper_rows(snap, wsel);
+        self.wallpaper_param_effect = weff;
+        self.rows[View::Wallpaper.idx()] = wrows;
 
         // Clamp EVERY view's selection to its new row count.
         //
@@ -328,8 +367,16 @@ impl App {
             Row::Param(p) => match &p.value {
                 ParamValue::Int { v } => {
                     let nv = (v + delta).clamp(p.min, p.max);
-                    serde_json::json!({"cmd":"param","key":p.key,
-                        "val":{"kind":"int","v":nv}})
+                    // Route by TAB. `Row::Param` is shared, so without this the
+                    // Wallpaper tab would send the pane's `param` command and
+                    // silently retune the terminal backdrop while the user
+                    // watched an unchanged desktop.
+                    param_command(
+                        self.view == View::Wallpaper,
+                        &self.wallpaper_param_effect,
+                        &p.key,
+                        serde_json::json!({"kind":"int","v":nv}),
+                    )
                 }
                 // Colours and text need typed entry, not nudging.
                 _ => {
@@ -416,28 +463,29 @@ impl App {
             return;
         };
         let msg = match row {
-            Row::Param(p) => match &p.value {
-                ParamValue::Text { .. } => serde_json::json!({"cmd":"param","key":p.key,
-                    "val":{"kind":"text","v":text}}),
-                ParamValue::Colour { .. } => {
-                    match panefx::palette::Rgb::parse_hex(&text) {
-                        Some(c) => serde_json::json!({"cmd":"param","key":p.key,
-                            "val":{"kind":"colour","r":c.0,"g":c.1,"b":c.2}}),
+            Row::Param(p) => {
+                // Same tab routing as `nudge` -- see the note there.
+                let wall = self.view == View::Wallpaper;
+                let eff = self.wallpaper_param_effect.clone();
+                let val = match &p.value {
+                    ParamValue::Text { .. } => serde_json::json!({"kind":"text","v":text}),
+                    ParamValue::Colour { .. } => match panefx::palette::Rgb::parse_hex(&text) {
+                        Some(c) => serde_json::json!({"kind":"colour","r":c.0,"g":c.1,"b":c.2}),
                         None => {
                             self.status = format!("'{text}' is not #rrggbb");
                             return;
                         }
-                    }
-                }
-                ParamValue::Int { .. } => match text.trim().parse::<i64>() {
-                    Ok(n) => serde_json::json!({"cmd":"param","key":p.key,
-                        "val":{"kind":"int","v":n.clamp(p.min,p.max)}}),
-                    Err(_) => {
-                        self.status = format!("'{text}' is not a number");
-                        return;
-                    }
-                },
-            },
+                    },
+                    ParamValue::Int { .. } => match text.trim().parse::<i64>() {
+                        Ok(n) => serde_json::json!({"kind":"int","v":n.clamp(p.min, p.max)}),
+                        Err(_) => {
+                            self.status = format!("'{text}' is not a number");
+                            return;
+                        }
+                    },
+                };
+                param_command(wall, &eff, &p.key, val)
+            }
             Row::ConfigText { key, .. } => serde_json::json!({"cmd":"set","key":key,"val":text}),
             Row::Config { key, min, max, .. } => match text.trim().parse::<i64>() {
                 Ok(n) => serde_json::json!({"cmd":"set","key":key,"val":n.clamp(min,max)}),
@@ -469,7 +517,53 @@ fn wallpaper_cycle_from(effects: &[String]) -> Vec<String> {
 ///
 /// Free function rather than a method so it can be tested against captured
 /// snapshots without a live daemon or a terminal.
-fn build_wallpaper_rows(snap: &serde_json::Value) -> Vec<Row> {
+/// Build the JSON for a param change, routed to the correct SURFACE.
+///
+/// `Row::Param` is shared between the two tabs, so the tab decides where the
+/// value goes. Without this the Wallpaper tab sends the pane's `param` command
+/// and silently retunes the terminal backdrop while the user watches an
+/// unchanged desktop -- the single most likely bug in this feature, and one
+/// with no visible error when it happens.
+fn param_command(
+    wallpaper: bool,
+    effect: &str,
+    key: &str,
+    val: serde_json::Value,
+) -> serde_json::Value {
+    if wallpaper {
+        serde_json::json!({"cmd":"wallpaper_param","effect":effect,"key":key,"val":val})
+    } else {
+        serde_json::json!({"cmd":"param","key":key,"val":val})
+    }
+}
+
+/// Which effect's params the Wallpaper tab shows.
+///
+/// The highlighted monitor's, so the knobs sit directly under the row that
+/// names them. Falls back to the first monitor that is on, because the highlight
+/// spends half its life on the fps/cell rows at the bottom and the param block
+/// must not vanish when it does. `None` when every monitor is off.
+fn wallpaper_param_effect(monitors: &[serde_json::Value], sel: usize) -> Option<String> {
+    let effect_of = |m: &serde_json::Value| {
+        m.get("effect")
+            .and_then(|v| v.as_str())
+            .filter(|e| *e != "off")
+            .map(String::from)
+    };
+    // The highlight is on a monitor row when sel < monitors.len(): the monitor
+    // rows are always FIRST and fixed-length, which is what keeps the selection
+    // stable as the param rows below change length.
+    if let Some(m) = monitors.get(sel) {
+        if let Some(e) = effect_of(m) {
+            return Some(e);
+        }
+    }
+    monitors.iter().find_map(effect_of)
+}
+
+/// Build the Wallpaper tab's rows, and report which effect the param rows are
+/// for so dispatch can route them to the wallpaper rather than the pane.
+fn build_wallpaper_rows(snap: &serde_json::Value, sel: usize) -> (Vec<Row>, String) {
     let mut rows: Vec<Row> = Vec::new();
     let cfg = snap.get("config").cloned().unwrap_or_default();
     let ci = |k: &str| cfg.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
@@ -496,12 +590,12 @@ fn build_wallpaper_rows(snap: &serde_json::Value) -> Vec<Row> {
         rows.push(Row::Note(
             "Terminal and Neovide backdrops are unaffected.".into(),
         ));
-        return rows;
+        return (rows, String::new());
     }
 
     if monitors.is_empty() {
         rows.push(Row::Note("no monitors detected".into()));
-        return rows;
+        return (rows, String::new());
     }
 
     for m in &monitors {
@@ -524,6 +618,34 @@ fn build_wallpaper_rows(snap: &serde_json::Value) -> Vec<Row> {
         });
     }
     rows.push(Row::WallpaperApplyAll);
+
+    // The desktop's OWN knobs for whichever effect is in focus.
+    //
+    // Placed between the monitor rows and the fps/cell block: they belong to
+    // the monitor row above them, and the fps/cell rows are set-once settings
+    // that read naturally as a trailing block. Keeping the monitor rows first
+    // and fixed-length also keeps the selection stable while these change
+    // length underneath it.
+    let param_effect = wallpaper_param_effect(&monitors, sel).unwrap_or_default();
+    if param_effect.is_empty() {
+        rows.push(Row::Note(
+            "every monitor is off — turn one on to tune its look".into(),
+        ));
+    } else {
+        let params: Vec<Param> = snap
+            .get("wallpaper_params")
+            .and_then(|m| m.get(&param_effect))
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        if params.is_empty() {
+            rows.push(Row::Note(format!("'{param_effect}' has no tunable knobs")));
+        } else {
+            rows.push(Row::Note(format!(
+                "{param_effect} — desktop only; shared by every monitor running it"
+            )));
+            rows.extend(params.into_iter().map(Row::Param));
+        }
+    }
 
     let asked = ci("wallpaper_fps");
     rows.push(Row::Config {
@@ -555,7 +677,7 @@ fn build_wallpaper_rows(snap: &serde_json::Value) -> Vec<Row> {
         min: 1,
         max: 64,
     });
-    rows
+    (rows, param_effect)
 }
 
 fn row_label(r: &Row) -> String {
@@ -1001,7 +1123,7 @@ mod view_tests {
         // An empty list would read as "panefx is broken" when the terminal
         // backdrops are working perfectly. It must say why, and say what is
         // unaffected.
-        let rows = build_wallpaper_rows(&snapshot_without_layer()["snapshot"]);
+        let (rows, _) = build_wallpaper_rows(&snapshot_without_layer()["snapshot"], 0);
         assert!(!rows.is_empty(), "never show an empty wallpaper tab");
         let text: String = rows.iter().map(|r| row_value(r, "waves")).collect::<Vec<_>>().join(" ");
         assert!(text.contains("unavailable"));
@@ -1012,7 +1134,7 @@ mod view_tests {
 
     #[test]
     fn monitors_render_with_effect_and_frozen_state() {
-        let rows = build_wallpaper_rows(&snapshot_with_monitors()["snapshot"]);
+        let (rows, _) = build_wallpaper_rows(&snapshot_with_monitors()["snapshot"], 0);
         let mons: Vec<&Row> = rows.iter()
             .filter(|r| matches!(r, Row::WallpaperMonitor { .. })).collect();
         assert_eq!(mons.len(), 2);
@@ -1033,5 +1155,111 @@ mod view_tests {
         let cycle = wallpaper_cycle_from(&effects);
         assert_eq!(cycle[0], "off");
         assert_eq!(cycle.len(), 5);
+    }
+
+    /// A snapshot with two monitors on DIFFERENT effects, plus their params.
+    fn snapshot_two_effects() -> serde_json::Value {
+        serde_json::json!({"snapshot":{
+            "effect":"waves","effects":["flames","rain","waves","fire"],
+            "params":[],
+            "config":{"font":"F","cell_w":10,"cell_h":15,"fps":10,"crop_top":0,
+                      "pad_x":10,"pad_y":8,"rotation":["waves"],"rotate_secs":0,
+                      "opacity":60,"wallpaper_fps":5,"wallpaper_fps_effective":5,
+                      "wallpaper_cell_w":15,"wallpaper_cell_h":23},
+            "wallpaper":[
+                {"index":1,"label":"1440x2560 portrait","effect":"waves","occluded":false},
+                {"index":3,"label":"1920x1080 (primary)","effect":"flames","occluded":false}
+            ],
+            "wallpaper_params":{
+                "waves":[{"key":"ink","label":"ink colour","value":{"kind":"colour","r":0,"g":0,"b":255},"min":0,"max":0}],
+                "flames":[{"key":"seed","label":"flame height","value":{"kind":"int","v":65},"min":1,"max":200}]
+            }
+        }})
+    }
+
+    #[test]
+    fn the_wallpaper_tab_shows_the_highlighted_monitors_params() {
+        let snap = snapshot_two_effects();
+        let s = &snap["snapshot"];
+        // Row 0 is DISPLAY1 (waves), row 1 is DISPLAY3 (flames).
+        let (_, eff0) = build_wallpaper_rows(s, 0);
+        assert_eq!(eff0, "waves");
+        let (_, eff1) = build_wallpaper_rows(s, 1);
+        assert_eq!(eff1, "flames", "params must follow the highlighted monitor");
+    }
+
+    #[test]
+    fn the_highlight_below_the_monitor_rows_falls_back_to_the_first_one_on() {
+        // The cursor spends half its life on the fps/cell rows; the param block
+        // must not vanish when it does.
+        let snap = snapshot_two_effects();
+        let (_, eff) = build_wallpaper_rows(&snap["snapshot"], 99);
+        assert_eq!(eff, "waves");
+    }
+
+    #[test]
+    fn an_off_monitor_falls_back_rather_than_showing_nothing() {
+        let mut snap = snapshot_two_effects();
+        snap["snapshot"]["wallpaper"][0]["effect"] = serde_json::json!("off");
+        let (_, eff) = build_wallpaper_rows(&snap["snapshot"], 0);
+        assert_eq!(eff, "flames", "an off monitor falls through to one that is on");
+    }
+
+    #[test]
+    fn all_monitors_off_says_so_instead_of_showing_stale_knobs() {
+        let mut snap = snapshot_two_effects();
+        snap["snapshot"]["wallpaper"][0]["effect"] = serde_json::json!("off");
+        snap["snapshot"]["wallpaper"][1]["effect"] = serde_json::json!("off");
+        let (rows, eff) = build_wallpaper_rows(&snap["snapshot"], 0);
+        assert!(eff.is_empty());
+        assert!(!rows.iter().any(|r| matches!(r, Row::Param(_))), "no knobs to show");
+        let text: String = rows.iter().map(|r| row_value(r, "")).collect::<Vec<_>>().join(" ");
+        assert!(text.contains("turn one on"), "must explain, not just go blank");
+    }
+
+    #[test]
+    fn wallpaper_params_sit_between_apply_all_and_the_fps_rows() {
+        // Load-bearing for selection stability: the monitor rows stay first and
+        // fixed-length, so the cursor does not jump when the param block below
+        // changes size.
+        let snap = snapshot_two_effects();
+        let (rows, _) = build_wallpaper_rows(&snap["snapshot"], 0);
+        let apply = rows.iter().position(|r| matches!(r, Row::WallpaperApplyAll)).unwrap();
+        let param = rows.iter().position(|r| matches!(r, Row::Param(_))).unwrap();
+        let fps = rows
+            .iter()
+            .position(|r| matches!(r, Row::Config { key: "wallpaper_fps", .. }))
+            .unwrap();
+        assert!(apply < param, "params come after the monitor rows");
+        assert!(param < fps, "params come before the fps/cell block");
+        // And the monitor rows are the first thing in the list.
+        assert!(matches!(rows[0], Row::WallpaperMonitor { .. }));
+    }
+
+    #[test]
+    fn a_wallpaper_param_never_retunes_the_pane() {
+        // THE trap. `Row::Param` is shared between tabs, so a missing tab check
+        // sends the pane's `param` command from the Wallpaper tab -- retuning
+        // the terminal backdrop while the desktop sits unchanged, with no error
+        // anywhere. Sabotage-checked: reverting the fork fails this test.
+        let v = serde_json::json!({"kind":"int","v":400});
+        let wall = param_command(true, "waves", "darkcut", v.clone());
+        assert_eq!(wall["cmd"], "wallpaper_param");
+        assert_eq!(wall["effect"], "waves", "the effect must be explicit");
+        assert_eq!(wall["key"], "darkcut");
+
+        let pane = param_command(false, "waves", "darkcut", v);
+        assert_eq!(pane["cmd"], "param");
+        assert!(pane.get("effect").is_none(), "the pane has one current effect");
+    }
+
+    #[test]
+    fn the_two_param_commands_are_never_the_same_shape() {
+        // Guards against a refactor that "unifies" them and reintroduces the bug.
+        let v = serde_json::json!({"kind":"int","v":1});
+        assert_ne!(
+            param_command(true, "waves", "k", v.clone())["cmd"],
+            param_command(false, "waves", "k", v)["cmd"]
+        );
     }
 }

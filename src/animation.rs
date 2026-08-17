@@ -235,15 +235,43 @@ pub fn build(
     }
 }
 
+/// Which saved-parameter namespace a simulation draws from.
+///
+/// The same effect runs in two places with different jobs: behind a terminal it
+/// has to stay legible under 60%-opaque text, on the desktop it has a whole
+/// screen to itself. They keep separate saved values, and this says which set to
+/// read.
+///
+/// Deliberately NOT defaulted anywhere — every call site must state its scope,
+/// so adding a new one cannot silently inherit the wrong parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// The backdrop behind terminal windows.
+    Pane,
+    /// The desktop wallpaper.
+    Wallpaper,
+}
+
 /// Apply any `[effect]` params persisted in config.toml to a freshly built
 /// effect. Values are stored as strings, so each is tried as an int, then a
 /// colour, then plain text — whichever the effect accepts.
 ///
 /// Lives here rather than in `main.rs` because both the terminal supervisor and
 /// the wallpaper's simulation pool need it, and neither should own it.
-pub fn apply_saved_params(sim: &mut dyn AsciiAnimation, cfg: &crate::config::Config) {
+pub fn apply_saved_params(
+    sim: &mut dyn AsciiAnimation,
+    cfg: &crate::config::Config,
+    scope: Scope,
+) {
     let name = sim.name().to_lowercase();
-    let Some(saved) = cfg.effect_params.get(&name) else {
+    let map = match scope {
+        Scope::Pane => &cfg.effect_params,
+        Scope::Wallpaper => &cfg.wallpaper_effect_params,
+    };
+    // No saved entry means this effect has never been tuned in this scope, so
+    // the effect's own constructor defaults stand. That is how the desktop
+    // starts from the effect's defaults rather than a copy of the pane's.
+    let Some(saved) = map.get(&name) else {
         return;
     };
     // Collect first: `params()` borrows, `set_param` needs &mut.
@@ -257,7 +285,13 @@ pub fn apply_saved_params(sim: &mut dyn AsciiAnimation, cfg: &crate::config::Con
             sim.set_param(&k, &ParamValue::Text { v: raw.clone() })
         };
         if !applied {
-            eprintln!("[panefx] config [{name}]: effect ignored '{k}'");
+            // Name the SCOPE too: "[waves]" and "[wallpaper.waves]" are
+            // different sections and the message must say which one is wrong.
+            let sec = match scope {
+                Scope::Pane => name.clone(),
+                Scope::Wallpaper => format!("wallpaper.{name}"),
+            };
+            eprintln!("[panefx] config [{sec}]: effect ignored '{k}'");
         }
     }
 }
@@ -272,8 +306,9 @@ pub fn rebuild(
     cols: usize,
     rows: usize,
     seed: u64,
+    scope: Scope,
 ) -> Box<dyn AsciiAnimation> {
     let mut s = build(name, cols, rows, seed, cfg);
-    apply_saved_params(s.as_mut(), cfg);
+    apply_saved_params(s.as_mut(), cfg, scope);
     s
 }

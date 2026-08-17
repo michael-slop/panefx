@@ -57,6 +57,18 @@ pub enum Command {
         monitor: Option<usize>,
         name: String,
     },
+    /// Set one parameter on the DESKTOP's copy of an effect.
+    ///
+    /// `effect` is explicit rather than "whichever is current": each monitor
+    /// picks its own, so there is no single current wallpaper effect the way
+    /// there is for the pane. Inferring it would make the same keypress do
+    /// different things depending on which row happened to be highlighted.
+    #[serde(rename = "wallpaper_param")]
+    WallpaperParam {
+        effect: String,
+        key: String,
+        val: ParamValue,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -75,6 +87,13 @@ pub struct Snapshot {
     /// Why there is no wallpaper layer. Absent when it is working.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wallpaper_error: Option<String>,
+    /// The desktop's own params, for every effect any monitor is running.
+    ///
+    /// Keyed by effect name because monitors can differ. The daemon does not
+    /// know which TUI row is highlighted, so it sends them all and the TUI picks
+    /// — which keeps the selection rule a local, testable decision.
+    #[serde(default)]
+    pub wallpaper_params: std::collections::BTreeMap<String, Vec<Param>>,
 }
 
 /// One monitor, as the TUI sees it.

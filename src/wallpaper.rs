@@ -114,7 +114,16 @@ impl SimPool {
     /// Build the simulation for `key`, seeded so it diverges from every other
     /// monitor's.
     pub fn acquire(&mut self, key: &SimKey, cfg: &Config) {
-        let sim = animation::rebuild(cfg, &key.effect, key.cols, key.rows, seed_for(key.monitor));
+        // Scope::Wallpaper -- THE line that makes the desktop tunable
+        // independently of the terminal backdrop.
+        let sim = animation::rebuild(
+            cfg,
+            &key.effect,
+            key.cols,
+            key.rows,
+            seed_for(key.monitor),
+            animation::Scope::Wallpaper,
+        );
         self.sims.insert(key.clone(), PooledSim { sim, dirty: true });
     }
 
@@ -144,6 +153,25 @@ impl SimPool {
 
     pub fn dirty(&self, key: &SimKey) -> bool {
         self.sims.get(key).map(|p| p.dirty).unwrap_or(false)
+    }
+
+    /// Re-apply the saved wallpaper params to every live sim running `effect`.
+    ///
+    /// IN PLACE, not a rebuild. Rebuilding would reset the animation to frame
+    /// zero on every arrow-key press, turning "nudge a colour" into a stutter.
+    /// Marks them dirty so the change is drawn on the next tick rather than
+    /// waiting for the simulation to happen to change by itself.
+    pub fn reapply(&mut self, effect: &str, cfg: &Config) {
+        for (k, p) in self.sims.iter_mut() {
+            if k.effect == effect {
+                animation::apply_saved_params(
+                    p.sim.as_mut(),
+                    cfg,
+                    animation::Scope::Wallpaper,
+                );
+                p.dirty = true;
+            }
+        }
     }
 
     /// Does a simulation exist for this monitor? Test-facing.
@@ -619,6 +647,20 @@ impl WallpaperSet {
             let surface_cfg = Self::cfg_for_surface(cfg, cell);
             crate::render::draw_animation(panel, sim, &surface_cfg);
             s.force_redraw = false;
+        }
+    }
+
+    /// Push a changed wallpaper param out to every live surface using it.
+    ///
+    /// `force_redraw` matters: `tick` only draws a surface when its simulation
+    /// reports a change or the flag is set, so on a settled effect a colour
+    /// tweak would otherwise sit invisible until the animation moved on its own.
+    pub fn reapply_params(&mut self, effect: &str, cfg: &Config) {
+        self.pool.reapply(effect, cfg);
+        for s in self.surfaces.iter_mut() {
+            if s.effect == effect {
+                s.force_redraw = true;
+            }
         }
     }
 
