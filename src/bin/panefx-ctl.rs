@@ -218,6 +218,16 @@ impl App {
             min: 1,
             max: 120,
         });
+        // Opacity of the windows panefx draws behind. A plain Row::Config, so
+        // it inherits the bar, the arrow keys, H/L for x10 and typed entry with
+        // no new rendering code.
+        rows.push(Row::Config {
+            key: "opacity",
+            label: "window opacity %",
+            value: ci("opacity"),
+            min: 10,
+            max: 100,
+        });
         rows.push(Row::Config {
             key: "cell_w",
             label: "cell width",
@@ -621,7 +631,7 @@ USAGE:
 
 KEYS
     Tab            switch between the Effects and Wallpaper tabs
-    w / e          jump straight to Wallpaper / Effects
+    w / e          jump straight to Wallpaper / TUI-Pane
     up/down        move between rows
     left/right     adjust a value (H / L for x10)
     Enter          type a value
@@ -730,7 +740,7 @@ fn run<B: Backend>(term: &mut Terminal<B>, app: &mut App) -> anyhow::Result<()> 
             KeyCode::Tab => {
                 app.view = app.view.next();
                 app.status = match app.view {
-                    View::Effects => "effects".into(),
+                    View::Effects => "TUI-Pane — the backdrop behind your windows".into(),
                     View::Wallpaper => "desktop wallpaper".into(),
                 };
             }
@@ -798,7 +808,7 @@ fn draw(f: &mut Frame, app: &App) {
         }
     };
     let mut header: Vec<Span> = vec![
-        Span::styled(" Effects ", tab_style(View::Effects)),
+        Span::styled(" TUI-Pane ", tab_style(View::Effects)),
         Span::raw(" "),
         Span::styled(" Wallpaper ", tab_style(View::Wallpaper)),
         Span::raw("   "),

@@ -51,6 +51,17 @@ pub struct Config {
     /// Per-effect character set override, e.g. PANEFX_CHARS_RAIN.
     /// `None` means the effect uses its own built-in set.
     pub chars_override: Option<String>,
+
+    /// How see-through panefx's target windows are, 10-100%.
+    ///
+    /// Applied with `SetLayeredWindowAttributes` (see `opacity.rs`) rather than
+    /// through each app's own setting, because neither Alacritty nor Neovide
+    /// can be driven live on Windows — and because one dial that works on every
+    /// window is the whole point.
+    ///
+    /// **The apps' own opacity must be 1.0**, or the two alphas multiply: an
+    /// Alacritty at 0.6 layered at 60% renders at ~36%.
+    pub opacity: u8,
     /// Per-effect params from `[rain]` / `[flames]` sections, kept as raw
     /// strings and applied through `AsciiAnimation::set_param` after the effect
     /// is built. Held generically so a new effect's knobs persist without
@@ -102,6 +113,9 @@ impl Default for Config {
             pad_x: 10,
             pad_y: 8,
             chars_override: None,
+            // 60%: what alacritty.toml used to carry, so the look is unchanged
+            // on first run after this became panefx's job.
+            opacity: 60,
             effect_params: Default::default(),
             // Half the terminal rate. The desktop is scenery.
             wallpaper_fps: 5,
@@ -167,6 +181,11 @@ impl Config {
         if let Some(v) = env_i32("PANEFX_CELL_H").filter(|v| *v > 0) {
             cfg.cell_h = v;
             cfg.cell_explicit = true;
+        }
+        if let Some(v) = env_i32("PANEFX_OPACITY")
+            .filter(|v| *v >= crate::opacity::MIN_PERCENT as i32 && *v <= crate::opacity::MAX_PERCENT as i32)
+        {
+            cfg.opacity = v as u8;
         }
         if let Some(v) = env_u64("PANEFX_WALLPAPER_FPS").filter(|v| *v > 0 && *v <= 120) {
             cfg.wallpaper_fps = v;
@@ -282,6 +301,13 @@ impl Config {
 
             match k.as_str() {
                 "font" => self.font = v.to_string(),
+                "opacity" => {
+                    if let Ok(n) = v.parse::<u8>() {
+                        if (crate::opacity::MIN_PERCENT..=crate::opacity::MAX_PERCENT).contains(&n) {
+                            self.opacity = n;
+                        }
+                    }
+                }
                 "wallpaper_fps" => {
                     if let Ok(n) = v.parse::<u64>() {
                         if n > 0 && n <= 120 {
@@ -427,6 +453,16 @@ impl Config {
             s.push_str(&format!("chars = \"{c}\"\n"));
         }
 
+        s.push_str("\n# How see-through the target windows are, 10-100%.\n");
+        s.push_str("# panefx sets this itself with SetLayeredWindowAttributes, so it\n");
+        s.push_str("# applies to every window it draws behind -- Alacritty, Neovide, or\n");
+        s.push_str("# anything in PANEFX_TARGETS -- and takes effect instantly. Neither\n");
+        s.push_str("# app can be driven live any other way on Windows.\n");
+        s.push_str("#\n");
+        s.push_str("# The apps' OWN opacity must stay at 1.0 or the two alphas MULTIPLY:\n");
+        s.push_str("# an Alacritty at 0.6 layered at 60% renders at about 36%.\n");
+        s.push_str(&format!("opacity = {}\n", self.opacity));
+
         s.push_str("\n# --- desktop wallpaper ----------------------------------------------\n");
         s.push_str("# Drawn into Explorer's WorkerW layer, BEHIND the desktop icons.\n");
         s.push_str("# Each monitor picks its own effect by its DISPLAY<n> number;\n");
@@ -560,6 +596,13 @@ impl Config {
                 }
                 _ => false,
             },
+            "opacity" => matches!(as_i64(), Some(n)
+                if n >= crate::opacity::MIN_PERCENT as i64
+                    && n <= crate::opacity::MAX_PERCENT as i64)
+            .then(|| {
+                self.opacity = as_i64().unwrap() as u8;
+            })
+            .is_some(),
             "wallpaper_fps" => matches!(as_i64(), Some(n) if n > 0 && n <= 120).then(|| {
                 self.wallpaper_fps = as_i64().unwrap() as u64;
             }).is_some(),
@@ -725,6 +768,55 @@ mod tests {
     }
 
     // ---- desktop wallpaper -------------------------------------------------
+
+    // ---- window opacity ----------------------------------------------------
+
+    #[test]
+    fn opacity_round_trips_through_toml() {
+        let mut c = Config::default();
+        c.apply_toml("opacity = 45");
+        assert_eq!(c.opacity, 45);
+        let mut back = Config::default();
+        back.apply_toml(&c.to_toml());
+        assert_eq!(back.opacity, 45);
+    }
+
+    #[test]
+    fn opacity_refuses_values_that_would_lose_the_window() {
+        // 0% is not merely dark — Microsoft's docs note a fully transparent
+        // window is also UNFOCUSABLE, so the user could not click it back.
+        let mut c = Config::default();
+        let before = c.opacity;
+        assert!(!c.set_field("opacity", &serde_json::json!(0)));
+        assert!(!c.set_field("opacity", &serde_json::json!(5)));
+        assert!(!c.set_field("opacity", &serde_json::json!(101)));
+        assert_eq!(c.opacity, before, "a rejected value must not mutate");
+        assert!(c.set_field("opacity", &serde_json::json!(10)));
+        assert!(c.set_field("opacity", &serde_json::json!(100)));
+    }
+
+    #[test]
+    fn a_bad_opacity_in_toml_leaves_the_default() {
+        // The file layer clamps silently rather than refusing to load — a typo
+        // in the config must not leave panefx with no backdrop at all.
+        let mut c = Config::default();
+        c.apply_toml("opacity = 0");
+        assert_eq!(c.opacity, Config::default().opacity);
+        c.apply_toml("opacity = 500");
+        assert_eq!(c.opacity, Config::default().opacity);
+    }
+
+    #[test]
+    fn opacity_is_not_swallowed_by_the_wallpaper_prefix_parser() {
+        // `parse_wallpaper_effect_key` is a prefix match; make sure it does not
+        // claim unrelated keys.
+        assert_eq!(parse_wallpaper_effect_key("opacity"), None);
+        let mut c = Config::default();
+        c.apply_toml("opacity = 33\nwallpaper_fps = 7");
+        assert_eq!(c.opacity, 33);
+        assert_eq!(c.wallpaper_fps, 7);
+        assert!(c.wallpaper_effects.is_empty());
+    }
 
     #[test]
     fn wallpaper_keys_must_stay_flat_not_a_section() {

@@ -103,6 +103,8 @@ pub struct ConfigView {
     pub pad_y: i32,
     pub rotation: Vec<String>,
     pub rotate_secs: u64,
+    /// Window opacity, 10-100%. See `opacity.rs`.
+    pub opacity: u8,
     pub wallpaper_fps: u64,
     /// What the wallpaper can ACTUALLY achieve: it is ticked from the daemon
     /// loop, so `fps` caps it. Reported separately so the TUI never shows a
@@ -124,6 +126,7 @@ impl ConfigView {
             pad_y: cfg.pad_y,
             rotation: cfg.rotation.clone(),
             rotate_secs: cfg.rotate_every.map(|d| d.as_secs()).unwrap_or(0),
+            opacity: cfg.opacity,
             wallpaper_fps: cfg.wallpaper_fps,
             wallpaper_fps_effective: cfg.wallpaper_fps.min(cfg.fps).max(1),
             wallpaper_cell_w: cfg.wallpaper_cell_w,

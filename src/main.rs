@@ -172,6 +172,10 @@ fn main() -> anyhow::Result<()> {
 
     let mut panels: HashMap<isize, Panel> = HashMap::new();
 
+    // Opacity last applied per window, so reconcile can skip the syscalls when
+    // nothing changed. Cleared per-window when that window closes.
+    let mut applied_opacity: HashMap<isize, u8> = HashMap::new();
+
     // The desktop wallpaper. Never fatal: if Explorer will not give us the
     // WorkerW layer, this is inert and the terminal backdrops carry on exactly
     // as before.
@@ -237,7 +241,15 @@ fn main() -> anyhow::Result<()> {
                             Some(c) if !cfg.cell_explicit => c,
                             _ => (cfg.cell_w, cfg.cell_h),
                         };
-                        reconcile(&mut panels, &windows, &mut sim_cols, &mut sim_rows, &cfg, cell);
+                        reconcile(
+                            &mut panels,
+                            &windows,
+                            &mut sim_cols,
+                            &mut sim_rows,
+                            &cfg,
+                            cell,
+                            &mut applied_opacity,
+                        );
                     }
                     // Occlusion needs the UNFILTERED list: `reconcile` keeps only
                     // terminals, but a browser or file manager covering the
@@ -274,6 +286,7 @@ fn main() -> anyhow::Result<()> {
                     sim_cols,
                     sim_rows,
                     &mut needs_query,
+                    &mut applied_opacity,
                 );
                 server.reply(peer, &reply);
             }
@@ -374,6 +387,7 @@ fn handle_command(
     sim_cols: usize,
     sim_rows: usize,
     needs_query: &mut bool,
+    applied_opacity: &mut HashMap<isize, u8>,
 ) -> control::Reply {
     use control::{Command, ConfigView, Reply, Snapshot, WallpaperMonitorView};
 
@@ -409,6 +423,15 @@ fn handle_command(
                 key.as_str(),
                 "cell_w" | "cell_h" | "pad_x" | "pad_y" | "crop_top"
             ) {
+                *needs_query = true;
+            }
+            // Opacity is cached per window, so the cache has to be dropped or
+            // the new value would not reach any window already open — which is
+            // all of them. Clearing forces a re-apply on the next reconcile,
+            // and `needs_query` makes that happen on THIS frame rather than up
+            // to 500ms later, so the slider feels live.
+            if key == "opacity" {
+                applied_opacity.clear();
                 *needs_query = true;
             }
             // Rain captures frame_ms at construction, so fps needs a rebuild.
@@ -467,6 +490,8 @@ fn handle_command(
             // The wallpaper must follow the reloaded config too, or revert
             // silently half-works — which is worse than not working.
             wall.rebuild_surfaces(cfg);
+            // Same for opacity: the reloaded config may carry a different one.
+            applied_opacity.clear();
             Reply::with(snapshot(sim, cfg, wall))
         }
 
@@ -507,6 +532,7 @@ fn reconcile(
     sim_rows: &mut usize,
     cfg: &config::Config,
     cell: (i32, i32),
+    applied_opacity: &mut HashMap<isize, u8>,
 ) {
     let (cell_w, cell_h) = cell;
     let terminals: Vec<&ipc::Window> = windows.iter().filter(|w| w.is_target()).collect();
@@ -514,6 +540,25 @@ fn reconcile(
     // Drop panels whose terminal is gone.
     let live: std::collections::HashSet<isize> = terminals.iter().map(|w| w.handle).collect();
     panels.retain(|handle, _| live.contains(handle));
+    // Forget opacity for windows that have closed, or the map grows forever.
+    applied_opacity.retain(|handle, _| live.contains(handle));
+
+    // Opacity is applied HERE rather than once at startup because it has to
+    // catch windows as they appear — a terminal opened a minute from now must
+    // match the others. The cache makes re-running this every reconcile free:
+    // without it the 500ms poll would issue two syscalls per window forever.
+    for w in &terminals {
+        if applied_opacity.get(&w.handle) == Some(&cfg.opacity) {
+            continue;
+        }
+        let hwnd = HWND(w.handle as *mut _);
+        match panefx::opacity::set_opacity(hwnd, cfg.opacity) {
+            Ok(()) => {
+                applied_opacity.insert(w.handle, cfg.opacity);
+            }
+            Err(e) => eprintln!("[panefx] could not set opacity on {}: {e}", w.handle),
+        }
+    }
 
     let mut max_cols = 0usize;
     let mut max_rows = 0usize;
