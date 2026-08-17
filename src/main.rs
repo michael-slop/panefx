@@ -28,7 +28,7 @@
 //!   * every reconcile also RE-PINS z-order, because GlazeWM re-orders windows
 //!     on focus changes and would otherwise strand our panels
 
-use panefx::{animation, config, control, ipc, panel, render};
+use panefx::{animation, config, control, ipc, panel, render, wallpaper};
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -82,6 +82,18 @@ fn main() -> anyhow::Result<()> {
     };
 
     let mut panels: HashMap<isize, Panel> = HashMap::new();
+
+    // The desktop wallpaper. Never fatal: if Explorer will not give us the
+    // WorkerW layer, this is inert and the terminal backdrops carry on exactly
+    // as before.
+    let mut wall = wallpaper::WallpaperSet::new(&cfg);
+    match &wall.error {
+        Some(e) => eprintln!("[panefx] wallpaper unavailable: {e}"),
+        None => println!(
+            "[panefx] wallpaper layer attached — {} monitor(s)",
+            wall.monitors().len()
+        ),
+    }
 
     // One shared simulation, sized to the largest panel seen so far.
     let mut effect_idx = 0usize;
@@ -138,6 +150,10 @@ fn main() -> anyhow::Result<()> {
                         };
                         reconcile(&mut panels, &windows, &mut sim_cols, &mut sim_rows, &cfg, cell);
                     }
+                    // Occlusion needs the UNFILTERED list: `reconcile` keeps only
+                    // terminals, but a browser or file manager covering the
+                    // screen is exactly what should freeze the wallpaper.
+                    wall.observe_windows(&windows);
                 }
                 ipc::IpcMessage::LayoutMayHaveChanged => {
                     // No geometry in the event — must ask.
@@ -163,6 +179,7 @@ fn main() -> anyhow::Result<()> {
                     cmd,
                     &mut cfg,
                     &mut sim,
+                    &mut wall,
                     &mut effect_idx,
                     &mut last_rotate,
                     sim_cols,
@@ -219,6 +236,14 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
+        // --- desktop wallpaper, on its OWN clock ---
+        //
+        // Called every daemon frame but rate-limited internally to
+        // `wallpaper_fps`. Deliberately AFTER the terminal draw: the terminals
+        // are what the user is looking at, and a wallpaper frame is never worth
+        // delaying them for.
+        wall.tick(&cfg, frame_start);
+
         frames_this_sec += 1;
         if fps_window.elapsed() >= Duration::from_secs(5) {
             if std::env::var("PANEFX_FPS_LOG").is_ok() {
@@ -238,45 +263,11 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Apply any `[effect]` params persisted in config.toml to a freshly built
-/// effect. Values are strings, so each is tried as an int, then a colour, then
-/// plain text — whichever the effect accepts.
-fn apply_saved_params(sim: &mut dyn AsciiAnimation, cfg: &config::Config) {
-    use animation::ParamValue;
-    let name = sim.name().to_lowercase();
-    let Some(saved) = cfg.effect_params.get(&name) else {
-        return;
-    };
-    // Collect first: `params()` borrows, `set_param` needs &mut.
-    let saved: Vec<(String, String)> = saved.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-    for (k, raw) in saved {
-        let applied = if let Ok(n) = raw.parse::<i64>() {
-            sim.set_param(&k, &ParamValue::Int { v: n })
-        } else if let Some(c) = panefx::palette::Rgb::parse_hex(&raw) {
-            sim.set_param(&k, &ParamValue::from_rgb(c))
-        } else {
-            sim.set_param(&k, &ParamValue::Text { v: raw.clone() })
-        };
-        if !applied {
-            eprintln!("[panefx] config [{name}]: effect ignored '{k}'");
-        }
-    }
-}
-
-/// Rebuild the effect, preserving persisted params. Used whenever a change
-/// cannot be applied in place (effect switch, or a value captured at
-/// construction such as rain's frame_ms).
-fn rebuild(
-    cfg: &config::Config,
-    name: &str,
-    cols: usize,
-    rows: usize,
-    seed: u64,
-) -> Box<dyn AsciiAnimation> {
-    let mut s = animation::build(name, cols, rows, seed, cfg);
-    apply_saved_params(s.as_mut(), cfg);
-    s
-}
+// `apply_saved_params` and `rebuild` now live in `animation`, because the
+// wallpaper's simulation pool needs them too and neither module should own the
+// other. Re-exported here under their old names so the call sites below read
+// unchanged.
+use animation::{apply_saved_params, rebuild};
 
 /// Handle one control command. Returns the reply to send back.
 #[allow(clippy::too_many_arguments)]
@@ -284,23 +275,37 @@ fn handle_command(
     cmd: control::Command,
     cfg: &mut config::Config,
     sim: &mut Box<dyn AsciiAnimation>,
+    wall: &mut wallpaper::WallpaperSet,
     effect_idx: &mut usize,
     last_rotate: &mut Instant,
     sim_cols: usize,
     sim_rows: usize,
     needs_query: &mut bool,
 ) -> control::Reply {
-    use control::{Command, ConfigView, Reply, Snapshot};
+    use control::{Command, ConfigView, Reply, Snapshot, WallpaperMonitorView};
 
-    let snapshot = |sim: &Box<dyn AsciiAnimation>, cfg: &config::Config| Snapshot {
+    let snapshot = |sim: &Box<dyn AsciiAnimation>,
+                    cfg: &config::Config,
+                    wall: &wallpaper::WallpaperSet| Snapshot {
         effect: sim.name().to_string(),
         effects: animation::EFFECTS.iter().map(|s| s.to_string()).collect(),
         params: sim.params(),
         config: ConfigView::of(cfg),
+        wallpaper: wall
+            .monitors()
+            .iter()
+            .map(|m| WallpaperMonitorView {
+                index: m.monitor.index,
+                label: m.monitor.label(),
+                effect: m.effect.clone(),
+                occluded: m.occluded,
+            })
+            .collect(),
+        wallpaper_error: wall.error.clone(),
     };
 
     match cmd {
-        Command::Get => Reply::with(snapshot(sim, cfg)),
+        Command::Get => Reply::with(snapshot(sim, cfg, wall)),
 
         Command::Set { key, val } => {
             if !cfg.set_field(&key, &val) {
@@ -318,7 +323,7 @@ fn handle_command(
                 let name = sim.name().to_string();
                 *sim = rebuild(cfg, &name, sim_cols, sim_rows, 0x5EED_1234);
             }
-            Reply::with(snapshot(sim, cfg))
+            Reply::with(snapshot(sim, cfg, wall))
         }
 
         Command::Effect { name } => {
@@ -339,7 +344,7 @@ fn handle_command(
             }
             *last_rotate = Instant::now();
             println!("[panefx] effect -> {wanted}");
-            Reply::with(snapshot(sim, cfg))
+            Reply::with(snapshot(sim, cfg, wall))
         }
 
         Command::Param { key, val } => {
@@ -349,7 +354,7 @@ fn handle_command(
             // Mirror into config so a later save persists it.
             let name = sim.name().to_string();
             cfg.set_effect_param(&name, &key, val.display());
-            Reply::with(snapshot(sim, cfg))
+            Reply::with(snapshot(sim, cfg, wall))
         }
 
         Command::Save => match cfg.save() {
@@ -366,7 +371,33 @@ fn handle_command(
             *sim = rebuild(cfg, &name, sim_cols, sim_rows, 0x5EED_1234);
             *effect_idx = 0;
             *needs_query = true;
-            Reply::with(snapshot(sim, cfg))
+            // The wallpaper must follow the reloaded config too, or revert
+            // silently half-works — which is worse than not working.
+            wall.rebuild_surfaces(cfg);
+            Reply::with(snapshot(sim, cfg, wall))
+        }
+
+        Command::WallpaperEffect { monitor, name } => {
+            let wanted = name.trim().to_lowercase();
+            if wanted != wallpaper::OFF && !animation::EFFECTS.contains(&wanted.as_str()) {
+                return Reply::err(format!("unknown effect '{name}' (or 'off')"));
+            }
+            // Mirror into config FIRST, so the choice persists on save even if
+            // no wallpaper layer is available to show it right now.
+            match monitor {
+                Some(i) => {
+                    cfg.wallpaper_effects.insert(i, wanted.clone());
+                }
+                None => {
+                    for m in wall.monitor_indices() {
+                        cfg.wallpaper_effects.insert(m, wanted.clone());
+                    }
+                }
+            }
+            if let Err(e) = wall.set_effect(monitor, &wanted, cfg) {
+                return Reply::err(e);
+            }
+            Reply::with(snapshot(sim, cfg, wall))
         }
     }
 }

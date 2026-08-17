@@ -68,6 +68,24 @@ pub struct Window {
     pub height: i32,
     #[serde(default)]
     pub display_state: String,
+    /// Tiling / floating / fullscreen / **minimized**.
+    ///
+    /// Needed because `display_state` answers "is this on the active workspace",
+    /// NOT "is this on screen". A minimized window comes back as
+    /// `displayState: "shown"` carrying its full pre-minimize rect — measured
+    /// live: a minimized terminal at 1115x628, a minimized game at 1920x1080.
+    /// Anything asking "is this rect covered?" must filter on this or it will
+    /// conclude the screen is covered by a window sitting in the taskbar.
+    #[serde(default)]
+    pub state: WindowState,
+}
+
+/// GlazeWM reports state as `{"type": "minimized", ...}`; only the tag matters
+/// here, and unknown tags must not break parsing.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WindowState {
+    #[serde(rename = "type", default)]
+    pub kind: String,
 }
 
 impl Window {
@@ -106,6 +124,15 @@ impl Window {
     pub fn is_visible(&self) -> bool {
         self.display_state.eq_ignore_ascii_case("shown")
             || self.display_state.eq_ignore_ascii_case("showing")
+    }
+
+    /// Is this window minimized — i.e. reporting a rect it does not occupy?
+    ///
+    /// See the note on [`Window::state`]. This is not the same question as
+    /// `!is_visible()`, and conflating them freezes the wallpaper permanently
+    /// behind a window that is not on screen.
+    pub fn is_minimized(&self) -> bool {
+        self.state.kind.eq_ignore_ascii_case("minimized")
     }
 }
 
@@ -339,6 +366,7 @@ mod tests {
             width: 100,
             height: 100,
             display_state: "shown".into(),
+            state: WindowState { kind: "tiling".into() },
         };
         // Same generic winit class, different process: must not match.
         assert!(!w.is_alacritty());
@@ -355,6 +383,7 @@ mod tests {
             width: 100,
             height: 100,
             display_state: "hidden".into(),
+            state: WindowState { kind: "tiling".into() },
         };
         assert!(!w.is_visible());
         w.display_state = "shown".into();
@@ -368,6 +397,41 @@ mod tests {
         // is the tripwire that says so.
         assert!(!KNOWN_EVENTS.contains(&"window_moved"));
         assert!(!KNOWN_EVENTS.contains(&"window_resized"));
+    }
+
+    #[test]
+    fn a_minimized_window_still_reports_shown_and_a_full_rect() {
+        // Captured verbatim from a live session. This is the shape that makes
+        // occlusion subtle: `displayState` says "shown" and the rect is the full
+        // pre-minimize size, so ONLY `state.type` reveals it is in the taskbar.
+        let json = r#"{
+          "success":true,
+          "data":{"windows":[
+            {"handle":1,"processName":"WindowsTerminal","className":"CASCADIA_HOSTING",
+             "x":-1277,"y":-264,"width":1115,"height":628,
+             "displayState":"shown","state":{"type":"minimized"}},
+            {"handle":2,"processName":"alacritty","className":"Window Class",
+             "x":0,"y":0,"width":1920,"height":1080,
+             "displayState":"shown","state":{"type":"tiling"}}
+          ]}
+        }"#;
+        let env: Envelope = serde_json::from_str(json).unwrap();
+        let w = env.data.unwrap().windows.unwrap();
+        assert!(w[0].is_visible(), "GlazeWM really does call this 'shown'");
+        assert!(w[0].is_minimized(), "and only state.type says otherwise");
+        assert!(!w[1].is_minimized());
+    }
+
+    #[test]
+    fn a_missing_state_field_defaults_to_not_minimized() {
+        // Older replies, or any shape we did not anticipate, must not make
+        // every window look minimized.
+        let json = r#"{"success":true,"data":{"windows":[
+            {"handle":1,"processName":"alacritty","className":"c",
+             "x":0,"y":0,"width":10,"height":10,"displayState":"shown"}]}}"#;
+        let env: Envelope = serde_json::from_str(json).unwrap();
+        let w = env.data.unwrap().windows.unwrap();
+        assert!(!w[0].is_minimized());
     }
 
     #[test]

@@ -42,20 +42,63 @@ enum Row {
         label: &'static str,
         value: String,
     },
+    /// One monitor's wallpaper effect. `←→` cycles, including `off`.
+    WallpaperMonitor {
+        index: usize,
+        label: String,
+        effect: String,
+        occluded: bool,
+    },
+    /// Fires on Enter: copy the highlighted monitor's effect to every monitor.
+    WallpaperApplyAll,
+    /// Non-selectable explanation, used when the wallpaper layer is missing.
+    /// An empty list there would read as "panefx is broken" when in fact the
+    /// terminal backdrops are entirely fine.
+    Note(String),
+}
+
+/// Which view the TUI is showing.
+///
+/// The row list is rebuilt wholesale on every reply, so each view keeps its own
+/// rows AND its own selection — see the clamp at the end of `absorb`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum View {
+    Effects,
+    Wallpaper,
+}
+
+impl View {
+    fn idx(self) -> usize {
+        match self {
+            View::Effects => 0,
+            View::Wallpaper => 1,
+        }
+    }
+    fn next(self) -> Self {
+        match self {
+            View::Effects => View::Wallpaper,
+            View::Wallpaper => View::Effects,
+        }
+    }
 }
 
 struct App {
     conn: Conn,
     effect: String,
     effects: Vec<String>,
-    rows: Vec<Row>,
-    sel: ListState,
+    /// Rows per view, rebuilt from every snapshot.
+    rows: [Vec<Row>; 2],
+    /// Selection per view, PRESERVED across rebuilds.
+    sel: [ListState; 2],
+    view: View,
     status: String,
     dirty: bool,
     /// Caret phase. Toggled by the event loop so the selected row blinks.
     blink_on: bool,
     last_blink: std::time::Instant,
     editing: Option<String>,
+    /// True when the daemon has a working wallpaper layer.
+    wallpaper_ok: bool,
 }
 
 struct Conn {
@@ -90,17 +133,38 @@ impl App {
             conn,
             effect: String::new(),
             effects: Vec::new(),
-            rows: Vec::new(),
-            sel: ListState::default(),
+            rows: [Vec::new(), Vec::new()],
+            sel: [ListState::default(), ListState::default()],
+            view: View::Effects,
             status: "connected".into(),
             dirty: false,
             blink_on: true,
             last_blink: std::time::Instant::now(),
             editing: None,
+            wallpaper_ok: false,
         };
+        app.sel[0].select(Some(0));
+        app.sel[1].select(Some(0));
         app.absorb(&reply);
-        app.sel.select(Some(0));
         Ok(app)
+    }
+
+    fn rows(&self) -> &Vec<Row> {
+        &self.rows[self.view.idx()]
+    }
+
+    fn sel_state(&self) -> &ListState {
+        &self.sel[self.view.idx()]
+    }
+
+    fn move_sel(&mut self, delta: isize) {
+        let n = self.rows().len();
+        if n == 0 {
+            return;
+        }
+        let cur = self.selected() as isize;
+        let next = (cur + delta).rem_euclid(n as isize) as usize;
+        self.sel[self.view.idx()].select(Some(next));
     }
 
     /// Rebuild the row list from a daemon snapshot.
@@ -201,16 +265,115 @@ impl App {
             label: "font",
             value: cs("font"),
         });
-        self.rows = rows;
+        self.rows[View::Effects.idx()] = rows;
+
+        // ---- wallpaper view ----
+        let mut wrows: Vec<Row> = Vec::new();
+        let monitors = snap
+            .get("wallpaper")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let werr = snap.get("wallpaper_error").and_then(|v| v.as_str());
+        self.wallpaper_ok = werr.is_none();
+
+        if let Some(e) = werr {
+            // Say WHY, and say that nothing else is affected. An empty list here
+            // would read as a broken program.
+            wrows.push(Row::Note(format!("wallpaper layer unavailable — {e}")));
+            wrows.push(Row::Note(
+                "Terminal backdrops are unaffected and still running.".into(),
+            ));
+        } else if monitors.is_empty() {
+            wrows.push(Row::Note("no monitors detected".into()));
+        } else {
+            for m in &monitors {
+                wrows.push(Row::WallpaperMonitor {
+                    index: m.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                    label: m
+                        .get("label")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    effect: m
+                        .get("effect")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("off")
+                        .to_string(),
+                    occluded: m
+                        .get("occluded")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                });
+            }
+            wrows.push(Row::WallpaperApplyAll);
+            let eff = cfg
+                .get("wallpaper_fps_effective")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let asked = ci("wallpaper_fps");
+            wrows.push(Row::Config {
+                key: "wallpaper_fps",
+                label: "wallpaper fps",
+                value: asked,
+                min: 1,
+                max: 120,
+            });
+            if eff > 0 && eff < asked {
+                // The wallpaper is ticked from the daemon loop, so `fps` caps
+                // it. Say so rather than showing a number the screen is not
+                // delivering.
+                wrows.push(Row::Note(format!(
+                    "capped to {eff} fps by the daemon's own fps"
+                )));
+            }
+            wrows.push(Row::Config {
+                key: "wallpaper_cell_w",
+                label: "wp cell width",
+                value: ci("wallpaper_cell_w"),
+                min: 1,
+                max: 64,
+            });
+            wrows.push(Row::Config {
+                key: "wallpaper_cell_h",
+                label: "wp cell height",
+                value: ci("wallpaper_cell_h"),
+                min: 1,
+                max: 64,
+            });
+        }
+        self.rows[View::Wallpaper.idx()] = wrows;
+
+        // Clamp EVERY view's selection to its new row count.
+        //
+        // `absorb` rebuilds the lists wholesale, so a shorter list would leave
+        // the selection past the end — where `nudge` silently does nothing and
+        // the TUI simply looks frozen with no error anywhere.
+        for v in 0..self.rows.len() {
+            let n = self.rows[v].len();
+            let cur = self.sel[v].selected().unwrap_or(0);
+            self.sel[v].select(Some(if n == 0 { 0 } else { cur.min(n - 1) }));
+        }
     }
 
     fn selected(&self) -> usize {
-        self.sel.selected().unwrap_or(0)
+        self.sel_state().selected().unwrap_or(0)
+    }
+
+    /// The effect cycle for a wallpaper monitor: every effect plus `off`.
+    ///
+    /// `off` is first so it is one keypress away from the initial state, and it
+    /// is NOT in the daemon's EFFECTS list (that list decides which config
+    /// sections hold params).
+    fn wallpaper_cycle(&self) -> Vec<String> {
+        let mut v = vec!["off".to_string()];
+        v.extend(self.effects.iter().cloned());
+        v
     }
 
     fn nudge(&mut self, delta: i64) {
         let idx = self.selected();
-        let Some(row) = self.rows.get(idx).cloned() else {
+        let Some(row) = self.rows().get(idx).cloned() else {
             return;
         };
         let msg = match row {
@@ -253,6 +416,22 @@ impl App {
                 self.status = format!("press Enter to edit '{label}'");
                 return;
             }
+            Row::WallpaperMonitor { index, effect, .. } => {
+                let cycle = self.wallpaper_cycle();
+                if cycle.is_empty() {
+                    return;
+                }
+                let cur = cycle.iter().position(|e| *e == effect).unwrap_or(0);
+                let n = cycle.len() as i64;
+                let next = ((cur as i64 + delta).rem_euclid(n)) as usize;
+                serde_json::json!({"cmd":"wallpaper_effect",
+                    "monitor":index,"name":cycle[next]})
+            }
+            Row::WallpaperApplyAll => {
+                self.status = "press Enter to apply this effect to every monitor".into();
+                return;
+            }
+            Row::Note(_) => return,
         };
         self.dispatch(msg);
     }
@@ -276,9 +455,29 @@ impl App {
         }
     }
 
+    /// Copy the highlighted monitor's effect to every monitor.
+    fn apply_to_all(&mut self) {
+        let idx = self.selected();
+        // Prefer the highlighted monitor; otherwise the first one listed.
+        let effect = match self.rows().get(idx) {
+            Some(Row::WallpaperMonitor { effect, .. }) => Some(effect.clone()),
+            _ => self.rows().iter().find_map(|r| match r {
+                Row::WallpaperMonitor { effect, .. } => Some(effect.clone()),
+                _ => None,
+            }),
+        };
+        let Some(effect) = effect else {
+            self.status = "no monitors to apply to".into();
+            return;
+        };
+        // `monitor` omitted == every monitor.
+        self.dispatch(serde_json::json!({"cmd":"wallpaper_effect","name":effect}));
+        self.status = format!("applied '{effect}' to every monitor");
+    }
+
     fn commit_edit(&mut self, text: String) {
         let idx = self.selected();
-        let Some(row) = self.rows.get(idx).cloned() else {
+        let Some(row) = self.rows().get(idx).cloned() else {
             return;
         };
         let msg = match row {
@@ -313,6 +512,8 @@ impl App {
                 }
             },
             Row::Effect => return,
+            // These are cycled or fired, never typed into.
+            Row::WallpaperMonitor { .. } | Row::WallpaperApplyAll | Row::Note(_) => return,
         };
         self.dispatch(msg);
     }
@@ -324,6 +525,9 @@ fn row_label(r: &Row) -> String {
         Row::Param(p) => p.label.clone(),
         Row::Config { label, .. } => (*label).into(),
         Row::ConfigText { label, .. } => (*label).into(),
+        Row::WallpaperMonitor { index, label, .. } => format!("{index}  {label}"),
+        Row::WallpaperApplyAll => "apply to all".into(),
+        Row::Note(_) => String::new(),
     }
 }
 
@@ -333,7 +537,27 @@ fn row_value(r: &Row, effect: &str) -> String {
         Row::Param(p) => p.value.display(),
         Row::Config { value, .. } => value.to_string(),
         Row::ConfigText { value, .. } => value.clone(),
+        // The ‹ › convention marks "this cycles". It is also load-bearing:
+        // `run()` blanks the edit buffer for values starting with ‹.
+        Row::WallpaperMonitor {
+            effect, occluded, ..
+        } => {
+            if *occluded {
+                // Say why it is not moving, so a frozen wallpaper reads as
+                // working-as-intended rather than as a bug.
+                format!("‹ {effect} ›  ❄ frozen")
+            } else {
+                format!("‹ {effect} ›")
+            }
+        }
+        Row::WallpaperApplyAll => "press Enter".into(),
+        Row::Note(t) => t.clone(),
     }
+}
+
+/// Rows that cannot be selected — pure explanation.
+fn row_is_note(r: &Row) -> bool {
+    matches!(r, Row::Note(_))
 }
 
 /// A little bar so int values read at a glance.
@@ -427,30 +651,34 @@ fn run<B: Backend>(term: &mut Terminal<B>, app: &mut App) -> anyhow::Result<()> 
 
         match k.code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-            KeyCode::Down | KeyCode::Char('j') => {
-                let n = app.rows.len();
-                if n > 0 {
-                    app.sel.select(Some((app.selected() + 1) % n));
-                }
+            KeyCode::Tab => {
+                app.view = app.view.next();
+                app.status = match app.view {
+                    View::Effects => "effects".into(),
+                    View::Wallpaper => "desktop wallpaper".into(),
+                };
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                let n = app.rows.len();
-                if n > 0 {
-                    app.sel.select(Some((app.selected() + n - 1) % n));
-                }
-            }
+            KeyCode::Char('w') => app.view = View::Wallpaper,
+            KeyCode::Char('e') => app.view = View::Effects,
+            KeyCode::Char('a') if app.view == View::Wallpaper => app.apply_to_all(),
+            KeyCode::Down | KeyCode::Char('j') => app.move_sel(1),
+            KeyCode::Up | KeyCode::Char('k') => app.move_sel(-1),
             KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('+') => app.nudge(1),
             KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('-') => app.nudge(-1),
             KeyCode::Char('L') => app.nudge(10),
             KeyCode::Char('H') => app.nudge(-10),
             KeyCode::Enter => {
-                let cur = app
-                    .rows
-                    .get(app.selected())
-                    .map(|r| row_value(r, &app.effect))
-                    .unwrap_or_default();
-                // Start from the current value so a small tweak is easy.
-                app.editing = Some(if cur.starts_with('‹') { String::new() } else { cur });
+                let row = app.rows().get(app.selected()).cloned();
+                match row {
+                    Some(Row::WallpaperApplyAll) => app.apply_to_all(),
+                    Some(Row::WallpaperMonitor { .. }) | Some(Row::Note(_)) | None => {}
+                    Some(r) => {
+                        let cur = row_value(&r, &app.effect);
+                        // Start from the current value so a small tweak is easy.
+                        app.editing =
+                            Some(if cur.starts_with('‹') { String::new() } else { cur });
+                    }
+                }
             }
             KeyCode::Char('s') => {
                 app.dispatch(serde_json::json!({"cmd":"save"}));
@@ -480,33 +708,78 @@ fn draw(f: &mut Frame, app: &App) {
         app.effect,
         if app.dirty { "*modified" } else { "" }
     );
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                "panefx",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  effect: "),
-            Span::styled(
+
+    // Tab strip, rendered INSIDE the existing header block rather than adding a
+    // fourth chunk — the header already has a spare line.
+    let tab_style = |v: View| {
+        if app.view == v {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        }
+    };
+    let mut header: Vec<Span> = vec![
+        Span::styled(" Effects ", tab_style(View::Effects)),
+        Span::raw(" "),
+        Span::styled(" Wallpaper ", tab_style(View::Wallpaper)),
+        Span::raw("   "),
+    ];
+    match app.view {
+        View::Effects => {
+            header.push(Span::raw("effect: "));
+            header.push(Span::styled(
                 app.effect.clone(),
                 Style::default()
                     .fg(Color::LightGreen)
                     .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(if app.dirty { "   *modified" } else { "" }),
-        ]))
-        .block(Block::default().borders(Borders::ALL).title(title)),
+            ));
+        }
+        View::Wallpaper => {
+            let n = app
+                .rows()
+                .iter()
+                .filter(|r| matches!(r, Row::WallpaperMonitor { .. }))
+                .count();
+            header.push(Span::styled(
+                if app.wallpaper_ok {
+                    format!("{n} monitor(s)")
+                } else {
+                    "layer unavailable".into()
+                },
+                Style::default().fg(if app.wallpaper_ok {
+                    Color::LightGreen
+                } else {
+                    Color::Yellow
+                }),
+            ));
+        }
+    }
+    if app.dirty {
+        header.push(Span::raw("   *modified"));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(header))
+            .block(Block::default().borders(Borders::ALL).title(title)),
         chunks[0],
     );
 
     let sel = app.selected();
     let items: Vec<ListItem> = app
-        .rows
+        .rows()
         .iter()
         .enumerate()
         .map(|(i, r)| {
+            // Notes are prose, not controls: render them dim, full width, with
+            // no caret, label column or bar.
+            if row_is_note(r) {
+                return ListItem::new(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(row_value(r, &app.effect), Style::default().fg(Color::Yellow)),
+                ]));
+            }
             let editing = i == sel && app.editing.is_some();
             let value = if editing {
                 format!("{}_", app.editing.clone().unwrap_or_default())
@@ -563,25 +836,33 @@ fn draw(f: &mut Frame, app: &App) {
         })
         .collect();
 
-    let mut state = app.sel.clone();
+    let mut state = app.sel_state().clone();
+    let list_title = match app.view {
+        View::Effects => " ↑↓ move   ←→ adjust (H/L ×10)   Enter type ",
+        View::Wallpaper => " ↑↓ move   ←→ effect (incl. off)   [a] all monitors ",
+    };
     f.render_stateful_widget(
-        List::new(items).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" ↑↓ move   ←→ adjust (H/L ×10)   Enter type "),
-        ),
+        List::new(items).block(Block::default().borders(Borders::ALL).title(list_title)),
         chunks[1],
         &mut state,
     );
 
     // Tell the user which keys do anything on THIS row — colours and text
     // cannot be nudged, and silently ignoring ←→ on them reads as broken.
-    let hint = match app.rows.get(sel) {
+    let hint = match app.rows().get(sel) {
         Some(Row::Param(p)) if !matches!(p.value, ParamValue::Int { .. }) => {
             "  ·  Enter to type a value"
         }
         Some(Row::ConfigText { .. }) => "  ·  Enter to type a value",
         Some(Row::Effect) => "  ·  ←→ cycles effects",
+        Some(Row::WallpaperMonitor { occluded, .. }) => {
+            if *occluded {
+                "  ·  frozen: fully covered, so it costs nothing"
+            } else {
+                "  ·  ←→ cycles this monitor's effect"
+            }
+        }
+        Some(Row::WallpaperApplyAll) => "  ·  Enter copies the effect to every monitor",
         _ => "",
     };
     f.render_widget(
@@ -590,7 +871,7 @@ fn draw(f: &mut Frame, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" [s]ave  [r]evert  [q]uit "),
+                    .title(" [Tab] view  [s]ave  [r]evert  [q]uit "),
             ),
         chunks[2],
     );

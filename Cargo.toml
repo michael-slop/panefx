@@ -33,6 +33,9 @@ features = [
   "Win32_UI_WindowsAndMessaging",
   "Win32_UI_HiDpi",
   "Win32_System_LibraryLoader",
+  # Monitor enumeration for the desktop wallpaper. No new CRATES -- the windows
+  # crate is already a dependency, so this costs two feature flags.
+  "Win32_Devices_Display",
 ]
 
 [profile.release]

@@ -43,6 +43,20 @@ pub enum Command {
     Save,
     /// Reload from config.toml, discarding unsaved live changes.
     Revert,
+    /// Point one monitor's wallpaper — or every monitor's — at an effect.
+    ///
+    /// `monitor: None` is the TUI's "apply to all". `name: "off"` destroys that
+    /// surface so the Windows wallpaper shows through.
+    ///
+    /// Renamed explicitly: the enum's `rename_all = "lowercase"` would otherwise
+    /// put `"wallpapereffect"` on the wire, which is the kind of string that
+    /// gets mistyped once and debugged for an hour.
+    #[serde(rename = "wallpaper_effect")]
+    WallpaperEffect {
+        #[serde(default)]
+        monitor: Option<usize>,
+        name: String,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -51,6 +65,29 @@ pub struct Snapshot {
     pub effects: Vec<String>,
     pub params: Vec<Param>,
     pub config: ConfigView,
+    /// One entry per detected monitor.
+    ///
+    /// EMPTY when the wallpaper layer could not be obtained — which is why
+    /// `wallpaper_error` exists alongside it. "No monitors" and "no wallpaper
+    /// layer" are very different problems and the TUI must not conflate them.
+    #[serde(default)]
+    pub wallpaper: Vec<WallpaperMonitorView>,
+    /// Why there is no wallpaper layer. Absent when it is working.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wallpaper_error: Option<String>,
+}
+
+/// One monitor, as the TUI sees it.
+#[derive(Debug, Serialize)]
+pub struct WallpaperMonitorView {
+    /// `DISPLAY<n>` number — the same number the config key uses.
+    pub index: usize,
+    pub label: String,
+    /// Effect name, or `"off"`.
+    pub effect: String,
+    /// Fully covered, and therefore frozen. Surfaced so "why isn't it moving"
+    /// is answerable at a glance rather than looking like a bug.
+    pub occluded: bool,
 }
 
 /// The subset of `Config` the TUI can see and edit. Flat and stringly-typed on
@@ -66,6 +103,13 @@ pub struct ConfigView {
     pub pad_y: i32,
     pub rotation: Vec<String>,
     pub rotate_secs: u64,
+    pub wallpaper_fps: u64,
+    /// What the wallpaper can ACTUALLY achieve: it is ticked from the daemon
+    /// loop, so `fps` caps it. Reported separately so the TUI never shows a
+    /// number the screen is not delivering.
+    pub wallpaper_fps_effective: u64,
+    pub wallpaper_cell_w: i32,
+    pub wallpaper_cell_h: i32,
 }
 
 impl ConfigView {
@@ -80,6 +124,10 @@ impl ConfigView {
             pad_y: cfg.pad_y,
             rotation: cfg.rotation.clone(),
             rotate_secs: cfg.rotate_every.map(|d| d.as_secs()).unwrap_or(0),
+            wallpaper_fps: cfg.wallpaper_fps,
+            wallpaper_fps_effective: cfg.wallpaper_fps.min(cfg.fps).max(1),
+            wallpaper_cell_w: cfg.wallpaper_cell_w,
+            wallpaper_cell_h: cfg.wallpaper_cell_h,
         }
     }
 }
@@ -250,6 +298,9 @@ mod tests {
             r#"{"cmd":"param","key":"head","val":{"kind":"colour","r":200,"g":255,"b":200}}"#,
             r#"{"cmd":"save"}"#,
             r#"{"cmd":"revert"}"#,
+            r#"{"cmd":"wallpaper_effect","monitor":3,"name":"waves"}"#,
+            // monitor omitted == apply to all
+            r#"{"cmd":"wallpaper_effect","name":"off"}"#,
         ];
         for c in cases {
             assert!(
@@ -281,5 +332,24 @@ mod tests {
     fn reply_serialises_without_null_noise() {
         let s = serde_json::to_string(&Reply::ok()).unwrap();
         assert_eq!(s, r#"{"ok":true}"#);
+    }
+
+    #[test]
+    fn the_wallpaper_command_tag_is_snake_case_on_the_wire() {
+        // Without the explicit rename the tag would be "wallpapereffect", which
+        // is easy to mistype and painful to debug. Pin the spelling.
+        let c: Command =
+            serde_json::from_str(r#"{"cmd":"wallpaper_effect","name":"rain"}"#).unwrap();
+        match c {
+            Command::WallpaperEffect { monitor, name } => {
+                assert_eq!(monitor, None, "an omitted monitor means ALL monitors");
+                assert_eq!(name, "rain");
+            }
+            _ => panic!("parsed as the wrong variant"),
+        }
+        assert!(
+            serde_json::from_str::<Command>(r#"{"cmd":"wallpapereffect","name":"rain"}"#).is_err(),
+            "the un-renamed spelling must NOT be accepted"
+        );
     }
 }

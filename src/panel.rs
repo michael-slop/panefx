@@ -21,9 +21,9 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW, SetWindowPos, ShowWindow,
-    HWND_BOTTOM, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE,
-    WM_DESTROY, WM_ERASEBKGND, WM_PAINT, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_POPUP,
+    HWND_BOTTOM, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
+    SW_SHOWNOACTIVATE, WM_DESTROY, WM_ERASEBKGND, WM_PAINT, WNDCLASSEXW, WS_CHILD,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 use crate::animation::AsciiAnimation;
@@ -78,10 +78,25 @@ pub struct GdiCache {
     pub face_utf16: Vec<u16>,
 }
 
+/// What a panel is positioned relative to.
+///
+/// `Window` is the original behaviour: a sibling of the tracked terminal,
+/// positioned in SCREEN coordinates, re-pinned into the z-slot behind it on
+/// every reconcile because GlazeWM reasserts z-order on focus changes.
+///
+/// `Desktop` is the wallpaper layer: a CHILD of Explorer's WorkerW, so its
+/// coordinates are parent-relative and its z-position is inherited and
+/// permanent. There is nothing to re-pin and nothing to fight.
+#[derive(Clone, Copy)]
+pub enum Anchor {
+    Window(HWND),
+    Desktop { parent: HWND },
+}
+
 pub struct Panel {
     pub hwnd: HWND,
-    /// The Alacritty window this panel shadows.
-    pub target: HWND,
+    /// What this panel follows.
+    pub anchor: Anchor,
     pub width: i32,
     pub height: i32,
     /// Whether the shadowed terminal is currently displayed. A hidden panel is
@@ -164,18 +179,47 @@ impl Panel {
     /// `x`/`y` are signed and may be negative — a monitor to the left of the
     /// primary yields negative coordinates (observed: x = -1436).
     pub fn create(target: HWND, x: i32, y: i32, width: i32, height: i32) -> anyhow::Result<Self> {
+        Panel::create_anchored(Anchor::Window(target), x, y, width, height)
+    }
+
+    /// Create a panel against any anchor.
+    ///
+    /// For `Anchor::Desktop`, `x`/`y` must ALREADY be WorkerW-relative — see
+    /// `desktop::to_child`. Passing screen coordinates puts the panel off the
+    /// parent's edge whenever the virtual desktop starts at a negative origin.
+    pub fn create_anchored(
+        anchor: Anchor,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> anyhow::Result<Self> {
         unsafe {
             let hinstance = GetModuleHandleW(None)?;
+
+            // WS_CHILD for a desktop surface, never WS_POPUP.
+            //
+            // A WS_POPUP *with a parent* is an OWNED window, not a child: it
+            // does not clip to the parent and does not inherit z-position, so it
+            // floats above every application instead of sitting behind the
+            // desktop icons. One style bit, and the ugliest possible failure.
+            let (style, parent) = match anchor {
+                // A default HWND here means "no parent" — a normal top-level
+                // popup, exactly as before.
+                Anchor::Window(_) => (WS_POPUP, HWND::default()),
+                Anchor::Desktop { parent } => (WS_CHILD, parent),
+            };
+
             let hwnd = CreateWindowExW(
                 WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
                 PANEL_CLASS,
                 w!("panefx panel"),
-                WS_POPUP,
+                style,
                 x,
                 y,
                 width.max(1),
                 height.max(1),
-                None,
+                parent,
                 None,
                 hinstance,
                 None,
@@ -187,7 +231,7 @@ impl Panel {
 
             Ok(Panel {
                 hwnd,
-                target,
+                anchor,
                 width: width.max(1),
                 height: height.max(1),
                 visible: true,
@@ -205,16 +249,25 @@ impl Panel {
         self.height = height;
 
         unsafe {
-            SetWindowPos(
-                self.hwnd,
+            match self.anchor {
                 // Insert directly AFTER (i.e. behind) the target window.
-                self.target,
-                x,
-                y,
-                width,
-                height,
-                SWP_NOACTIVATE,
-            )?;
+                Anchor::Window(target) => {
+                    SetWindowPos(self.hwnd, target, x, y, width, height, SWP_NOACTIVATE)?;
+                }
+                // A child's z-slot among the WorkerW's children is inherited;
+                // asking for a specific one is meaningless and can fail outright.
+                Anchor::Desktop { .. } => {
+                    SetWindowPos(
+                        self.hwnd,
+                        HWND::default(),
+                        x,
+                        y,
+                        width,
+                        height,
+                        SWP_NOACTIVATE | SWP_NOZORDER,
+                    )?;
+                }
+            }
         }
 
         if resized {
@@ -231,10 +284,15 @@ impl Panel {
     /// changes and can otherwise leave our panel in front of, or detached
     /// from, its terminal.
     pub fn pin_behind_target(&self) -> anyhow::Result<()> {
+        // A desktop surface inherits its z-position from the WorkerW and holds
+        // it permanently, so there is nothing to re-pin.
+        let Anchor::Window(target) = self.anchor else {
+            return Ok(());
+        };
         unsafe {
             SetWindowPos(
                 self.hwnd,
-                self.target,
+                target,
                 0,
                 0,
                 0,
@@ -248,6 +306,11 @@ impl Panel {
     /// Drop to the very bottom of the z-order. Used when the target is hidden
     /// (e.g. on another workspace) as a belt-and-braces companion to `hide`.
     pub fn sink(&self) -> anyhow::Result<()> {
+        // Meaningless for a desktop child, and HWND_BOTTOM on one can shove it
+        // behind its own parent.
+        if matches!(self.anchor, Anchor::Desktop { .. }) {
+            return Ok(());
+        }
         unsafe {
             SetWindowPos(
                 self.hwnd,
@@ -311,6 +374,13 @@ impl Drop for Panel {
                     let _ = DeleteDC(g.mem_dc);
                 }
             }
+            // May fail for a desktop surface whose WorkerW parent Explorer has
+            // already destroyed — that is fine and is why the result is ignored.
+            //
+            // But the GDI cleanup above is NOT optional in that case: those
+            // objects belong to the process, not the window, and outlive it.
+            // Skipping it because "the window is gone anyway" leaks a
+            // full-screen bitmap per monitor on every Explorer restart.
             let _ = DestroyWindow(self.hwnd);
         }
     }

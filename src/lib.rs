@@ -27,8 +27,12 @@ pub mod waves;
 // and keeping it out of a non-Windows build would let the effects be tested
 // anywhere.
 #[cfg(windows)]
+pub mod desktop;
+#[cfg(windows)]
 pub mod ipc;
 #[cfg(windows)]
 pub mod panel;
 #[cfg(windows)]
 pub mod render;
+#[cfg(windows)]
+pub mod wallpaper;

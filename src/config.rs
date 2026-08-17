@@ -56,6 +56,31 @@ pub struct Config {
     /// is built. Held generically so a new effect's knobs persist without
     /// touching `Config`.
     pub effect_params: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+
+    // ---- desktop wallpaper -------------------------------------------------
+    /// Frame rate for the desktop wallpaper, independent of `fps`.
+    ///
+    /// Lower by default: the wallpaper is glanced at rather than watched, and
+    /// this path draws up to one full-monitor bitmap per screen against the
+    /// terminal path's small ones.
+    pub wallpaper_fps: u64,
+    /// Effect per monitor, keyed by `DISPLAY<n>` index. An absent entry — or the
+    /// literal `"off"` — means no surface at all for that monitor, so Windows'
+    /// own wallpaper shows through.
+    pub wallpaper_effects: std::collections::BTreeMap<usize, String>,
+    /// Wallpaper cell size.
+    ///
+    /// SEPARATE from `cell_w`/`cell_h` on purpose. The terminal cell exists so
+    /// glyphs line up with the terminal's text; a wallpaper has no text to line
+    /// up with, and inheriting a small terminal cell quadruples the cell count
+    /// for no visual gain. Measured: a 1440x2560 portrait at 10x15 is 24,480
+    /// cells against 10,656 at 15x23 — and 12,012 cells was the panel that cost
+    /// 88.7% of a core before the optimisation pass.
+    pub wallpaper_cell_w: i32,
+    pub wallpaper_cell_h: i32,
+    /// Set when the wallpaper cell was chosen explicitly; otherwise an effect's
+    /// `preferred_cell()` wins. Mirrors `cell_explicit`.
+    pub wallpaper_cell_explicit: bool,
 }
 
 impl Default for Config {
@@ -78,8 +103,27 @@ impl Default for Config {
             pad_y: 8,
             chars_override: None,
             effect_params: Default::default(),
+            // Half the terminal rate. The desktop is scenery.
+            wallpaper_fps: 5,
+            // EMPTY = wallpapers off. A new feature must not change what the
+            // user already sees until they ask for it.
+            wallpaper_effects: Default::default(),
+            // 15x23 matches `waves::preferred_cell()`, which was tuned live
+            // against the real thing and is also 57% fewer cells than 10x15.
+            wallpaper_cell_w: 15,
+            wallpaper_cell_h: 23,
+            wallpaper_cell_explicit: false,
         }
     }
+}
+
+/// `wallpaper_3_effect` -> `Some(3)`. Anything else -> `None`.
+///
+/// Strict on purpose: `wallpaper_fps` shares the prefix, and an over-eager match
+/// would swallow it into the per-monitor map where nothing would ever read it.
+pub fn parse_wallpaper_effect_key(k: &str) -> Option<usize> {
+    let rest = k.strip_prefix("wallpaper_")?.strip_suffix("_effect")?;
+    rest.parse::<usize>().ok().filter(|n| *n >= 1 && *n <= 64)
 }
 
 fn env_str(key: &str) -> Option<String> {
@@ -123,6 +167,17 @@ impl Config {
         if let Some(v) = env_i32("PANEFX_CELL_H").filter(|v| *v > 0) {
             cfg.cell_h = v;
             cfg.cell_explicit = true;
+        }
+        if let Some(v) = env_u64("PANEFX_WALLPAPER_FPS").filter(|v| *v > 0 && *v <= 120) {
+            cfg.wallpaper_fps = v;
+        }
+        if let Some(v) = env_i32("PANEFX_WALLPAPER_CELL_W").filter(|v| *v > 0) {
+            cfg.wallpaper_cell_w = v;
+            cfg.wallpaper_cell_explicit = true;
+        }
+        if let Some(v) = env_i32("PANEFX_WALLPAPER_CELL_H").filter(|v| *v > 0) {
+            cfg.wallpaper_cell_h = v;
+            cfg.wallpaper_cell_explicit = true;
         }
         if let Some(v) = env_u64("PANEFX_FPS").filter(|v| *v > 0 && *v <= 120) {
             cfg.fps = v;
@@ -210,8 +265,46 @@ impl Config {
                 }
             }
 
+            // Per-monitor wallpaper effect: `wallpaper_<n>_effect`.
+            //
+            // FLAT KEYS, never a `[wallpaper]` section. The check above treats
+            // any section not named after an effect as decorative and lets its
+            // keys fall through to the top-level match — so `[wallpaper]` with
+            // `fps = 5` under it would set the TERMINAL fps. Flat keys sidestep
+            // that entirely without touching the parser.
+            //
+            // Placed AFTER the effect-section diversion (so a stray key inside
+            // `[waves]` stays a param) and BEFORE the top-level match.
+            if let Some(idx) = parse_wallpaper_effect_key(&k) {
+                self.wallpaper_effects.insert(idx, v.to_lowercase());
+                continue;
+            }
+
             match k.as_str() {
                 "font" => self.font = v.to_string(),
+                "wallpaper_fps" => {
+                    if let Ok(n) = v.parse::<u64>() {
+                        if n > 0 && n <= 120 {
+                            self.wallpaper_fps = n;
+                        }
+                    }
+                }
+                "wallpaper_cell_w" => {
+                    if let Ok(n) = v.parse::<i32>() {
+                        if n > 0 {
+                            self.wallpaper_cell_w = n;
+                            self.wallpaper_cell_explicit = true;
+                        }
+                    }
+                }
+                "wallpaper_cell_h" => {
+                    if let Ok(n) = v.parse::<i32>() {
+                        if n > 0 {
+                            self.wallpaper_cell_h = n;
+                            self.wallpaper_cell_explicit = true;
+                        }
+                    }
+                }
                 "cell_w" => {
                     if let Ok(n) = v.parse::<i32>() {
                         if n > 0 {
@@ -333,6 +426,27 @@ impl Config {
         if let Some(c) = &self.chars_override {
             s.push_str(&format!("chars = \"{c}\"\n"));
         }
+
+        s.push_str("\n# --- desktop wallpaper ----------------------------------------------\n");
+        s.push_str("# Drawn into Explorer's WorkerW layer, BEHIND the desktop icons.\n");
+        s.push_str("# Each monitor picks its own effect by its DISPLAY<n> number;\n");
+        s.push_str("# \"off\" (or no key at all) means that monitor keeps the Windows\n");
+        s.push_str("# wallpaper and costs nothing.\n");
+        s.push_str("#\n");
+        s.push_str("# FLAT KEYS, not a [wallpaper] section: any section not named after\n");
+        s.push_str("# an effect is decorative and its keys still set the fields above, so\n");
+        s.push_str("# a [wallpaper] header would make `fps` in it overwrite the terminal\n");
+        s.push_str("# frame rate.\n");
+        s.push_str(&format!("wallpaper_fps = {}\n", self.wallpaper_fps));
+        s.push_str("\n# A wallpaper has no terminal text to line up with, so it does NOT\n");
+        s.push_str("# use cell_w/cell_h above. 15x23 keeps a 1440x2560 portrait at ~10k\n");
+        s.push_str("# cells instead of ~24k.\n");
+        s.push_str(&format!("wallpaper_cell_w = {}\n", self.wallpaper_cell_w));
+        s.push_str(&format!("wallpaper_cell_h = {}\n", self.wallpaper_cell_h));
+        for (idx, eff) in &self.wallpaper_effects {
+            s.push_str(&format!("wallpaper_{idx}_effect = \"{eff}\"\n"));
+        }
+
         if !self.effect_params.is_empty() {
             s.push_str("\n# --- per-effect parameters ------------------------------------------\n");
             s.push_str("# Only sections named after an effect are read as parameters; any\n");
@@ -443,6 +557,34 @@ impl Config {
                         self.rotation = list;
                         true
                     }
+                }
+                _ => false,
+            },
+            "wallpaper_fps" => matches!(as_i64(), Some(n) if n > 0 && n <= 120).then(|| {
+                self.wallpaper_fps = as_i64().unwrap() as u64;
+            }).is_some(),
+            "wallpaper_cell_w" => matches!(as_i64(), Some(n) if n > 0 && n <= 200).then(|| {
+                self.wallpaper_cell_w = as_i64().unwrap() as i32;
+                self.wallpaper_cell_explicit = true;
+            }).is_some(),
+            "wallpaper_cell_h" => matches!(as_i64(), Some(n) if n > 0 && n <= 200).then(|| {
+                self.wallpaper_cell_h = as_i64().unwrap() as i32;
+                self.wallpaper_cell_explicit = true;
+            }).is_some(),
+            // `wallpaper_<n>_effect`. Guard arm, so it cannot shadow the literal
+            // keys above (notably `wallpaper_fps`, which shares the prefix).
+            k if parse_wallpaper_effect_key(k).is_some() => match as_str() {
+                Some(s) => {
+                    let s = s.trim().to_lowercase();
+                    // "off" is legal and is deliberately NOT in EFFECTS — that
+                    // list drives the TOML param-section rule, and a section
+                    // named [off] would be meaningless.
+                    if s != "off" && !crate::animation::EFFECTS.contains(&s.as_str()) {
+                        return false;
+                    }
+                    self.wallpaper_effects
+                        .insert(parse_wallpaper_effect_key(k).unwrap(), s);
+                    true
                 }
                 _ => false,
             },
@@ -580,5 +722,120 @@ mod tests {
         let mut c = Config::default();
         c.apply_toml("rotate_secs = 0");
         assert!(c.rotate_every.is_none());
+    }
+
+    // ---- desktop wallpaper -------------------------------------------------
+
+    #[test]
+    fn wallpaper_keys_must_stay_flat_not_a_section() {
+        // THE tripwire for the flat-key decision. Any section not named after an
+        // effect is decorative, so its keys fall through to the top level — a
+        // `[wallpaper]` header with `fps = 5` under it therefore sets the
+        // TERMINAL frame rate, silently, which is exactly the bug flat keys
+        // exist to avoid. If this ever "fails" because someone tidied the config
+        // into a section, they have reintroduced it.
+        let mut c = Config::default();
+        c.apply_toml("[wallpaper]\nfps = 5");
+        assert_eq!(c.fps, 5, "a [wallpaper] section leaks into the terminal fps");
+        assert_eq!(c.wallpaper_fps, Config::default().wallpaper_fps);
+    }
+
+    #[test]
+    fn per_monitor_effects_parse_and_round_trip() {
+        let mut c = Config::default();
+        c.apply_toml(
+            r#"
+            wallpaper_fps = 7
+            wallpaper_1_effect = "waves"
+            wallpaper_3_effect = "flames"
+            wallpaper_4_effect = "off"
+        "#,
+        );
+        assert_eq!(c.wallpaper_effects.get(&1).map(String::as_str), Some("waves"));
+        assert_eq!(c.wallpaper_effects.get(&3).map(String::as_str), Some("flames"));
+        assert_eq!(c.wallpaper_effects.get(&4).map(String::as_str), Some("off"));
+        assert!(!c.wallpaper_effects.contains_key(&2), "absent stays absent");
+        assert_eq!(c.wallpaper_fps, 7);
+
+        let mut back = Config::default();
+        back.apply_toml(&c.to_toml());
+        assert_eq!(back.wallpaper_effects, c.wallpaper_effects);
+        assert_eq!(back.wallpaper_fps, c.wallpaper_fps);
+    }
+
+    #[test]
+    fn wallpaper_effect_key_parser_is_strict() {
+        // `wallpaper_fps` shares the prefix. An over-eager match would swallow
+        // it into the per-monitor map, where nothing would ever read it and the
+        // frame rate would silently stay at its default.
+        assert_eq!(parse_wallpaper_effect_key("wallpaper_3_effect"), Some(3));
+        assert_eq!(parse_wallpaper_effect_key("wallpaper_12_effect"), Some(12));
+        assert_eq!(parse_wallpaper_effect_key("wallpaper_fps"), None);
+        assert_eq!(parse_wallpaper_effect_key("wallpaper_cell_w"), None);
+        assert_eq!(parse_wallpaper_effect_key("wallpaper_effect"), None);
+        assert_eq!(parse_wallpaper_effect_key("wallpaper_x_effect"), None);
+        assert_eq!(parse_wallpaper_effect_key("wallpaper_0_effect"), None);
+        assert_eq!(parse_wallpaper_effect_key("font"), None);
+    }
+
+    #[test]
+    fn wallpaper_fps_is_not_captured_by_the_prefix_match() {
+        let mut c = Config::default();
+        c.apply_toml("wallpaper_fps = 12");
+        assert_eq!(c.wallpaper_fps, 12);
+        assert!(c.wallpaper_effects.is_empty());
+    }
+
+    #[test]
+    fn wallpaper_cell_is_independent_of_the_terminal_cell() {
+        // The 57% cell-count trap: the terminal's explicit 10x15 must not reach
+        // the wallpaper, where it would more than double the glyph count on a
+        // portrait monitor.
+        let mut c = Config::default();
+        c.apply_toml("cell_w = 10\ncell_h = 15");
+        assert!(c.cell_explicit);
+        assert_eq!(c.wallpaper_cell_w, 15, "terminal cell leaked into wallpaper");
+        assert_eq!(c.wallpaper_cell_h, 23);
+        assert!(!c.wallpaper_cell_explicit);
+    }
+
+    #[test]
+    fn set_field_accepts_off_and_rejects_unknown_effects() {
+        let mut c = Config::default();
+        assert!(c.set_field("wallpaper_2_effect", &serde_json::json!("off")));
+        assert!(c.set_field("wallpaper_2_effect", &serde_json::json!("waves")));
+        assert!(!c.set_field("wallpaper_2_effect", &serde_json::json!("nope")));
+        assert_eq!(
+            c.wallpaper_effects.get(&2).map(String::as_str),
+            Some("waves"),
+            "a rejected value must not mutate"
+        );
+    }
+
+    #[test]
+    fn set_field_handles_wallpaper_scalars() {
+        let mut c = Config::default();
+        assert!(c.set_field("wallpaper_fps", &serde_json::json!(9)));
+        assert_eq!(c.wallpaper_fps, 9);
+        assert!(!c.set_field("wallpaper_fps", &serde_json::json!(0)));
+        assert_eq!(c.wallpaper_fps, 9, "rejected value must not mutate");
+        assert!(c.set_field("wallpaper_cell_w", &serde_json::json!(20)));
+        assert!(c.wallpaper_cell_explicit);
+    }
+
+    #[test]
+    fn a_stray_wallpaper_key_inside_an_effect_section_stays_a_param() {
+        // Ordering guard: the prefix match must sit AFTER the effect-section
+        // diversion, or a key inside [waves] would reach global state.
+        let mut c = Config::default();
+        c.apply_toml("[waves]\nwallpaper_1_effect = \"rain\"");
+        assert!(
+            c.wallpaper_effects.is_empty(),
+            "a key inside an effect section must stay a param"
+        );
+        assert_eq!(
+            c.effect_params["waves"].get("wallpaper_1_effect").map(String::as_str),
+            Some("rain")
+        );
     }
 }

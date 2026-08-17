@@ -234,3 +234,46 @@ pub fn build(
         _ => Box::new(crate::flames::Flames::new(cols, rows, seed)),
     }
 }
+
+/// Apply any `[effect]` params persisted in config.toml to a freshly built
+/// effect. Values are stored as strings, so each is tried as an int, then a
+/// colour, then plain text — whichever the effect accepts.
+///
+/// Lives here rather than in `main.rs` because both the terminal supervisor and
+/// the wallpaper's simulation pool need it, and neither should own it.
+pub fn apply_saved_params(sim: &mut dyn AsciiAnimation, cfg: &crate::config::Config) {
+    let name = sim.name().to_lowercase();
+    let Some(saved) = cfg.effect_params.get(&name) else {
+        return;
+    };
+    // Collect first: `params()` borrows, `set_param` needs &mut.
+    let saved: Vec<(String, String)> = saved.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    for (k, raw) in saved {
+        let applied = if let Ok(n) = raw.parse::<i64>() {
+            sim.set_param(&k, &ParamValue::Int { v: n })
+        } else if let Some(c) = crate::palette::Rgb::parse_hex(&raw) {
+            sim.set_param(&k, &ParamValue::from_rgb(c))
+        } else {
+            sim.set_param(&k, &ParamValue::Text { v: raw.clone() })
+        };
+        if !applied {
+            eprintln!("[panefx] config [{name}]: effect ignored '{k}'");
+        }
+    }
+}
+
+/// Build an effect and restore its persisted params.
+///
+/// Used wherever a change cannot be applied in place — an effect switch, or a
+/// value captured at construction such as rain's frame_ms.
+pub fn rebuild(
+    cfg: &crate::config::Config,
+    name: &str,
+    cols: usize,
+    rows: usize,
+    seed: u64,
+) -> Box<dyn AsciiAnimation> {
+    let mut s = build(name, cols, rows, seed, cfg);
+    apply_saved_params(s.as_mut(), cfg);
+    s
+}
