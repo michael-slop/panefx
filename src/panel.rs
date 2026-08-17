@@ -20,7 +20,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW, SetWindowPos, ShowWindow,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetShellWindow, RegisterClassExW, SetWindowPos,
+    ShowWindow,
     HWND_BOTTOM, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
     SW_SHOWNOACTIVATE, WM_DESTROY, WM_ERASEBKGND, WM_PAINT, WNDCLASSEXW, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW, WS_POPUP,
@@ -101,6 +102,23 @@ pub enum Anchor {
         /// mis-composited.
         raised: bool,
     },
+}
+
+/// Which z-order slot a desktop surface inserts after.
+///
+/// Pulled out of the `unsafe` block on purpose: this one choice is the whole
+/// difference between a visible wallpaper and an invisible one, and inside the
+/// block no test could reach it. The bug it encodes was real — see
+/// `pin_behind_target`.
+pub fn desktop_insert_after(progman: HWND) -> HWND {
+    if progman.is_invalid() {
+        // No shell window to anchor to. The bottom is still the right fallback:
+        // wrong in the "hidden behind the background" direction rather than the
+        // "covering every application on screen" direction.
+        HWND_BOTTOM
+    } else {
+        progman
+    }
 }
 
 pub struct Panel {
@@ -316,15 +334,24 @@ impl Panel {
         // asserted: directly after SHELLDLL_DefView, i.e. behind the icons but
         // above the WorkerW. Explorer recreates these children on theme and
         // wallpaper changes, so this is re-asserted rather than done once.
-        // A desktop surface sinks to the BOTTOM of the z-order: behind every
-        // application window, and behind the terminal panels too. Re-asserted
-        // on every reconcile for the same reason the terminal panels are --
-        // something else will eventually push it up.
+        // A desktop surface sits directly ABOVE Progman: behind every
+        // application window, but IN FRONT of the desktop background.
+        //
+        // NOT `HWND_BOTTOM`. That means the absolute bottom of the z-order,
+        // which is *below* Progman -- and Progman paints the desktop background
+        // over the top, so the surface renders into pixels nobody can see. It
+        // looked like it worked at first only because a freshly created window
+        // happened to land just above Progman; once this was re-asserted every
+        // tick, each frame pushed it back under and the wallpaper vanished.
+        //
+        // Inserting after Progman is the whole trick: one slot in front of the
+        // background, still behind everything else.
         if matches!(self.anchor, Anchor::Desktop { .. }) {
             unsafe {
+                let insert_after = desktop_insert_after(GetShellWindow());
                 SetWindowPos(
                     self.hwnd,
-                    HWND_BOTTOM,
+                    insert_after,
                     0,
                     0,
                     0,
@@ -428,5 +455,34 @@ impl Drop for Panel {
             // full-screen bitmap per monitor on every Explorer restart.
             let _ = DestroyWindow(self.hwnd);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_desktop_surface_inserts_after_progman_never_at_the_bottom() {
+        // THE BUG. `HWND_BOTTOM` is the absolute bottom of the z-order, which is
+        // *below* Progman -- and Progman paints the desktop background over the
+        // top, so the surface drew every frame into pixels nobody could see.
+        //
+        // It looked fine at first only because a freshly created window happened
+        // to land just above Progman by luck. Once z-order was re-asserted every
+        // tick, each frame shoved it back under and the wallpaper vanished while
+        // the daemon reported perfect health: windows present, correct geometry,
+        // not occluded, no errors, 128s of CPU burned on invisible frames.
+        let progman = HWND(0x1_0BDE as *mut core::ffi::c_void);
+        let slot = desktop_insert_after(progman);
+        assert_eq!(slot, progman, "must insert directly after Progman");
+        assert_ne!(slot, HWND_BOTTOM, "HWND_BOTTOM hides the wallpaper");
+    }
+
+    #[test]
+    fn without_a_shell_window_it_falls_back_to_the_bottom() {
+        // Failing toward "invisible" beats failing toward "covers everything you
+        // are working on".
+        assert_eq!(desktop_insert_after(HWND::default()), HWND_BOTTOM);
     }
 }
