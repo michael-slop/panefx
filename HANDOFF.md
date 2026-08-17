@@ -33,7 +33,8 @@ ASCII subsystem — the core should hand a renderer a rect and a surface, not a
 character grid. Do not let `AsciiAnimation` become the universal interface by
 default.
 
-Windows 11. Four ASCII effects today; the machinery is content-agnostic.
+Windows 11. Four ASCII effects today, behind terminals AND on the desktop; the
+machinery is content-agnostic.
 
 ## Status (2026-08-15) — WORKING END TO END
 
@@ -49,9 +50,11 @@ Windows 11. Four ASCII effects today; the machinery is content-agnostic.
 | `src/config.rs` | Layered defaults / TOML / env, with save |
 | `src/panel.rs` | Panel window + cached GDI objects |
 | `src/render.rs` | ExtTextOutW cell blitter |
-| `src/bin/panefx-ctl.rs` | ratatui control TUI |
+| `src/bin/panefx-ctl.rs` | ratatui control TUI (Effects + Wallpaper tabs) |
+| `src/desktop.rs` | WorkerW discovery + monitor enumeration |
+| `src/wallpaper.rs` | Per-monitor surfaces, sim pool, occlusion freeze |
 
-**66 unit tests passing. Verified visually on screen, not just by exit code.**
+**108 unit tests passing. Verified visually on screen, not just by exit code.**
 
 **It autostarts with GlazeWM** — it is a function of the WM, not a separate
 service, because it depends on the WM's IPC for all window geometry.
@@ -67,7 +70,7 @@ service, because it depends on the WM's IPC for all window geometry.
 
 Rebuild and reinstall:
 ```powershell
-cd C:\Users\micha\panefx
+cd <repo>
 .\build.ps1 -Install     # build, install BOTH copies, verify, restart daemon
 .\build.ps1              # dev build only
 .\build.ps1 -Test        # tests only
@@ -265,7 +268,7 @@ Two rules:
 
 ## The `waves` effect (blackwaves)
 
-Ported bar-for-bar from `C:\Users\micha\blackwaves\blackwaves.py`. That script's
+Ported bar-for-bar from the author's `blackwaves.py`. That script's
 comments record measurements taken off a real reference clip and ARE the design —
 read it before changing anything here.
 
@@ -302,7 +305,7 @@ A ratatui TUI that talks to the running daemon. The daemon stays headless under
 GlazeWM; run the TUI whenever you want to fiddle, quit it, daemon unaffected.
 
 ```powershell
-C:\Users\micha\.glzr\glazewm\scripts\panefx-ctl.exe
+~\.glzr\glazewm\scripts\panefx-ctl.exe
 ```
 
 Keys: `↑↓` move · `←→` adjust (`H`/`L` for ×10) · `Enter` type a value ·
@@ -556,8 +559,87 @@ GlazeWM actively reasserts z-order (`ZOrder::Normal | TopMost |
 AfterWindow(handle)`) on every focus change — see
 `RustroverProjects\glazewm\packages\wm\src\commands\general\platform_sync.rs`.
 Panels must re-pin behind their terminal after Glaze finishes, every focus
-change, forever. If this flickers badly, the fallback is the **WorkerW
-wallpaper layer** (send `0x052C` to `Progman`, reparent into the spawned
-`WorkerW`): one fullscreen surface, no following, no z-order war, invisible to
-Glaze — at the cost of painting the whole desktop rather than per-pane.
-`fire.rs` and `render.rs` are shared either way, so the pivot is cheap.
+change, forever. The re-pin-every-reconcile strategy has held up in practice.
+
+## The desktop wallpaper (`desktop.rs` + `wallpaper.rs`)
+
+One animated surface per monitor, drawn into Explorer's WorkerW layer behind
+the desktop icons, driven from the **Wallpaper tab** in `panefx-ctl`.
+
+### It does not work on Windows 11 25H2, and that is not our bug
+
+**Measured on build 26200: `0x052C` is a no-op.** Progman is found, the message
+is sent and acknowledged, and no WorkerW is ever created. Microsoft shipped a
+built-in video-wallpaper feature in 25H2 and third-party wallpapers are now
+reported as being treated as ordinary windows; other wallpaper apps hit the same
+wall on this build.
+
+So the daemon logs a named reason and carries on with terminal backdrops, and
+the TUI's Wallpaper tab explains what happened rather than showing an empty
+list. **Every failure path here is a named error, never a silent `None`** —
+that is deliberate, because "no wallpaper" and "panefx is broken" must not look
+alike. The code is complete and tested; it will light up on any build that still
+provides the layer.
+
+Do NOT "fix" this by pinning a fullscreen window to `HWND_BOTTOM`. That sits
+above the wallpaper but below nothing, so it hides the desktop icons — a
+different feature, not a fallback.
+
+### The three traps, each with a regression test
+
+1. **GlazeWM reports MINIMIZED windows as `displayState: "shown"`** carrying
+   their full pre-minimize rect (measured: a minimized terminal at 1115x628, a
+   minimized game at 1920x1080). `displayState` answers "is this on the active
+   workspace", NOT "is this on screen". Occlusion filters on `state.type`;
+   without it the wallpaper freezes behind a window sitting in the taskbar,
+   forever, with nothing visibly covering it.
+   → `a_minimized_window_does_not_occlude`
+2. **Occlusion is a scanline union, never a bounding box.** `UnionRect` would
+   call two windows in opposite corners "full coverage" and freeze a visibly
+   half-empty desktop. Under a tiling WM, two tiles genuinely covering a monitor
+   between them is the normal case, so it has to be exact.
+   → `two_windows_in_opposite_corners_do_not_occlude`
+3. **A `WS_POPUP` given a parent is an OWNED window, not a child.** It does not
+   clip to the parent and does not inherit z-position — it floats above every
+   application instead of sitting behind the icons. Desktop surfaces are
+   `WS_CHILD`. One style bit, ugliest possible failure.
+
+### Efficiency
+
+* **A covered monitor's simulation is not stepped at all** — not
+  stepped-and-skipped. A fully covered desktop costs a pass over a few booleans.
+* **Simulations are shared by `(effect, cols, rows)`.** Params are global per
+  effect name, so two monitors on the same effect and grid produce identical
+  frames: N monitors cost N blits and one `step()`.
+* **The wallpaper has its OWN cell size** (`wallpaper_cell_w/h`, default 15x23).
+  It must NOT inherit `cell_w`/`cell_h`: the terminal cell exists so glyphs line
+  up with text, and a wallpaper has no text. Measured on a 1440x2560 portrait —
+  24,480 cells at 10x15 against 10,656 at 15x23, and 12,012 cells was the panel
+  that cost 88.7% of a core before the optimisation pass.
+  → `wallpaper_cell_is_independent_of_the_terminal_cell`
+* `wallpaper_fps` (default 5) is capped by `fps`, because the wallpaper is
+  ticked from the daemon loop. The snapshot reports the *achievable* rate so the
+  TUI never shows a number the screen is not delivering.
+
+### Config
+
+Flat keys, never a `[wallpaper]` section — any section not named after an effect
+is decorative and its keys fall through to the top level, so `[wallpaper]` with
+`fps` under it would set the TERMINAL frame rate.
+→ `wallpaper_keys_must_stay_flat_not_a_section`
+
+```toml
+wallpaper_fps = 5
+wallpaper_cell_w = 15
+wallpaper_cell_h = 23
+wallpaper_1_effect = "waves"
+wallpaper_3_effect = "off"     # "off" DESTROYS the surface, never hides it —
+                               # a hidden panel still owns a ~14MB bitmap
+```
+
+### TUI
+
+`Tab` (or `w` / `e`) switches view. On the Wallpaper tab each monitor is a row,
+`←→` cycles its effect including `off`, and `a` applies one effect to every
+monitor. Occluded monitors show `❄ frozen`, so a still wallpaper reads as
+working-as-intended rather than as a bug.

@@ -63,11 +63,15 @@ the daemon yourself.
 
 ### The TUI
 
+Two tabs: **Effects** (the running backdrop) and **Wallpaper** (the desktop).
+
 | key | does |
 |---|---|
+| `Tab` | switch tab (`w` / `e` jump straight to one) |
 | `↑` `↓` | move between rows |
 | `←` `→` | adjust (`H` / `L` for ×10) |
 | `Enter` | type a value directly |
+| `a` | *(Wallpaper tab)* apply this effect to every monitor |
 | `s` | save to `~\.config\panefx\config.toml` |
 | `r` | revert to the saved config |
 | `q` | quit — **without saving** |
@@ -78,6 +82,19 @@ so experiment freely and quit to throw it away.
 The row list is built from whatever the effect declares, so a new effect's knobs
 appear automatically.
 
+### Desktop wallpaper
+
+The same effects can run on the desktop itself, behind the icons — one
+independent effect per monitor, or `off` to leave that screen alone. A monitor
+that is fully covered stops being simulated entirely rather than animating where
+nobody can see it, and shows as `❄ frozen` in the TUI.
+
+> **This does not work on Windows 11 25H2 (build 26200).** The undocumented
+> message that asks Explorer for the layer behind the desktop icons is a no-op
+> there — measured, not assumed — and other wallpaper apps hit the same wall on
+> that build. panefx says so plainly and carries on with terminal backdrops; the
+> code is complete and will work on any build that still provides the layer.
+
 ### Control protocol
 
 The daemon listens on `127.0.0.1:6124`, newline-delimited JSON:
@@ -87,6 +104,8 @@ The daemon listens on `127.0.0.1:6124`, newline-delimited JSON:
 {"cmd":"effect","name":"waves"}
 {"cmd":"set","key":"fps","val":20}
 {"cmd":"param","key":"darkcut","val":{"kind":"int","v":300}}
+{"cmd":"wallpaper_effect","monitor":3,"name":"rain"}   // one monitor
+{"cmd":"wallpaper_effect","name":"off"}                // every monitor
 {"cmd":"save"}   {"cmd":"revert"}
 ```
 
@@ -97,7 +116,8 @@ rather than refusing to start.
 
 `PANEFX_EFFECT`, `PANEFX_ROTATION` (comma list) + `PANEFX_ROTATE_SECS`,
 `PANEFX_FPS`, `PANEFX_CELL_W` / `_H`, `PANEFX_FONT`, `PANEFX_CHARS`,
-`PANEFX_PAD_X` / `_Y`, `PANEFX_CROP_TOP`. Env wins over the config file.
+`PANEFX_PAD_X` / `_Y`, `PANEFX_CROP_TOP`, `PANEFX_WALLPAPER_FPS`,
+`PANEFX_WALLPAPER_CELL_W` / `_H`. Env wins over the config file.
 
 ---
 
@@ -159,6 +179,21 @@ Some things in here look wrong and are not:
 * **`waves` uses `darkcut`**, which has no equivalent in the Python original.
   Without it every cell is a drawn glyph — free when rasterising to a PNG, but
   here every lit cell is a GDI call.
+* **GlazeWM reports minimized windows as `displayState: "shown"`**, carrying the
+  full rect they had before being minimized. `displayState` answers "is this on
+  the active workspace", not "is this on screen". The wallpaper's occlusion check
+  filters on `state.type`; without that it would freeze behind a window sitting
+  in the taskbar, forever, with nothing visibly covering it.
+* **Occlusion is a scanline union, not a bounding box.** Two windows in opposite
+  corners have a bounding box covering the whole screen, so `UnionRect` would
+  freeze a visibly half-empty desktop.
+* **The wallpaper has its own cell size and ignores `cell_w`/`cell_h`.** The
+  terminal cell exists so glyphs line up with terminal text; a wallpaper has no
+  text to line up with. Inheriting a 10×15 terminal cell renders a 1440×2560
+  portrait at 24,480 cells instead of 10,656.
+* **A `WS_POPUP` with a parent is an *owned* window, not a child** — it would
+  float above every application instead of sitting behind the desktop icons.
+  Desktop surfaces are `WS_CHILD`.
 
 ---
 

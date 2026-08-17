@@ -20,11 +20,18 @@
 //!
 //! # Why this can fail, and why that must be survivable
 //!
-//! `0x052C` is undocumented and there are Windows 11 builds where it reportedly
-//! does nothing. Every entry point here therefore returns a *named* error rather
-//! than an `Option`, and the daemon carries on with terminal panels only. A
-//! wallpaper you cannot have is a missing feature; a daemon that refuses to
-//! start is a broken program.
+//! `0x052C` is undocumented, and **on Windows 11 25H2 (build 26200) it does
+//! nothing at all.** Measured here: Progman is found, the message is sent and
+//! acknowledged, and no WorkerW is ever created. Microsoft shipped a built-in
+//! video-wallpaper feature in that release and third-party wallpapers are now
+//! reported as being treated as ordinary windows — the same regression other
+//! wallpaper apps hit on 25H2.
+//!
+//! So this module is expected to fail on current Windows, and that must cost
+//! nothing. Every entry point returns a *named* error rather than an `Option`,
+//! and the daemon carries on with terminal panels only. A wallpaper you cannot
+//! have is a missing feature; a daemon that refuses to start is a broken
+//! program.
 
 use windows::core::w;
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, WPARAM};

@@ -268,81 +268,8 @@ impl App {
         self.rows[View::Effects.idx()] = rows;
 
         // ---- wallpaper view ----
-        let mut wrows: Vec<Row> = Vec::new();
-        let monitors = snap
-            .get("wallpaper")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let werr = snap.get("wallpaper_error").and_then(|v| v.as_str());
-        self.wallpaper_ok = werr.is_none();
-
-        if let Some(e) = werr {
-            // Say WHY, and say that nothing else is affected. An empty list here
-            // would read as a broken program.
-            wrows.push(Row::Note(format!("wallpaper layer unavailable — {e}")));
-            wrows.push(Row::Note(
-                "Terminal backdrops are unaffected and still running.".into(),
-            ));
-        } else if monitors.is_empty() {
-            wrows.push(Row::Note("no monitors detected".into()));
-        } else {
-            for m in &monitors {
-                wrows.push(Row::WallpaperMonitor {
-                    index: m.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-                    label: m
-                        .get("label")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    effect: m
-                        .get("effect")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("off")
-                        .to_string(),
-                    occluded: m
-                        .get("occluded")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false),
-                });
-            }
-            wrows.push(Row::WallpaperApplyAll);
-            let eff = cfg
-                .get("wallpaper_fps_effective")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            let asked = ci("wallpaper_fps");
-            wrows.push(Row::Config {
-                key: "wallpaper_fps",
-                label: "wallpaper fps",
-                value: asked,
-                min: 1,
-                max: 120,
-            });
-            if eff > 0 && eff < asked {
-                // The wallpaper is ticked from the daemon loop, so `fps` caps
-                // it. Say so rather than showing a number the screen is not
-                // delivering.
-                wrows.push(Row::Note(format!(
-                    "capped to {eff} fps by the daemon's own fps"
-                )));
-            }
-            wrows.push(Row::Config {
-                key: "wallpaper_cell_w",
-                label: "wp cell width",
-                value: ci("wallpaper_cell_w"),
-                min: 1,
-                max: 64,
-            });
-            wrows.push(Row::Config {
-                key: "wallpaper_cell_h",
-                label: "wp cell height",
-                value: ci("wallpaper_cell_h"),
-                min: 1,
-                max: 64,
-            });
-        }
-        self.rows[View::Wallpaper.idx()] = wrows;
+        self.wallpaper_ok = snap.get("wallpaper_error").is_none();
+        self.rows[View::Wallpaper.idx()] = build_wallpaper_rows(snap);
 
         // Clamp EVERY view's selection to its new row count.
         //
@@ -366,9 +293,7 @@ impl App {
     /// is NOT in the daemon's EFFECTS list (that list decides which config
     /// sections hold params).
     fn wallpaper_cycle(&self) -> Vec<String> {
-        let mut v = vec!["off".to_string()];
-        v.extend(self.effects.iter().cloned());
-        v
+        wallpaper_cycle_from(&self.effects)
     }
 
     fn nudge(&mut self, delta: i64) {
@@ -517,6 +442,110 @@ impl App {
         };
         self.dispatch(msg);
     }
+}
+
+/// The effect cycle for a wallpaper monitor: `off` plus every effect.
+///
+/// `off` is FIRST so it is one keypress away from the initial state, and it is
+/// deliberately not a member of the daemon's `EFFECTS` list — that list decides
+/// which config sections are read as per-effect params.
+fn wallpaper_cycle_from(effects: &[String]) -> Vec<String> {
+    let mut v = vec!["off".to_string()];
+    v.extend(effects.iter().cloned());
+    v
+}
+
+/// Build the Wallpaper tab's rows from a daemon snapshot.
+///
+/// Free function rather than a method so it can be tested against captured
+/// snapshots without a live daemon or a terminal.
+fn build_wallpaper_rows(snap: &serde_json::Value) -> Vec<Row> {
+    let mut rows: Vec<Row> = Vec::new();
+    let cfg = snap.get("config").cloned().unwrap_or_default();
+    let ci = |k: &str| cfg.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
+
+    let monitors = snap
+        .get("wallpaper")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let werr = snap.get("wallpaper_error").and_then(|v| v.as_str());
+
+    if let Some(e) = werr {
+        // Say WHY, and say what is unaffected. An empty tab here would read as
+        // "panefx is broken" when the terminal backdrops are working perfectly.
+        rows.push(Row::Note(format!("wallpaper layer unavailable — {e}")));
+        if e.contains("0x052C") {
+            rows.push(Row::Note(
+                "Windows 11 25H2 removed the layer third-party wallpapers used.".into(),
+            ));
+            rows.push(Row::Note(
+                "Other wallpaper apps hit the same wall on this build.".into(),
+            ));
+        }
+        rows.push(Row::Note(
+            "Terminal and Neovide backdrops are unaffected.".into(),
+        ));
+        return rows;
+    }
+
+    if monitors.is_empty() {
+        rows.push(Row::Note("no monitors detected".into()));
+        return rows;
+    }
+
+    for m in &monitors {
+        rows.push(Row::WallpaperMonitor {
+            index: m.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+            label: m
+                .get("label")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            effect: m
+                .get("effect")
+                .and_then(|v| v.as_str())
+                .unwrap_or("off")
+                .to_string(),
+            occluded: m
+                .get("occluded")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        });
+    }
+    rows.push(Row::WallpaperApplyAll);
+
+    let asked = ci("wallpaper_fps");
+    rows.push(Row::Config {
+        key: "wallpaper_fps",
+        label: "wallpaper fps",
+        value: asked,
+        min: 1,
+        max: 120,
+    });
+    let eff = ci("wallpaper_fps_effective");
+    if eff > 0 && eff < asked {
+        // The wallpaper is ticked from the daemon loop, so `fps` caps it. Say
+        // so, rather than showing a number the screen is not delivering.
+        rows.push(Row::Note(format!(
+            "capped to {eff} fps by the daemon's own fps"
+        )));
+    }
+    rows.push(Row::Config {
+        key: "wallpaper_cell_w",
+        label: "wp cell width",
+        value: ci("wallpaper_cell_w"),
+        min: 1,
+        max: 64,
+    });
+    rows.push(Row::Config {
+        key: "wallpaper_cell_h",
+        label: "wp cell height",
+        value: ci("wallpaper_cell_h"),
+        min: 1,
+        max: 64,
+    });
+    rows
 }
 
 fn row_label(r: &Row) -> String {
@@ -875,4 +904,77 @@ fn draw(f: &mut Frame, app: &App) {
             ),
         chunks[2],
     );
+}
+
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+
+    /// The snapshot a daemon with no wallpaper layer sends.
+    fn snapshot_without_layer() -> serde_json::Value {
+        serde_json::json!({"snapshot":{
+            "effect":"waves","effects":["flames","rain","waves","fire"],
+            "params":[],
+            "config":{"font":"F","cell_w":10,"cell_h":15,"fps":10,"crop_top":0,
+                      "pad_x":10,"pad_y":8,"rotation":["waves"],"rotate_secs":0,
+                      "wallpaper_fps":5,"wallpaper_fps_effective":5,
+                      "wallpaper_cell_w":15,"wallpaper_cell_h":23},
+            "wallpaper":[],
+            "wallpaper_error":"Explorer did not create a WorkerW behind the icons (0x052C had no effect on this build)"
+        }})
+    }
+
+    fn snapshot_with_monitors() -> serde_json::Value {
+        serde_json::json!({"snapshot":{
+            "effect":"waves","effects":["flames","rain","waves","fire"],
+            "params":[],
+            "config":{"font":"F","cell_w":10,"cell_h":15,"fps":10,"crop_top":0,
+                      "pad_x":10,"pad_y":8,"rotation":["waves"],"rotate_secs":0,
+                      "wallpaper_fps":5,"wallpaper_fps_effective":5,
+                      "wallpaper_cell_w":15,"wallpaper_cell_h":23},
+            "wallpaper":[
+                {"index":1,"label":"1440x2560 portrait","effect":"waves","occluded":false},
+                {"index":3,"label":"1920x1080 (primary)","effect":"off","occluded":true}
+            ]
+        }})
+    }
+
+    #[test]
+    fn a_missing_layer_explains_itself_instead_of_showing_nothing() {
+        // An empty list would read as "panefx is broken" when the terminal
+        // backdrops are working perfectly. It must say why, and say what is
+        // unaffected.
+        let rows = build_wallpaper_rows(&snapshot_without_layer()["snapshot"]);
+        assert!(!rows.is_empty(), "never show an empty wallpaper tab");
+        let text: String = rows.iter().map(|r| row_value(r, "waves")).collect::<Vec<_>>().join(" ");
+        assert!(text.contains("unavailable"));
+        assert!(text.contains("25H2"), "name the actual cause");
+        assert!(text.contains("unaffected"), "say what still works");
+        assert!(rows.iter().all(row_is_note), "nothing here is selectable");
+    }
+
+    #[test]
+    fn monitors_render_with_effect_and_frozen_state() {
+        let rows = build_wallpaper_rows(&snapshot_with_monitors()["snapshot"]);
+        let mons: Vec<&Row> = rows.iter()
+            .filter(|r| matches!(r, Row::WallpaperMonitor { .. })).collect();
+        assert_eq!(mons.len(), 2);
+        assert!(row_label(mons[0]).contains("1440x2560"));
+        assert!(row_value(mons[0], "").contains("waves"));
+        // The frozen marker is why a still wallpaper does not read as a bug.
+        assert!(row_value(mons[1], "").contains("frozen"));
+        assert!(!row_value(mons[0], "").contains("frozen"));
+        assert!(rows.iter().any(|r| matches!(r, Row::WallpaperApplyAll)));
+    }
+
+    #[test]
+    fn off_is_reachable_in_one_keypress_from_the_cycle() {
+        // `off` must be first so it is adjacent to the initial state, and it is
+        // deliberately NOT in the daemon's EFFECTS list.
+        let effects: Vec<String> =
+            ["flames","rain","waves","fire"].iter().map(|s| s.to_string()).collect();
+        let cycle = wallpaper_cycle_from(&effects);
+        assert_eq!(cycle[0], "off");
+        assert_eq!(cycle.len(), 5);
+    }
 }
