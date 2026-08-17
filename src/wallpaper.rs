@@ -25,11 +25,19 @@
 //! a live IPC session: minimized windows come back as `displayState: "shown"` at
 //! 1720x939 and larger. Filtering on `state.type` is not optional.
 //!
-//! # 3. Simulations are shared, not duplicated
+//! # 3. Every monitor owns its simulation
 //!
-//! Params are global per effect name, so two monitors running the same effect at
-//! the same grid size produce identical frames. They therefore share one
-//! simulation: N monitors cost N blits but one `step()`.
+//! Monitors do **not** share simulations, even on the same effect at the same
+//! grid size. Sharing would be cheaper — N monitors for one `step()` — but two
+//! same-sized screens would then show the *same frame at the same instant*:
+//! identical raindrops, identical waves, perfectly mirrored. That is a visible
+//! defect, and resolution collisions are the common case, not the exotic one.
+//!
+//! So each surface gets its own state and its own **seed**, derived from the
+//! monitor index. The cost is one `step()` per monitor rather than one overall —
+//! and per the project's own profiling that is the cheap half: the simulation is
+//! ~1% of a core while the renderer was ~72%, and the renderer was already
+//! per-surface. The freeze below is what actually keeps this affordable.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -49,24 +57,41 @@ pub const OFF: &str = "off";
 /// How often to retry finding the WorkerW after it goes away.
 const WORKER_RETRY: Duration = Duration::from_secs(5);
 
-/// Identity deciding whether two surfaces can share one simulation.
+/// Which simulation a surface owns.
+///
+/// Keyed by **monitor**, not by `(effect, grid)`. Two monitors on the same
+/// effect at the same size must animate independently, so they get separate
+/// entries even though their content would otherwise be interchangeable.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct SimKey {
+    /// `DISPLAY<n>` index. This is what makes the key unique per screen.
+    pub monitor: usize,
     pub effect: String,
     pub cols: usize,
     pub rows: usize,
 }
 
+/// A per-monitor seed.
+///
+/// Two monitors running the same effect must not start from the same state, or
+/// they animate in lockstep and look mirrored. Mixing the monitor index in with
+/// a large odd constant separates them without needing any entropy source (the
+/// daemon must stay deterministic for its tests).
+pub fn seed_for(monitor: usize) -> u64 {
+    0x5EED_1234u64.wrapping_add((monitor as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+}
+
 struct PooledSim {
     sim: Box<dyn AsciiAnimation>,
-    /// Live surfaces pointing at this sim. Zero means it can be dropped.
-    refs: usize,
-    /// Did the last step change anything? Latched per frame, because the first
-    /// surface to draw must not clear it for the second.
+    /// Did the last step change anything? Latched per frame, because the draw
+    /// decision happens after every sim has stepped.
     dirty: bool,
 }
 
-/// Simulations, de-duplicated by `(effect, cols, rows)`.
+/// One simulation per monitor.
+///
+/// Not a de-duplicating cache: the key includes the monitor index precisely so
+/// that two identical screens get two independent animations.
 #[derive(Default)]
 pub struct SimPool {
     sims: HashMap<SimKey, PooledSim>,
@@ -77,7 +102,7 @@ impl SimPool {
         Self::default()
     }
 
-    /// Number of distinct simulations alive. The sharing property, observable.
+    /// Live simulations — one per monitor with an effect on.
     pub fn len(&self) -> usize {
         self.sims.len()
     }
@@ -86,35 +111,16 @@ impl SimPool {
         self.sims.is_empty()
     }
 
-    /// Take a reference to the sim for `key`, building it if needed.
-    pub fn acquire(&mut self, key: &SimKey, cfg: &Config, seed: u64) {
-        if let Some(p) = self.sims.get_mut(key) {
-            p.refs += 1;
-            return;
-        }
-        let sim = animation::rebuild(cfg, &key.effect, key.cols, key.rows, seed);
-        self.sims.insert(
-            key.clone(),
-            PooledSim {
-                sim,
-                refs: 1,
-                dirty: true,
-            },
-        );
+    /// Build the simulation for `key`, seeded so it diverges from every other
+    /// monitor's.
+    pub fn acquire(&mut self, key: &SimKey, cfg: &Config) {
+        let sim = animation::rebuild(cfg, &key.effect, key.cols, key.rows, seed_for(key.monitor));
+        self.sims.insert(key.clone(), PooledSim { sim, dirty: true });
     }
 
-    /// Release one reference, dropping the sim when the last one goes.
+    /// Drop a monitor's simulation, freeing its state.
     pub fn release(&mut self, key: &SimKey) {
-        let gone = match self.sims.get_mut(key) {
-            Some(p) => {
-                p.refs = p.refs.saturating_sub(1);
-                p.refs == 0
-            }
-            None => false,
-        };
-        if gone {
-            self.sims.remove(key);
-        }
+        self.sims.remove(key);
     }
 
     /// Step only the sims named in `live`.
@@ -140,9 +146,23 @@ impl SimPool {
         self.sims.get(key).map(|p| p.dirty).unwrap_or(false)
     }
 
-    /// Was this sim stepped on the last `step_only`? Test-facing.
-    pub fn refs(&self, key: &SimKey) -> usize {
-        self.sims.get(key).map(|p| p.refs).unwrap_or(0)
+    /// Does a simulation exist for this monitor? Test-facing.
+    pub fn has(&self, key: &SimKey) -> bool {
+        self.sims.contains_key(key)
+    }
+
+    /// A monitor's current grid, as a cheap fingerprint of its visible state.
+    /// Test-facing: two monitors showing identical grids are mirroring.
+    pub fn fingerprint(&self, key: &SimKey) -> Option<Vec<Option<char>>> {
+        let p = self.sims.get(key)?;
+        let (cols, rows) = p.sim.dimensions();
+        let mut out = Vec::with_capacity(cols * rows);
+        for r in 0..rows {
+            for c in 0..cols {
+                out.push(p.sim.cell_at(c, r).map(|(ch, _)| ch));
+            }
+        }
+        Some(out)
     }
 }
 
@@ -403,11 +423,12 @@ impl WallpaperSet {
         let rows = (s.monitor.height / ch).max(1) as usize;
 
         let key = SimKey {
+            monitor: s.monitor.index,
             effect: s.effect.clone(),
             cols,
             rows,
         };
-        self.pool.acquire(&key, cfg, 0x5EED_1234);
+        self.pool.acquire(&key, cfg);
 
         let (x, y) = desktop::to_child(&worker, s.monitor.x, s.monitor.y);
         match Panel::create_anchored(
@@ -555,7 +576,7 @@ impl WallpaperSet {
         Ok(())
     }
 
-    /// How many distinct simulations are alive. Observable sharing.
+    /// Live simulations — one per monitor whose effect is not `off`.
     pub fn sim_count(&self) -> usize {
         self.pool.len()
     }
@@ -700,8 +721,9 @@ mod tests {
 
     // ---- sim pool ----------------------------------------------------------
 
-    fn key(effect: &str, c: usize, r: usize) -> SimKey {
+    fn key(mon: usize, effect: &str, c: usize, r: usize) -> SimKey {
         SimKey {
+            monitor: mon,
             effect: effect.into(),
             cols: c,
             rows: r,
@@ -709,39 +731,79 @@ mod tests {
     }
 
     #[test]
-    fn same_effect_and_grid_share_one_sim() {
-        // The property that keeps four monitors affordable: one step(), N blits.
+    fn two_identical_monitors_get_separate_simulations() {
+        // Same effect, same grid, different screens. They must NOT share, or the
+        // two monitors animate in lockstep.
         let cfg = Config::default();
         let mut pool = SimPool::new();
-        let k = key("flames", 80, 40);
-        pool.acquire(&k, &cfg, 1);
-        pool.acquire(&k, &cfg, 1);
-        assert_eq!(pool.len(), 1, "identical keys must share");
-        assert_eq!(pool.refs(&k), 2);
+        let a = key(1, "flames", 80, 40);
+        let b = key(3, "flames", 80, 40);
+        pool.acquire(&a, &cfg);
+        pool.acquire(&b, &cfg);
+        assert_eq!(pool.len(), 2, "one simulation per monitor, never shared");
+        assert!(pool.has(&a) && pool.has(&b));
     }
 
     #[test]
-    fn different_grids_do_not_share() {
-        // Portrait and landscape produce different grids. Sharing would force a
-        // resize twice per frame, and `waves::resize` rebuilds its base field.
+    fn two_identical_monitors_do_not_mirror_each_other() {
+        // THE point of the per-monitor seed, checked on the actual output rather
+        // than on the plumbing. Two same-sized screens on the same effect must
+        // not show the same frame — that is what a shared sim looked like.
         let cfg = Config::default();
         let mut pool = SimPool::new();
-        pool.acquire(&key("flames", 80, 40), &cfg, 1);
-        pool.acquire(&key("flames", 40, 80), &cfg, 1);
+        let a = key(1, "flames", 60, 30);
+        let b = key(3, "flames", 60, 30);
+        pool.acquire(&a, &cfg);
+        pool.acquire(&b, &cfg);
+        // Advance both together, exactly as the daemon would.
+        for _ in 0..40 {
+            pool.step_only(&[a.clone(), b.clone()]);
+        }
+        let fa = pool.fingerprint(&a).expect("monitor 1 grid");
+        let fb = pool.fingerprint(&b).expect("monitor 3 grid");
+        assert_eq!(fa.len(), fb.len(), "same grid size, so comparable");
+        assert_ne!(
+            fa, fb,
+            "identical monitors are showing identical frames — they are mirroring"
+        );
+    }
+
+    #[test]
+    fn the_seed_differs_per_monitor() {
+        // The mechanism behind the test above. Equal seeds would make two
+        // monitors replay the same sequence even with separate state.
+        assert_ne!(seed_for(1), seed_for(3));
+        assert_ne!(seed_for(1), seed_for(2));
+        assert_ne!(seed_for(0), seed_for(1));
+        // Deterministic: the daemon's tests depend on it, so no entropy here.
+        assert_eq!(seed_for(3), seed_for(3));
+    }
+
+    #[test]
+    fn one_monitor_switching_effect_replaces_only_its_own_sim() {
+        let cfg = Config::default();
+        let mut pool = SimPool::new();
+        let a_flames = key(1, "flames", 80, 40);
+        let b_flames = key(3, "flames", 80, 40);
+        pool.acquire(&a_flames, &cfg);
+        pool.acquire(&b_flames, &cfg);
+        // Monitor 1 switches to rain: its old sim goes, monitor 3 is untouched.
+        pool.release(&a_flames);
+        pool.acquire(&key(1, "rain", 80, 40), &cfg);
+        assert!(!pool.has(&a_flames), "the replaced sim must be freed");
+        assert!(pool.has(&b_flames), "the other monitor must be unaffected");
         assert_eq!(pool.len(), 2);
     }
 
     #[test]
-    fn releasing_the_last_reference_evicts() {
+    fn releasing_frees_the_simulation() {
         let cfg = Config::default();
         let mut pool = SimPool::new();
-        let k = key("flames", 80, 40);
-        pool.acquire(&k, &cfg, 1);
-        pool.acquire(&k, &cfg, 1);
+        let k = key(1, "flames", 80, 40);
+        pool.acquire(&k, &cfg);
+        assert_eq!(pool.len(), 1);
         pool.release(&k);
-        assert_eq!(pool.len(), 1, "still one consumer left");
-        pool.release(&k);
-        assert_eq!(pool.len(), 0, "last consumer gone, sim dropped");
+        assert_eq!(pool.len(), 0, "off must free the state, not just hide it");
     }
 
     #[test]
@@ -750,23 +812,51 @@ mod tests {
         // must not advance -- that is what makes a covered monitor cost nothing.
         let cfg = Config::default();
         let mut pool = SimPool::new();
-        let k = key("rain", 40, 20);
-        pool.acquire(&k, &cfg, 1);
+        let k = key(1, "rain", 40, 20);
+        pool.acquire(&k, &cfg);
         pool.step_only(&[]);
         assert!(!pool.dirty(&k), "an occluded sim must not report work done");
     }
 
     #[test]
-    fn a_sim_with_one_visible_consumer_is_stepped() {
-        // Composability: sharing must not let an occluded surface freeze a
-        // visible one.
+    fn one_occluded_monitor_does_not_freeze_another() {
+        // Monitor 1 is covered, monitor 3 is visible. Now that each owns its
+        // simulation, the covered one must go idle WITHOUT stalling the other.
         let cfg = Config::default();
         let mut pool = SimPool::new();
-        let k = key("flames", 40, 20);
-        pool.acquire(&k, &cfg, 1);
-        pool.acquire(&k, &cfg, 1);
-        pool.step_only(std::slice::from_ref(&k));
-        assert!(pool.dirty(&k));
+        let covered = key(1, "flames", 40, 20);
+        let visible = key(3, "flames", 40, 20);
+        pool.acquire(&covered, &cfg);
+        pool.acquire(&visible, &cfg);
+        pool.step_only(std::slice::from_ref(&visible));
+        assert!(pool.dirty(&visible), "the visible monitor must keep animating");
+        assert!(!pool.dirty(&covered), "the covered monitor must go idle");
+    }
+
+    #[test]
+    fn a_frozen_monitor_holds_its_frame_and_resumes_from_it() {
+        // "Static instead of dynamic": a covered monitor stops where it was and
+        // carries on from there, rather than resetting.
+        let cfg = Config::default();
+        let mut pool = SimPool::new();
+        let k = key(1, "flames", 40, 20);
+        pool.acquire(&k, &cfg);
+        for _ in 0..10 {
+            pool.step_only(std::slice::from_ref(&k));
+        }
+        let before = pool.fingerprint(&k).unwrap();
+        // Covered for a while: no stepping at all.
+        for _ in 0..30 {
+            pool.step_only(&[]);
+        }
+        let during = pool.fingerprint(&k).unwrap();
+        assert_eq!(before, during, "a frozen monitor must not advance");
+        // Uncovered: it moves again.
+        for _ in 0..5 {
+            pool.step_only(std::slice::from_ref(&k));
+        }
+        let after = pool.fingerprint(&k).unwrap();
+        assert_ne!(during, after, "it must resume when it becomes visible");
     }
 
     #[test]
@@ -789,6 +879,52 @@ mod tests {
             WallpaperSet::cell_for(waves.as_ref(), &cfg),
             (15, 23),
             "an effect's preferred cell must win on the desktop"
+        );
+    }
+
+    #[test]
+    fn the_terminal_cell_never_reaches_the_wallpaper_resolver() {
+        // The 57% trap, tested on the RESOLVER rather than on the config fields
+        // — checking that `Config` holds the right numbers proves nothing if
+        // `cell_for` goes and reads the terminal's instead.
+        //
+        // Measured: a 1440x2560 portrait is 24,480 cells at 10x15 against
+        // 10,656 at 15x23, and 12,012 cells was the panel that cost 88.7% of a
+        // core before the optimisation pass.
+        let mut cfg = Config::default();
+        // Exactly the live config: an explicit terminal cell, no wallpaper one.
+        cfg.cell_w = 10;
+        cfg.cell_h = 15;
+        cfg.cell_explicit = true;
+        assert!(!cfg.wallpaper_cell_explicit);
+
+        let waves = animation::build("waves", 10, 10, 1, &cfg);
+        let cell = WallpaperSet::cell_for(waves.as_ref(), &cfg);
+        assert_ne!(cell, (10, 15), "the terminal cell leaked into the wallpaper");
+        assert_eq!(cell, (15, 23));
+
+        // And spell out what it would have cost, so the number is not folklore.
+        let (w, h) = (1440, 2560);
+        let leaked = (w / 10) * (h / 15);
+        let correct = (w / cell.0) * (h / cell.1);
+        assert_eq!(leaked, 24_480);
+        assert_eq!(correct, 10_656);
+        assert!(correct * 2 < leaked, "the leak more than doubles the work");
+    }
+
+    #[test]
+    fn an_effect_with_no_preference_falls_back_to_the_wallpaper_default() {
+        // `flames` declares no preferred cell, so the wallpaper default must
+        // apply — NOT the terminal's.
+        let mut cfg = Config::default();
+        cfg.cell_w = 10;
+        cfg.cell_h = 15;
+        cfg.cell_explicit = true;
+        let flames = animation::build("flames", 10, 10, 1, &cfg);
+        assert_eq!(flames.preferred_cell(), None, "precondition for this test");
+        assert_eq!(
+            WallpaperSet::cell_for(flames.as_ref(), &cfg),
+            (cfg.wallpaper_cell_w, cfg.wallpaper_cell_h)
         );
     }
 

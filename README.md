@@ -89,6 +89,11 @@ independent effect per monitor, or `off` to leave that screen alone. A monitor
 that is fully covered stops being simulated entirely rather than animating where
 nobody can see it, and shows as `❄ frozen` in the TUI.
 
+Each monitor animates **independently**, seeded from its display index. Two
+screens of the same size running the same effect would otherwise share one
+simulation and show the identical frame at the identical instant, which looks
+like a mirror rather than two wallpapers.
+
 > **This does not work on Windows 11 25H2 (build 26200).** The undocumented
 > message that asks Explorer for the layer behind the desktop icons is a no-op
 > there — measured, not assumed — and other wallpaper apps hit the same wall on

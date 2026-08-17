@@ -54,7 +54,13 @@ machinery is content-agnostic.
 | `src/desktop.rs` | WorkerW discovery + monitor enumeration |
 | `src/wallpaper.rs` | Per-monitor surfaces, sim pool, occlusion freeze |
 
-**108 unit tests passing. Verified visually on screen, not just by exit code.**
+**110 unit tests passing. Verified visually on screen, not just by exit code.**
+
+**The critical tests are sabotage-checked** — each was re-run against a
+deliberately reintroduced bug to confirm it actually fails. A test that cannot
+fail is worse than no test, because it reads as coverage. Verified this way:
+the mirroring check, the minimized-window filter, the scanline-vs-bounding-box
+occlusion, the wallpaper cell resolver, and the config key ordering.
 
 **It autostarts with GlazeWM** — it is a function of the WM, not a separate
 service, because it depends on the WM's IPC for all window geometry.
@@ -608,9 +614,15 @@ different feature, not a fallback.
 
 * **A covered monitor's simulation is not stepped at all** — not
   stepped-and-skipped. A fully covered desktop costs a pass over a few booleans.
-* **Simulations are shared by `(effect, cols, rows)`.** Params are global per
-  effect name, so two monitors on the same effect and grid produce identical
-  frames: N monitors cost N blits and one `step()`.
+* **Every monitor owns its simulation, seeded from its `DISPLAY<n>` index.**
+  Sharing by `(effect, grid)` was cheaper but wrong: two same-sized screens on
+  one effect showed the *same frame at the same instant* — identical raindrops,
+  perfectly mirrored. Resolution collisions are the common case, not the exotic
+  one. The extra cost is one `step()` per monitor instead of one overall, which
+  lands on the cheap side of the measured split (sim ~1% of a core, renderer
+  ~72%) — and on a mixed-resolution layout the old code was already building one
+  sim per monitor anyway, so sharing only ever kicked in where it looked wrong.
+  → `two_identical_monitors_do_not_mirror_each_other`
 * **The wallpaper has its OWN cell size** (`wallpaper_cell_w/h`, default 15x23).
   It must NOT inherit `cell_w`/`cell_h`: the terminal cell exists so glyphs line
   up with text, and a wallpaper has no text. Measured on a 1440x2560 portrait —
