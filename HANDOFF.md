@@ -33,9 +33,7 @@ ASCII subsystem — the core should hand a renderer a rect and a surface, not a
 character grid. Do not let `AsciiAnimation` become the universal interface by
 default.
 
-Windows 11 / pHub. Four ASCII effects today; the machinery is content-agnostic.
-
-Plan: `C:\Users\micha\.claude\plans\https-github-com-mhearse-asciifire-i-wan-serene-popcorn.md`
+Windows 11. Four ASCII effects today; the machinery is content-agnostic.
 
 ## Status (2026-08-15) — WORKING END TO END
 
@@ -108,7 +106,7 @@ Also changed outside this repo:
   window. The re-pin-every-reconcile strategy beats GlazeWM's own z-ordering.
   **The per-pane architecture works; the WorkerW fallback was not needed.**
 
-## Verified facts (measured on pHub, not assumed)
+## Verified facts (measured, not assumed)
 
 * **Alacritty's Win32 class name is `"Window Class"`** — winit's generic
   default, NOT `"Alacritty"`. Too generic to match on alone; other winit apps
@@ -215,11 +213,11 @@ kept for comparison.
 ## The `rain` effect
 
 Ported from **`site/static/app.js:773`** (`createRain`) — Michael's own
-renderer, the one driving the **self.net boot screen** (`initBoot`, app.js:716,
+renderer, the one driving a personal site's **boot screen** (`initBoot`, app.js:716,
 `{dim:true}`). Read before porting.
 
 Disambiguation, because this cost real time: `app.js` calls `createRain` twice —
-line 716 is the self.net boot screen (**the right one**) and line 927 is the
+line 716 is the boot screen (**the right one**) and line 927 is the
 Konami-code easter egg. The **moecode window pane** that opens after the boot
 screen uses a *different* rain implementation entirely, NOT `createRain`, and
 Michael considers that one wrong. Do not port from the moecode pane.
@@ -386,7 +384,7 @@ splitting it into separate `glyph_at`/`color_at` doubles the per-cell work.
 ## Tuning knobs
 
 * `PANEFX_CELL_W` / `PANEFX_CELL_H` env vars override the character cell
-  size. Defaults 10x15, measured from the Alacritty font on pHub
+  size. Defaults 10x15, measured from the Alacritty font
   (BigBlueTerm437 Nerd Font Mono @ 11pt, 96 DPI = 9.78 x 14.67 px). Change
   these if the font, its size, or the display DPI changes.
 * `render::FONT_FACE` must match `[font] normal.family` in `alacritty.toml`.
@@ -408,8 +406,8 @@ splitting it into separate `glyph_at`/`color_at` doubles the per-cell work.
 
 **`target-cpu=native` makes the binary NON-PORTABLE.** `.cargo/config.toml` sets
 it, which is right for the machine it is built on and wrong for every other one.
-pHub is a Ryzen 9800X3D (Zen 5); SloppyLaptopy is an Intel i7-13700H. Copying
-the native binary risks an illegal-instruction crash.
+Verified across a Zen 5 desktop and a 13th-gen Intel laptop: copying the native
+binary risks an illegal-instruction crash.
 
 Build a portable one instead:
 
@@ -422,23 +420,24 @@ Remove-Item Env:\RUSTFLAGS
 `x86-64-v2` is SSE4.2-era — safe on anything from the last decade. Verified
 running on the laptop's Intel CPU with no crash.
 
-### SloppyLaptopy, deployed 2026-08-16
+### What a second machine needs
 
-* `~\bin\panefx.exe` + `panefx-ctl.exe` (portable build; `~\bin` already on PATH)
-* `~\.config\panefx\config.toml` — copied from pHub
-* GlazeWM `config.yaml` — panefx **appended** to the existing
-  `startup_commands` / `shutdown_commands`, which already launch Zebar. Append,
-  never replace, or Zebar stops starting. Backup at `config.yaml.bak-panefx`.
+* `~\bin\panefx.exe` + `panefx-ctl.exe` (portable build; `~\bin` on PATH)
+* `~\.config\panefx\config.toml`
+* GlazeWM `config.yaml` — panefx **appended** to any existing
+  `startup_commands` / `shutdown_commands`. Append, never replace, or whatever
+  else was starting there (Zebar, etc.) silently stops. Keep a backup.
 * GlazeWM ignore rule for `panefx` / `PaneFxClass`
 * `alacritty.toml` opacity 1.0 → 0.6
 * `%APPDATA%\neovide\config.toml` — `transparency = 0.6`, `frame = "none"`
 
-No Rust toolchain on the laptop, and none needed — binaries are built on pHub.
+No Rust toolchain needed on the target — build elsewhere and copy the portable
+binary.
 
 **SSH quoting:** nested quotes through PowerShell→SSH mangle reliably (this cost
 several attempts). `scp` a `.ps1` and run it with
 `powershell -NoProfile -ExecutionPolicy Bypass -File`. Also note `scp target:bin/x`
-silently did nothing; the explicit `scp target:C:/Users/micha/bin/x` worked.
+silently did nothing; an explicit absolute path (`scp target:C:/Users/<you>/bin/x`) worked.
 
 **A daemon started over SSH DIES when the SSH session ends** — including with
 `Start-Process -WindowStyle Hidden`, which is not enough. The whole process tree

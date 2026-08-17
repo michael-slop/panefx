@@ -305,7 +305,7 @@ mod tests {
 
     #[test]
     fn parses_a_real_query_windows_reply() {
-        // Captured from the live IPC on pHub — note the negative coordinates
+        // Captured from a live IPC session — note the negative coordinates
         // from the left-hand monitor, and the generic winit class name.
         let json = r#"{
           "messageType":"client_response",

@@ -45,7 +45,7 @@ impl Rgb {
 /// through Alacritty at `opacity = 0.6`, which blends every colour most of the
 /// way back toward the terminal's own dark background — a ramp that starts at
 /// near-black (the obvious choice on paper) renders as invisible-to-faint for
-/// its lower two thirds, so only the flame roots show. Measured on pHub: with
+/// its lower two thirds, so only the flame roots show. Measured: with
 /// a near-black cool end, only `$`/`#` survived the blend.
 pub const GREEN_RAMP: [Rgb; 8] = [
     Rgb(0x14, 0x28, 0x18), // ' '  darkest, still above the terminal bg

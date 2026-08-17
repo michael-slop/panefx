@@ -49,7 +49,7 @@ impl Rng {
 ///
 /// A fixed decay burns out after a roughly fixed number of rows: tuned on an
 /// 80x25 grid it looks right there, then fills only the bottom sixth of a
-/// full-height terminal (measured on pHub: 1274px tall ≈ 85 rows, flames died
+/// full-height terminal (measured: 1274px tall ≈ 85 rows, flames died
 /// around row 70 of 85, leaving the top two thirds empty).
 ///
 /// Calibrated so that flames reach roughly 60-70% of the way up, which reads
@@ -243,7 +243,7 @@ impl Fire {
                 // Row 0 has no neighbour above it, so nothing cools it further
                 // and whatever heat reaches it renders as a hard flat line
                 // across the full width — a horizontal streak, not a flame.
-                // (Measured on pHub: the top ~3 rows of every panel showed
+                // (Measured: the top ~3 rows of every panel showed
                 // ramp-coloured pixels in straight lines.) This is the mirror
                 // of the off-screen seed row at the bottom.
                 let fade = top_fade(row, self.rows);

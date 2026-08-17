@@ -20,7 +20,7 @@
 # Flags that are not optional:
 #
 #   +nightly-x86_64-pc-windows-gnu
-#       stable-msvc has no link.exe on PATH on pHub. This is the same toolchain
+#       stable-msvc has no link.exe on PATH here. This is the same toolchain
 #       the patched GlazeWM builds with.
 #   --offline
 #       the dependency set is already vendored; going online just adds latency

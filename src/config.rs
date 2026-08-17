@@ -15,7 +15,7 @@ use std::time::Duration;
 
 /// Font used to draw every effect. Must be a family name Windows can resolve.
 ///
-/// Defaults to the Alacritty font on pHub so the animation shares the
+/// Defaults to the author's Alacritty font so the animation shares the
 /// terminal's cell grid. BigBlueTerm is a DOS/CP437 face with NO katakana —
 /// which is why the rain effect uses CP437 glyphs rather than the usual
 /// Matrix katakana. That is a deliberate constraint, not an oversight.

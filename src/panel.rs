@@ -162,7 +162,7 @@ impl Panel {
     /// Create a panel shadowing `target` at the given rect.
     ///
     /// `x`/`y` are signed and may be negative — a monitor to the left of the
-    /// primary yields negative coordinates (observed on pHub: x = -1436).
+    /// primary yields negative coordinates (observed: x = -1436).
     pub fn create(target: HWND, x: i32, y: i32, width: i32, height: i32) -> anyhow::Result<Self> {
         unsafe {
             let hinstance = GetModuleHandleW(None)?;
