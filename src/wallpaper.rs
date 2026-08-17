@@ -499,14 +499,14 @@ impl WallpaperSet {
                 // background — which would hide it completely. It has to sit
                 // between the WorkerW and SHELLDLL_DefView.
                 if let Err(e) = p.pin_behind_target() {
-                    eprintln!("[panefx] wallpaper: z-order for {} failed: {e}", s.monitor.device);
+                    crate::log_warn!("[panefx] wallpaper: z-order for {} failed: {e}", s.monitor.device);
                 }
                 s.panel = Some(p);
                 s.sim = Some(key);
                 s.force_redraw = true;
             }
             Err(e) => {
-                eprintln!(
+                crate::log_warn!(
                     "[panefx] wallpaper: could not create a surface for {}: {e}",
                     s.monitor.device
                 );
@@ -549,7 +549,7 @@ impl WallpaperSet {
         if !self.monitors_changed(&current) {
             return false;
         }
-        println!(
+        crate::log_info!(
             "[panefx] monitor layout changed ({} -> {}), rebuilding wallpaper",
             self.surfaces.len(),
             current.len()

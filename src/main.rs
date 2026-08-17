@@ -28,7 +28,7 @@
 //!   * every reconcile also RE-PINS z-order, because GlazeWM re-orders windows
 //!     on focus changes and would otherwise strand our panels
 
-use panefx::{animation, config, control, ipc, panel, render, term_opacity, wallpaper};
+use panefx::{animation, config, control, ipc, panel, render, term_opacity, tray, wallpaper};
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -115,7 +115,7 @@ fn launch_tui() -> anyhow::Result<()> {
     match status {
         Ok(s) => std::process::exit(s.code().unwrap_or(0)),
         Err(e) => {
-            eprintln!(
+            panefx::log_warn!(
                 "panefx: cannot start the control TUI ({}): {e}\n\
                  Expected panefx-ctl.exe next to {}.\n\
                  Run `panefx --daemon` for the background daemon.",
@@ -136,7 +136,7 @@ fn main() -> anyhow::Result<()> {
             return launch_tui();
         }
         Mode::Unknown(flag) => {
-            eprintln!("panefx: unknown option '{flag}'\n\n{HELP}");
+            panefx::log_warn!("panefx: unknown option '{flag}'\n\n{HELP}");
             std::process::exit(2);
         }
         Mode::Daemon => {}
@@ -149,16 +149,16 @@ fn main() -> anyhow::Result<()> {
     // for weeks.
     match render::verify_font(&cfg.font) {
         Some(got) if got.eq_ignore_ascii_case(&cfg.font) => {
-            println!("[panefx] font OK: {got:?}");
+            panefx::log_info!("[panefx] font OK: {got:?}");
         }
         Some(got) => {
-            eprintln!(
+            panefx::log_warn!(
                 "[panefx] WARNING: asked for {:?} but GDI selected {:?}. \
                  Is the font installed, and is the family name exact?",
                 cfg.font, got
             );
         }
-        None => eprintln!("[panefx] WARNING: could not verify font {:?}", cfg.font),
+        None => panefx::log_warn!("[panefx] WARNING: could not verify font {:?}", cfg.font),
     }
 
     panel::register_class()?;
@@ -168,12 +168,23 @@ fn main() -> anyhow::Result<()> {
     let client = match ipc::IpcThread::spawn() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!(
+            panefx::log_warn!(
                 "[panefx] cannot reach GlazeWM at {}: {e}\n\
                  Is GlazeWM running? Panels need its IPC for window geometry.",
                 ipc::IPC_URL
             );
             return Err(e);
+        }
+    };
+
+    // Tray icon: the daemon has no window and no console, so without this it is
+    // completely invisible -- no way to tell it is running, reach the TUI, or
+    // restart it after a bad state. Failure here is not fatal.
+    let _tray = match tray::Tray::new() {
+        Ok(t) => Some(t),
+        Err(e) => {
+            panefx::log_warn!("[panefx] no tray icon: {e}");
+            None
         }
     };
 
@@ -187,13 +198,13 @@ fn main() -> anyhow::Result<()> {
     // the terminal's cannot drift apart.
     match term_opacity::apply(cfg.opacity) {
         Ok(term_opacity::Outcome::Written) => {
-            println!("[panefx] background opacity -> {}%", cfg.opacity)
+            panefx::log_info!("[panefx] background opacity -> {}%", cfg.opacity)
         }
         Ok(term_opacity::Outcome::AlreadyCorrect) => {}
-        Ok(term_opacity::Outcome::KeyMissing) => eprintln!(
+        Ok(term_opacity::Outcome::KeyMissing) => panefx::log_warn!(
             "[panefx] alacritty.toml has no '[window] opacity =' line; opacity not applied"
         ),
-        Err(e) => eprintln!("[panefx] could not set opacity at startup: {e}"),
+        Err(e) => panefx::log_warn!("[panefx] could not set opacity at startup: {e}"),
     }
 
     // Undo the previous mechanism on any window that still carries it.
@@ -209,8 +220,8 @@ fn main() -> anyhow::Result<()> {
     // as before.
     let mut wall = wallpaper::WallpaperSet::new(&cfg);
     match &wall.error {
-        Some(e) => eprintln!("[panefx] wallpaper unavailable: {e}"),
-        None => println!(
+        Some(e) => panefx::log_warn!("[panefx] wallpaper unavailable: {e}"),
+        None => panefx::log_info!(
             "[panefx] wallpaper layer attached — {} monitor(s)",
             wall.monitors().len()
         ),
@@ -242,7 +253,7 @@ fn main() -> anyhow::Result<()> {
     let mut last_poll = Instant::now();
     let mut frame_start;
 
-    println!(
+    panefx::log_info!(
         "[panefx] running — {} fps, cell {}x{}, font {:?}, effects {:?}",
         cfg.fps, cfg.cell_w, cfg.cell_h, cfg.font, cfg.rotation
     );
@@ -256,6 +267,52 @@ fn main() -> anyhow::Result<()> {
             while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
+            }
+        }
+
+        // --- tray clicks ---
+        if let Some(action) = tray::take_action() {
+            match action {
+                tray::TrayAction::OpenTui => {
+                    // Spawn the console binary; the daemon has no console of its
+                    // own to host a TUI in.
+                    let exe = std::env::current_exe().ok();
+                    let ctl = exe
+                        .as_ref()
+                        .and_then(|e| e.parent())
+                        .map(|d| d.join("panefx-ctl.exe"));
+                    if let Some(ctl) = ctl {
+                        // CREATE_NEW_CONSOLE: without it the TUI inherits the
+                        // daemon's (nonexistent) console and dies immediately.
+                        use std::os::windows::process::CommandExt;
+                        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+                        if let Err(e) = std::process::Command::new(&ctl)
+                            .creation_flags(CREATE_NEW_CONSOLE)
+                            .spawn()
+                        {
+                            panefx::log_warn!("[panefx] could not open the TUI: {e}");
+                        }
+                    }
+                }
+                tray::TrayAction::Reload => {
+                    // Re-exec ourselves and exit, which clears any accumulated
+                    // bad state -- stranded panels, a dead wallpaper layer, a
+                    // WorkerW that Explorer recreated.
+                    panefx::log_info!("[panefx] reloading on request from the tray");
+                    if let Ok(exe) = std::env::current_exe() {
+                        use std::os::windows::process::CommandExt;
+                        const DETACHED_PROCESS: u32 = 0x0000_0008;
+                        let _ = std::process::Command::new(exe)
+                            .arg("--daemon")
+                            .creation_flags(DETACHED_PROCESS)
+                            .spawn();
+                    }
+                    return Ok(());
+                }
+                tray::TrayAction::Exit => {
+                    panefx::log_info!("[panefx] exiting on request from the tray");
+                    return Ok(());
+                }
             }
         }
 
@@ -288,7 +345,7 @@ fn main() -> anyhow::Result<()> {
                     needs_query = true;
                 }
                 ipc::IpcMessage::Closed => {
-                    eprintln!("[panefx] GlazeWM closed the IPC connection; exiting.");
+                    panefx::log_warn!("[panefx] GlazeWM closed the IPC connection; exiting.");
                     return Ok(());
                 }
             }
@@ -341,7 +398,7 @@ fn main() -> anyhow::Result<()> {
                 let seed = 0x5EED_1234u64.wrapping_add(effect_idx as u64 * 0x9E37_79B9);
                 sim = animation::build(name, sim_cols, sim_rows, seed, &cfg);
                 last_rotate = Instant::now();
-                println!("[panefx] effect -> {name}");
+                panefx::log_info!("[panefx] effect -> {name}");
             }
         }
 
@@ -379,15 +436,15 @@ fn main() -> anyhow::Result<()> {
                 pending_opacity = None;
                 match term_opacity::apply(want) {
                     Ok(term_opacity::Outcome::Written) => {
-                        println!("[panefx] background opacity -> {want}%");
+                        panefx::log_info!("[panefx] background opacity -> {want}%");
                     }
                     Ok(term_opacity::Outcome::AlreadyCorrect) => {}
                     Ok(term_opacity::Outcome::KeyMissing) => {
-                        eprintln!(
+                        panefx::log_warn!(
                             "[panefx] alacritty.toml has no '[window] opacity =' line;                              not changed"
                         );
                     }
-                    Err(e) => eprintln!("[panefx] could not set opacity: {e}"),
+                    Err(e) => panefx::log_warn!("[panefx] could not set opacity: {e}"),
                 }
             }
         }
@@ -403,7 +460,7 @@ fn main() -> anyhow::Result<()> {
         frames_this_sec += 1;
         if fps_window.elapsed() >= Duration::from_secs(5) {
             if std::env::var("PANEFX_FPS_LOG").is_ok() {
-                println!(
+                panefx::log_info!(
                     "[panefx] actual {:.1} fps (target {})",
                     frames_this_sec as f64 / fps_window.elapsed().as_secs_f64(),
                     cfg.fps
@@ -531,7 +588,7 @@ fn handle_command(
                 *effect_idx = 0;
             }
             *last_rotate = Instant::now();
-            println!("[panefx] effect -> {wanted}");
+            panefx::log_info!("[panefx] effect -> {wanted}");
             Reply::with(snapshot(sim, cfg, wall))
         }
 
@@ -547,7 +604,7 @@ fn handle_command(
 
         Command::Save => match cfg.save() {
             Ok(p) => {
-                println!("[panefx] saved {}", p.display());
+                panefx::log_info!("[panefx] saved {}", p.display());
                 Reply::ok()
             }
             Err(e) => Reply::err(format!("save failed: {e}")),
@@ -565,6 +622,11 @@ fn handle_command(
             // Same for opacity: the reloaded config may carry a different one.
             *pending_opacity = Some((cfg.opacity, Instant::now()));
             Reply::with(snapshot(sim, cfg, wall))
+        }
+
+        Command::Logs { lines } => {
+            // Capped so a bad client cannot ask for an unbounded response.
+            Reply::with_logs(panefx::log::tail(lines.min(1000)))
         }
 
         Command::WallpaperParam { effect, key, val } => {
@@ -644,7 +706,7 @@ fn reconcile(
                 match Panel::create(target, w.x, w.y, w.width, w.height) {
                     Ok(p) => v.insert(p),
                     Err(e) => {
-                        eprintln!("[panefx] failed to create panel for {}: {e}", w.handle);
+                        panefx::log_warn!("[panefx] failed to create panel for {}: {e}", w.handle);
                         continue;
                     }
                 }
@@ -654,11 +716,11 @@ fn reconcile(
         if w.is_visible() {
             panel.show();
             if let Err(e) = panel.reposition(w.x, w.y, w.width, w.height) {
-                eprintln!("[panefx] reposition failed: {e}");
+                panefx::log_warn!("[panefx] reposition failed: {e}");
             }
             // Re-pin every time: GlazeWM reasserts z-order on focus changes.
             if let Err(e) = panel.pin_behind_target() {
-                eprintln!("[panefx] z-pin failed: {e}");
+                panefx::log_warn!("[panefx] z-pin failed: {e}");
             }
             // Size the grid to the DRAWABLE area, not the full window rect —
             // the renderer insets by Alacritty's padding, so a grid sized to

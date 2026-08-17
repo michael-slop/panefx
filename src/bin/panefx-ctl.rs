@@ -51,6 +51,16 @@ enum Row {
     },
     /// Fires on Enter: copy the highlighted monitor's effect to every monitor.
     WallpaperApplyAll,
+    /// One line from the daemon's log.
+    ///
+    /// `count > 1` means the line repeated — the floating-pane bug emitted the
+    /// same error every frame, and showing "x412" beats 412 identical rows.
+    Log {
+        at: u64,
+        warn: bool,
+        text: String,
+        count: u32,
+    },
     /// Non-selectable explanation, used when the wallpaper layer is missing.
     /// An empty list there would read as "panefx is broken" when in fact the
     /// terminal backdrops are entirely fine.
@@ -65,6 +75,11 @@ enum Row {
 enum View {
     Effects,
     Wallpaper,
+    /// The daemon's recent log lines.
+    ///
+    /// Exists because the daemon has NO CONSOLE: every failure was previously
+    /// invisible, and two real bugs hid behind that for an hour each.
+    Logs,
 }
 
 impl View {
@@ -72,12 +87,14 @@ impl View {
         match self {
             View::Effects => 0,
             View::Wallpaper => 1,
+            View::Logs => 2,
         }
     }
     fn next(self) -> Self {
         match self {
             View::Effects => View::Wallpaper,
-            View::Wallpaper => View::Effects,
+            View::Wallpaper => View::Logs,
+            View::Logs => View::Effects,
         }
     }
 }
@@ -87,9 +104,9 @@ struct App {
     effect: String,
     effects: Vec<String>,
     /// Rows per view, rebuilt from every snapshot.
-    rows: [Vec<Row>; 2],
+    rows: [Vec<Row>; 3],
     /// Selection per view, PRESERVED across rebuilds.
-    sel: [ListState; 2],
+    sel: [ListState; 3],
     view: View,
     status: String,
     dirty: bool,
@@ -144,8 +161,12 @@ impl App {
             conn,
             effect: String::new(),
             effects: Vec::new(),
-            rows: [Vec::new(), Vec::new()],
-            sel: [ListState::default(), ListState::default()],
+            rows: [Vec::new(), Vec::new(), Vec::new()],
+            sel: [
+                ListState::default(),
+                ListState::default(),
+                ListState::default(),
+            ],
             view: View::Effects,
             status: "connected".into(),
             dirty: false,
@@ -158,6 +179,7 @@ impl App {
         };
         app.sel[0].select(Some(0));
         app.sel[1].select(Some(0));
+        app.sel[2].select(Some(0));
         app.absorb(&reply);
         Ok(app)
     }
@@ -185,6 +207,48 @@ impl App {
         if self.view == View::Wallpaper {
             self.rebuild_wallpaper_rows();
         }
+    }
+
+    /// Pull the newest log lines from the daemon.
+    ///
+    /// Asked for separately from the snapshot: the log is polled far more often
+    /// and is much larger, so bundling it would make every keypress carry 500
+    /// lines.
+    fn refresh_logs(&mut self) {
+        let reply = match self.conn.send(serde_json::json!({"cmd":"logs","lines":300})) {
+            Ok(r) => r,
+            Err(e) => {
+                self.status = format!("connection lost: {e}");
+                return;
+            }
+        };
+        let entries = reply
+            .get("logs")
+            .and_then(|l| l.get("entries"))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut rows: Vec<Row> = Vec::new();
+        if entries.is_empty() {
+            rows.push(Row::Note("no log entries yet".into()));
+        }
+        for e in entries {
+            rows.push(Row::Log {
+                at: e.get("at").and_then(|v| v.as_u64()).unwrap_or(0),
+                warn: e.get("level").and_then(|v| v.as_str()) == Some("warn"),
+                text: e
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                count: e.get("count").and_then(|v| v.as_u64()).unwrap_or(1) as u32,
+            });
+        }
+        let n = rows.len();
+        self.rows[View::Logs.idx()] = rows;
+        // Stick to the newest line, which is what you want when watching a
+        // problem happen.
+        self.sel[View::Logs.idx()].select(Some(n.saturating_sub(1)));
     }
 
     /// Rebuild the Wallpaper tab from the cached snapshot.
@@ -413,7 +477,7 @@ impl App {
                 self.status = "press Enter to apply this effect to every monitor".into();
                 return;
             }
-            Row::Note(_) => return,
+            Row::Note(_) | Row::Log { .. } => return,
         };
         self.dispatch(msg);
     }
@@ -496,7 +560,10 @@ impl App {
             },
             Row::Effect => return,
             // These are cycled or fired, never typed into.
-            Row::WallpaperMonitor { .. } | Row::WallpaperApplyAll | Row::Note(_) => return,
+            Row::WallpaperMonitor { .. }
+            | Row::WallpaperApplyAll
+            | Row::Note(_)
+            | Row::Log { .. } => return,
         };
         self.dispatch(msg);
     }
@@ -688,6 +755,7 @@ fn row_label(r: &Row) -> String {
         Row::ConfigText { label, .. } => (*label).into(),
         Row::WallpaperMonitor { index, label, .. } => format!("{index}  {label}"),
         Row::WallpaperApplyAll => "apply to all".into(),
+        Row::Log { at, .. } => format!("{:>4}s", at),
         Row::Note(_) => String::new(),
     }
 }
@@ -712,13 +780,20 @@ fn row_value(r: &Row, effect: &str) -> String {
             }
         }
         Row::WallpaperApplyAll => "press Enter".into(),
+        Row::Log { text, count, .. } => {
+            if *count > 1 {
+                format!("{text}   x{count}")
+            } else {
+                text.clone()
+            }
+        }
         Row::Note(t) => t.clone(),
     }
 }
 
 /// Rows that cannot be selected — pure explanation.
 fn row_is_note(r: &Row) -> bool {
-    matches!(r, Row::Note(_))
+    matches!(r, Row::Note(_) | Row::Log { .. })
 }
 
 /// A little bar so int values read at a glance.
@@ -753,7 +828,8 @@ USAGE:
 
 KEYS
     Tab            switch between the Effects and Wallpaper tabs
-    w / e          jump straight to Wallpaper / TUI-Pane
+    w / e / g      jump straight to Wallpaper / TUI-Pane / Logs
+    R              (Logs) refresh
     up/down        move between rows
     left/right     adjust a value (H / L for x10)
     Enter          type a value
@@ -861,13 +937,25 @@ fn run<B: Backend>(term: &mut Terminal<B>, app: &mut App) -> anyhow::Result<()> 
             KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
             KeyCode::Tab => {
                 app.view = app.view.next();
+                if app.view == View::Logs {
+                    app.refresh_logs();
+                }
                 app.status = match app.view {
                     View::Effects => "TUI-Pane — the backdrop behind your windows".into(),
                     View::Wallpaper => "desktop wallpaper".into(),
+                    View::Logs => "daemon log — newest last".into(),
                 };
             }
             KeyCode::Char('w') => app.view = View::Wallpaper,
             KeyCode::Char('e') => app.view = View::Effects,
+            // `g` for logs: `l` is already "adjust right".
+            KeyCode::Char('g') => {
+                app.view = View::Logs;
+                app.refresh_logs();
+            }
+            // Manual refresh, and the only way to see NEW lines without
+            // leaving and re-entering the tab.
+            KeyCode::Char('R') if app.view == View::Logs => app.refresh_logs(),
             KeyCode::Char('a') if app.view == View::Wallpaper => app.apply_to_all(),
             KeyCode::Down | KeyCode::Char('j') => app.move_sel(1),
             KeyCode::Up | KeyCode::Char('k') => app.move_sel(-1),
@@ -933,6 +1021,8 @@ fn draw(f: &mut Frame, app: &App) {
         Span::styled(" TUI-Pane ", tab_style(View::Effects)),
         Span::raw(" "),
         Span::styled(" Wallpaper ", tab_style(View::Wallpaper)),
+        Span::raw(" "),
+        Span::styled(" Logs ", tab_style(View::Logs)),
         Span::raw("   "),
     ];
     match app.view {
@@ -943,6 +1033,25 @@ fn draw(f: &mut Frame, app: &App) {
                 Style::default()
                     .fg(Color::LightGreen)
                     .add_modifier(Modifier::BOLD),
+            ));
+        }
+        View::Logs => {
+            let warns = app
+                .rows()
+                .iter()
+                .filter(|r| matches!(r, Row::Log { warn: true, .. }))
+                .count();
+            header.push(Span::styled(
+                if warns > 0 {
+                    format!("{warns} warning(s)")
+                } else {
+                    "no warnings".into()
+                },
+                Style::default().fg(if warns > 0 {
+                    Color::Yellow
+                } else {
+                    Color::LightGreen
+                }),
             ));
         }
         View::Wallpaper => {
@@ -982,6 +1091,19 @@ fn draw(f: &mut Frame, app: &App) {
         .map(|(i, r)| {
             // Notes are prose, not controls: render them dim, full width, with
             // no caret, label column or bar.
+            if let Row::Log { warn, .. } = r {
+                // Warnings yellow, info dim: a per-frame failure has to be
+                // distinguishable from startup chatter at a glance.
+                let style = if *warn {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                return ListItem::new(Line::from(vec![
+                    Span::styled(format!("  {:>6} ", row_label(r)), Style::default().fg(Color::DarkGray)),
+                    Span::styled(row_value(r, ""), style),
+                ]));
+            }
             if row_is_note(r) {
                 return ListItem::new(Line::from(vec![
                     Span::raw("  "),
@@ -1048,6 +1170,7 @@ fn draw(f: &mut Frame, app: &App) {
     let list_title = match app.view {
         View::Effects => " ↑↓ move   ←→ adjust (H/L ×10)   Enter type ",
         View::Wallpaper => " ↑↓ move   ←→ effect (incl. off)   [a] all monitors ",
+        View::Logs => " ↑↓ scroll   [R] refresh ",
     };
     f.render_stateful_widget(
         List::new(items).block(Block::default().borders(Borders::ALL).title(list_title)),
@@ -1079,7 +1202,7 @@ fn draw(f: &mut Frame, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" [Tab] view  [s]ave  [r]evert  [q]uit "),
+                    .title(" [Tab] view  [g] logs  [s]ave  [r]evert  [q]uit "),
             ),
         chunks[2],
     );

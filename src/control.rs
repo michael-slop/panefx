@@ -69,6 +69,20 @@ pub enum Command {
         key: String,
         val: ParamValue,
     },
+    /// Fetch the daemon's recent log lines.
+    ///
+    /// Separate from `Get` because the log is polled far more often than the
+    /// rest of the snapshot and is much larger; bundling it would make every
+    /// keypress carry 500 lines.
+    Logs {
+        /// How many lines to return, newest last.
+        #[serde(default = "default_log_lines")]
+        lines: usize,
+    },
+}
+
+fn default_log_lines() -> usize {
+    200
 }
 
 #[derive(Debug, Serialize)]
@@ -154,6 +168,12 @@ impl ConfigView {
     }
 }
 
+/// Reply to [`Command::Logs`].
+#[derive(Debug, Serialize)]
+pub struct LogReply {
+    pub entries: Vec<crate::log::Entry>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct Reply {
     pub ok: bool,
@@ -161,6 +181,9 @@ pub struct Reply {
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<Snapshot>,
+    /// Present only on a `logs` reply, so a normal snapshot stays small.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logs: Option<LogReply>,
 }
 
 impl Reply {
@@ -169,6 +192,17 @@ impl Reply {
             ok: true,
             error: None,
             snapshot: None,
+            logs: None,
+        }
+    }
+
+    /// A reply carrying log lines.
+    pub fn with_logs(entries: Vec<crate::log::Entry>) -> Self {
+        Reply {
+            ok: true,
+            error: None,
+            snapshot: None,
+            logs: Some(LogReply { entries }),
         }
     }
     pub fn with(s: Snapshot) -> Self {
@@ -176,6 +210,7 @@ impl Reply {
             ok: true,
             error: None,
             snapshot: Some(s),
+            logs: None,
         }
     }
     pub fn err(msg: impl Into<String>) -> Self {
@@ -183,6 +218,7 @@ impl Reply {
             ok: false,
             error: Some(msg.into()),
             snapshot: None,
+            logs: None,
         }
     }
 }

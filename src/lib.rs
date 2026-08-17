@@ -14,6 +14,10 @@
 //! (`src/bin/panefx-ctl.rs`) agree on exactly one definition of the wire
 //! protocol and the parameter types.
 
+// In-memory log the TUI can read. The daemon has no console, so without
+// this every failure is invisible -- which cost real debugging time.
+pub mod log;
+
 pub mod animation;
 pub mod config;
 pub mod control;
@@ -39,5 +43,7 @@ pub mod ipc;
 pub mod panel;
 #[cfg(windows)]
 pub mod render;
+#[cfg(windows)]
+pub mod tray;
 #[cfg(windows)]
 pub mod wallpaper;
