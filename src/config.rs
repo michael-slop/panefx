@@ -110,6 +110,13 @@ pub struct Config {
     /// Set when the wallpaper cell was chosen explicitly; otherwise an effect's
     /// `preferred_cell()` wins. Mirrors `cell_explicit`.
     pub wallpaper_cell_explicit: bool,
+    /// How fine the wallpaper's character grid is, 1 (chunky) to 10 (fine).
+    ///
+    /// A friendlier front end for `wallpaper_cell_w`/`_h`: setting it WRITES
+    /// those two from [`detail_to_cell`], so there is one source of truth rather
+    /// than two settings that can disagree. The raw pair stays editable for
+    /// anyone who wants a size off the ladder.
+    pub wallpaper_detail: u8,
 }
 
 impl Default for Config {
@@ -146,8 +153,44 @@ impl Default for Config {
             wallpaper_cell_w: 15,
             wallpaper_cell_h: 23,
             wallpaper_cell_explicit: false,
+            // 5 -> 16x25, within a pixel of the 15x23 this used to default to,
+            // so the look does not change on first run after the knob appeared.
+            wallpaper_detail: 5,
         }
     }
+}
+
+/// Lowest and highest detail rungs.
+pub const DETAIL_MIN: u8 = 1;
+pub const DETAIL_MAX: u8 = 10;
+
+/// A detail level as a concrete cell size in pixels.
+///
+/// Scales BOTH axes together, holding the 15:23 shape that `waves` was tuned at
+/// (`waves::preferred_cell`). Changing only the width would stretch every effect
+/// as the slider moved.
+///
+/// The top of the ladder is the floor on purpose. At 6x9 the author's four
+/// monitors total ~179,000 cells; one rung finer would be ~403,000, roughly 28x
+/// the panel once measured at 88.7% of a core. The slider must not be able to
+/// walk into that by accident — typing a raw `wallpaper_cell_w` still can.
+pub fn detail_to_cell(detail: u8) -> (i32, i32) {
+    let d = detail.clamp(DETAIL_MIN, DETAIL_MAX) as i32;
+    let w = 24 - (d - 1) * 2;
+    // 23/15, rounded: keeps every rung within a pixel of the house ratio.
+    let h = (w as f32 * 23.0 / 15.0).round() as i32;
+    (w, h)
+}
+
+/// The rung whose cell size is closest to `(w, h)`.
+///
+/// Used to show a sensible detail number when the raw cell size was set
+/// directly. Nothing is hidden: the slider simply reports the nearest rung.
+pub fn cell_to_detail(w: i32, h: i32) -> u8 {
+    let _ = h;
+    (DETAIL_MIN..=DETAIL_MAX)
+        .min_by_key(|d| (detail_to_cell(*d).0 - w).abs())
+        .unwrap_or(5)
 }
 
 /// `wallpaper_3_effect` -> `Some(3)`. Anything else -> `None`.
@@ -369,6 +412,17 @@ impl Config {
                         }
                     }
                 }
+                "wallpaper_detail" => {
+                    if let Ok(n) = v.parse::<u8>() {
+                        if (DETAIL_MIN..=DETAIL_MAX).contains(&n) {
+                            let (w, h) = detail_to_cell(n);
+                            self.wallpaper_detail = n;
+                            self.wallpaper_cell_w = w;
+                            self.wallpaper_cell_h = h;
+                            self.wallpaper_cell_explicit = true;
+                        }
+                    }
+                }
                 "wallpaper_cell_w" => {
                     if let Ok(n) = v.parse::<i32>() {
                         if n > 0 {
@@ -531,6 +585,7 @@ impl Config {
         s.push_str("\n# A wallpaper has no terminal text to line up with, so it does NOT\n");
         s.push_str("# use cell_w/cell_h above. 15x23 keeps a 1440x2560 portrait at ~10k\n");
         s.push_str("# cells instead of ~24k.\n");
+        s.push_str(&format!("wallpaper_detail = {}\n", self.wallpaper_detail));
         s.push_str(&format!("wallpaper_cell_w = {}\n", self.wallpaper_cell_w));
         s.push_str(&format!("wallpaper_cell_h = {}\n", self.wallpaper_cell_h));
         for (idx, eff) in &self.wallpaper_effects {
@@ -703,13 +758,33 @@ impl Config {
             "wallpaper_fps" => matches!(as_i64(), Some(n) if n > 0 && n <= 120).then(|| {
                 self.wallpaper_fps = as_i64().unwrap() as u64;
             }).is_some(),
+            // The friendly knob. Writes `wallpaper_cell_w/h` from the ladder
+            // rather than keeping a second, competing notion of size -- the raw
+            // rows below stay editable and remain the one source of truth.
+            "wallpaper_detail" => matches!(
+                as_i64(),
+                Some(n) if n >= DETAIL_MIN as i64 && n <= DETAIL_MAX as i64
+            )
+            .then(|| {
+                let d = as_i64().unwrap() as u8;
+                let (w, h) = detail_to_cell(d);
+                self.wallpaper_detail = d;
+                self.wallpaper_cell_w = w;
+                self.wallpaper_cell_h = h;
+                self.wallpaper_cell_explicit = true;
+            })
+            .is_some(),
             "wallpaper_cell_w" => matches!(as_i64(), Some(n) if n > 0 && n <= 200).then(|| {
                 self.wallpaper_cell_w = as_i64().unwrap() as i32;
                 self.wallpaper_cell_explicit = true;
+                // Keep the friendly knob on the nearest rung, so the two rows
+                // never disagree about what is actually on screen.
+                self.wallpaper_detail = cell_to_detail(self.wallpaper_cell_w, self.wallpaper_cell_h);
             }).is_some(),
             "wallpaper_cell_h" => matches!(as_i64(), Some(n) if n > 0 && n <= 200).then(|| {
                 self.wallpaper_cell_h = as_i64().unwrap() as i32;
                 self.wallpaper_cell_explicit = true;
+                self.wallpaper_detail = cell_to_detail(self.wallpaper_cell_w, self.wallpaper_cell_h);
             }).is_some(),
             // `wallpaper_<n>_effect`. Guard arm, so it cannot shadow the literal
             // keys above (notably `wallpaper_fps`, which shares the prefix).
@@ -1147,5 +1222,96 @@ ink = \"#0000ff\"");
     fn an_empty_wallpaper_param_map_emits_no_section() {
         let c = Config::default();
         assert!(!c.to_toml().contains("[wallpaper."));
+    }
+}
+
+#[cfg(test)]
+mod detail_tests {
+    use super::*;
+
+    #[test]
+    fn detail_maps_to_the_expected_cell_ladder() {
+        assert_eq!(detail_to_cell(1), (24, 37), "rung 1 = chunkiest");
+        assert_eq!(detail_to_cell(5), (16, 25), "rung 5 ~ today's default");
+        assert_eq!(detail_to_cell(10), (6, 9), "rung 10 = the floor");
+    }
+
+    #[test]
+    fn detail_preserves_the_house_aspect_ratio() {
+        // Scaling only one axis would stretch every effect as the slider moved.
+        // `waves` is tuned at 15:23; every rung must stay within a pixel of it.
+        for d in DETAIL_MIN..=DETAIL_MAX {
+            let (w, h) = detail_to_cell(d);
+            let want = w as f32 * 23.0 / 15.0;
+            assert!(
+                (h as f32 - want).abs() <= 1.0,
+                "rung {d} is {w}x{h}, off the 15:23 shape (wanted h~{want:.1})"
+            );
+        }
+    }
+
+    #[test]
+    fn the_ladder_only_ever_gets_finer() {
+        // A slider that moved right and produced BIGGER cells would be maddening.
+        let mut prev = i32::MAX;
+        for d in DETAIL_MIN..=DETAIL_MAX {
+            let (w, _) = detail_to_cell(d);
+            assert!(w < prev, "rung {d} did not get finer than the one before");
+            prev = w;
+        }
+    }
+
+    #[test]
+    fn detail_is_clamped_never_wrapped() {
+        // 0 and 99 must land on the ends, not produce absurd or negative cells.
+        assert_eq!(detail_to_cell(0), detail_to_cell(DETAIL_MIN));
+        assert_eq!(detail_to_cell(99), detail_to_cell(DETAIL_MAX));
+        let (w, h) = detail_to_cell(99);
+        assert!(w > 0 && h > 0, "clamping must never yield a degenerate cell");
+    }
+
+    #[test]
+    fn setting_detail_writes_the_cell_size() {
+        // ONE source of truth: the friendly knob writes the raw values rather
+        // than keeping a second, competing notion of size.
+        let mut c = Config::default();
+        assert!(c.set_field("wallpaper_detail", &serde_json::json!(10)));
+        assert_eq!(c.wallpaper_detail, 10);
+        assert_eq!((c.wallpaper_cell_w, c.wallpaper_cell_h), (6, 9));
+        assert!(
+            c.wallpaper_cell_explicit,
+            "must override the effect's preferred cell, or nothing changes"
+        );
+    }
+
+    #[test]
+    fn a_raw_cell_edit_keeps_the_detail_row_honest() {
+        // Otherwise the two rows disagree about what is on screen.
+        let mut c = Config::default();
+        assert!(c.set_field("wallpaper_cell_w", &serde_json::json!(6)));
+        assert_eq!(c.wallpaper_detail, 10, "detail must follow to the nearest rung");
+    }
+
+    #[test]
+    fn detail_out_of_range_is_rejected_not_clamped_silently() {
+        // A rejected set tells the TUI to say so. Silently accepting 99 would
+        // report a level that does not exist.
+        let mut c = Config::default();
+        assert!(!c.set_field("wallpaper_detail", &serde_json::json!(0)));
+        assert!(!c.set_field("wallpaper_detail", &serde_json::json!(11)));
+    }
+
+    #[test]
+    fn detail_round_trips_through_toml() {
+        let mut c = Config::default();
+        assert!(c.set_field("wallpaper_detail", &serde_json::json!(8)));
+        let mut back = Config::default();
+        back.apply_toml(&c.to_toml());
+        assert_eq!(back.wallpaper_detail, 8);
+        assert_eq!(
+            (back.wallpaper_cell_w, back.wallpaper_cell_h),
+            (c.wallpaper_cell_w, c.wallpaper_cell_h),
+            "the cell size must survive the save, not be recomputed differently"
+        );
     }
 }

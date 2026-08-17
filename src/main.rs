@@ -563,6 +563,23 @@ fn handle_command(
             if key == "opacity" {
                 *pending_opacity = Some((cfg.opacity, Instant::now()));
             }
+            // The wallpaper grid changed. Without this the new value is stored
+            // and read back correctly by `cell_for` -- but the live surfaces
+            // keep the grid they were BUILT with, so the TUI reports a change
+            // that never reaches the screen.
+            //
+            // Rebuild rather than resize in place: `SimKey` includes cols/rows,
+            // so a changed grid is a different sim by construction, and
+            // `rebuild_surfaces` already tears down and recreates cleanly.
+            if wallpaper::changes_the_grid(&key) {
+                wall.rebuild_surfaces(cfg);
+                panefx::log_info!(
+                    "wallpaper grid -> {}x{} px (detail {})",
+                    cfg.wallpaper_cell_w,
+                    cfg.wallpaper_cell_h,
+                    cfg.wallpaper_detail
+                );
+            }
             // Rain captures frame_ms at construction, so fps needs a rebuild.
             if key == "fps" {
                 let name = sim.name().to_string();

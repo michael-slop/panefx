@@ -143,6 +143,8 @@ pub struct ConfigView {
     /// loop, so `fps` caps it. Reported separately so the TUI never shows a
     /// number the screen is not delivering.
     pub wallpaper_fps_effective: u64,
+    /// Friendly 1-10 knob; `wallpaper_cell_w/h` are what it writes.
+    pub wallpaper_detail: u8,
     pub wallpaper_cell_w: i32,
     pub wallpaper_cell_h: i32,
 }
@@ -162,6 +164,7 @@ impl ConfigView {
             opacity: cfg.opacity,
             wallpaper_fps: cfg.wallpaper_fps,
             wallpaper_fps_effective: cfg.wallpaper_fps.min(cfg.fps).max(1),
+            wallpaper_detail: cfg.wallpaper_detail,
             wallpaper_cell_w: cfg.wallpaper_cell_w,
             wallpaper_cell_h: cfg.wallpaper_cell_h,
         }
@@ -226,11 +229,26 @@ impl Reply {
 /// A connected TUI. Held for the life of the connection so a long-lived TUI
 /// sees live updates without reconnecting.
 struct Peer {
+    /// Stable identity, NOT a position.
+    ///
+    /// `poll` returns `(id, command)` and the caller replies later, after
+    /// `poll` has already removed any peers that hung up. With a positional
+    /// index those two moments disagree: removing peer 0 shifts every later
+    /// peer down one, so the reply goes to the wrong socket -- or to none.
+    ///
+    /// That is not a rare race. A client that sends one command and closes is
+    /// read as "command" AND "hung up" in the SAME poll, so it lands in `out`
+    /// and `dead` together and the very next reply is misdirected. It wedged
+    /// the control channel after a single request.
+    id: usize,
     reader: BufReader<TcpStream>,
     stream: TcpStream,
 }
 
 pub struct Server {
+    /// Source of peer ids. Monotonic, never reused, so a stale id from a
+    /// previous connection can never resolve to a live peer.
+    next_id: usize,
     listener: TcpListener,
     peers: Vec<Peer>,
 }
@@ -248,6 +266,7 @@ impl Server {
                 println!("[panefx] control channel on 127.0.0.1:{port}");
                 Some(Server {
                     listener: l,
+                    next_id: 0,
                     peers: Vec::new(),
                 })
             }
@@ -274,10 +293,15 @@ impl Server {
                         continue;
                     }
                     match s.try_clone() {
-                        Ok(c) => self.peers.push(Peer {
-                            reader: BufReader::new(c),
-                            stream: s,
-                        }),
+                        Ok(c) => {
+                            let id = self.next_id;
+                            self.next_id += 1;
+                            self.peers.push(Peer {
+                                id,
+                                reader: BufReader::new(c),
+                                stream: s,
+                            })
+                        }
                         Err(_) => continue,
                     }
                 }
@@ -289,7 +313,8 @@ impl Server {
         let mut out = Vec::new();
         let mut dead = Vec::new();
 
-        for (i, p) in self.peers.iter_mut().enumerate() {
+        for p in self.peers.iter_mut() {
+            let i = p.id;
             loop {
                 let mut line = String::new();
                 match p.reader.read_line(&mut line) {
@@ -324,16 +349,19 @@ impl Server {
             }
         }
 
-        for i in dead.into_iter().rev() {
-            if i < self.peers.len() {
-                self.peers.remove(i);
-            }
-        }
+        // Retain by id: positions shift as peers are removed, ids do not.
+        self.peers.retain(|p| !dead.contains(&p.id));
         out
     }
 
+    /// Reply to the peer that sent a command.
+    ///
+    /// `peer` is the stable id from [`Server::poll`], not a position -- see
+    /// [`Peer::id`]. A peer that has since hung up simply is not found, which
+    /// is the correct outcome: dropping a reply to a closed socket beats
+    /// sending it to whoever now occupies that slot.
     pub fn reply(&mut self, peer: usize, r: &Reply) {
-        if let Some(p) = self.peers.get_mut(peer) {
+        if let Some(p) = self.peers.iter_mut().find(|p| p.id == peer) {
             if let Ok(s) = serde_json::to_string(r) {
                 let _ = writeln!(p.stream, "{s}");
                 let _ = p.stream.flush();
@@ -345,6 +373,99 @@ impl Server {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A client that sends one command and immediately closes -- exactly what
+    /// every one-shot probe and script does -- used to WEDGE the control
+    /// channel permanently.
+    ///
+    /// It was read as "here is a command" and "this peer hung up" in the SAME
+    /// poll, so it landed in `out` and `dead` together. `dead` was applied
+    /// before the caller ever called `reply`, shifting every later peer down a
+    /// slot -- so the reply went to the wrong socket, or nowhere. The daemon
+    /// kept rendering happily and simply stopped answering.
+    ///
+    /// The test drives the divergence directly rather than through sockets: it
+    /// takes THREE peers so that removing the first leaves the survivor at a
+    /// position that no longer equals its id. With two peers the id and the
+    /// index still coincide by luck and a positional `reply` passes anyway --
+    /// this test was written that way first, and it did not catch the bug.
+    #[test]
+    fn a_hung_up_peer_does_not_misdirect_the_next_reply() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpStream;
+
+        let mut server = None;
+        let mut port = 0;
+        for p in 6200..6280 {
+            if let Some(s) = Server::bind(p) {
+                server = Some(s);
+                port = p;
+                break;
+            }
+        }
+        let mut server = server.expect("no free port for the test");
+
+        // Three peers, connected in order so ids are 0, 1, 2.
+        let mut a = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let mut b = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        // Register all three with the server before anyone hangs up.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        server.poll();
+
+        // A and B hang up. C -- id 2 -- is about to become position 0.
+        writeln!(a, "{}", r#"{"cmd":"get"}"#).unwrap();
+        a.flush().unwrap();
+        drop(a);
+        drop(b);
+        writeln!(c, "{}", r#"{"cmd":"save"}"#).unwrap();
+        c.flush().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        // ONE poll, then reply to exactly what it reported -- the daemon loop's
+        // shape. Measured: ids are [0,1,2]; A and B hang up, so poll reports
+        // ids [0, 2] and peer id 2 survives at POSITION 0. A positional
+        // lookup for id 2 therefore finds nothing at all and the reply is
+        // silently dropped, which is precisely how the channel wedged.
+        let reported = server.poll();
+        assert!(
+            reported.iter().any(|(id, _)| *id == 2),
+            "the live peer's command was not reported at all"
+        );
+
+        // Tag each reply with the id it was ADDRESSED to. Asserting only that
+        // "a reply arrived" cannot see this bug: peer 2 sits at position 0, so
+        // a positional lookup hands C the reply addressed to the DEAD peer 0
+        // and C receives something either way. Only the tag distinguishes
+        // "answered" from "answered with somebody else's mail".
+        for (peer, _cmd) in reported {
+            server.reply(peer, &Reply::err(format!("for-peer-{peer}")));
+        }
+
+        c.set_read_timeout(Some(std::time::Duration::from_millis(500)))
+            .unwrap();
+        let mut line = String::new();
+        let _ = BufReader::new(c.try_clone().unwrap()).read_line(&mut line);
+        assert!(
+            line.contains("for-peer-2"),
+            "the live peer (id 2) got the reply addressed to a DEAD peer --              hung-up peers shifted the positions, so replies went to whoever              now occupied the slot (got {line:?})"
+        );
+    }
+
+    #[test]
+    fn peer_ids_are_monotonic_not_positional() {
+        // The invariant behind the fix: an id identifies a CONNECTION for its
+        // whole life, so it cannot be invalidated by an unrelated peer leaving.
+        let mut server = None;
+        for p in 6280..6360 {
+            if let Some(s) = Server::bind(p) {
+                server = Some(s);
+                break;
+            }
+        }
+        let server = server.expect("no free port");
+        assert_eq!(server.next_id, 0, "ids must start from a known point");
+    }
 
     #[test]
     fn parses_every_command_shape() {

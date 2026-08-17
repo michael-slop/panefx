@@ -648,10 +648,10 @@ fn build_wallpaper_rows(snap: &serde_json::Value, sel: usize) -> (Vec<Row>, Stri
         rows.push(Row::Note(format!("wallpaper layer unavailable — {e}")));
         if e.contains("0x052C") {
             rows.push(Row::Note(
-                "Windows 11 25H2 removed the layer third-party wallpapers used.".into(),
+                "Explorer did not hand back a wallpaper layer. Restarting".into(),
             ));
             rows.push(Row::Note(
-                "Other wallpaper apps hit the same wall on this build.".into(),
+                "Explorer, then panefx, usually clears this.".into(),
             ));
         }
         rows.push(Row::Note(
@@ -730,6 +730,16 @@ fn build_wallpaper_rows(snap: &serde_json::Value, sel: usize) -> (Vec<Row>, Stri
             "capped to {eff} fps by the daemon's own fps"
         )));
     }
+    // The detail knob, above the raw cell rows it writes into. One lever for
+    // "make it finer" instead of two numbers you have to keep in proportion by
+    // hand -- the raw rows stay for anyone who wants an exact size.
+    rows.push(Row::Config {
+        key: "wallpaper_detail",
+        label: "detail",
+        value: ci("wallpaper_detail"),
+        min: panefx::config::DETAIL_MIN as i64,
+        max: panefx::config::DETAIL_MAX as i64,
+    });
     rows.push(Row::Config {
         key: "wallpaper_cell_w",
         label: "wp cell width",
@@ -760,11 +770,57 @@ fn row_label(r: &Row) -> String {
     }
 }
 
+/// The human reading of a raw number, appended after the stored value.
+///
+/// Every numeric row used to show a bare integer whose meaning was invisible:
+/// `headroom 1350` is really 1.350, `cell width 15` is 15 pixels, `fps 10` is 10
+/// frames per second. You had to know, or do the division in your head.
+///
+/// The stored number is still shown unchanged — it is what gets sent and saved.
+/// This only adds the reading beside it.
+///
+/// Derived from the KEY, not from a hardcoded list of effects, so a new effect
+/// shipping a `foo (x1000)` param formats correctly with no change here. That
+/// matches the existing rule that this TUI renders whatever it is handed and
+/// never hardcodes effect knowledge.
+fn value_units(key: &str, label: &str, value: i64) -> String {
+    // Fixed point. The label already hints "(x1000)" but still leaves the
+    // arithmetic to the reader.
+    if label.contains("x1000") || key.ends_with("_x1000") {
+        return format!(" = {:.3}", value as f64 / 1000.0);
+    }
+    if key.ends_with("fps") {
+        return " fps".into();
+    }
+    if key.contains("cell_") || key.starts_with("pad_") || key == "crop_top" {
+        return " px".into();
+    }
+    if key == "opacity" {
+        return "%".into();
+    }
+    // The detail number is an index into a ladder, so on its own it says
+    // nothing at all. Show the cell size it selects.
+    if key == "wallpaper_detail" {
+        let (w, h) = panefx::config::detail_to_cell(value as u8);
+        return format!("  -> {w}x{h} px cells");
+    }
+    String::new()
+}
+
 fn row_value(r: &Row, effect: &str) -> String {
     match r {
         Row::Effect => format!("‹ {effect} ›"),
-        Row::Param(p) => p.value.display(),
-        Row::Config { value, .. } => value.to_string(),
+        // Only numbers carry units. A colour swatch or a text value must be
+        // rendered exactly as the effect declared it.
+        Row::Param(p) => match &p.value {
+            panefx::animation::ParamValue::Int { v } => {
+                format!("{v}{}", value_units(&p.key, &p.label, *v))
+            }
+            other => other.display(),
+        },
+        Row::Config { key, label, value, .. } => {
+            format!("{value}{}", value_units(key, label, *value))
+        }
         Row::ConfigText { value, .. } => value.clone(),
         // The ‹ › convention marks "this cycles". It is also load-bearing:
         // `run()` blanks the edit buffer for values starting with ‹.
@@ -1250,7 +1306,11 @@ mod view_tests {
         assert!(!rows.is_empty(), "never show an empty wallpaper tab");
         let text: String = rows.iter().map(|r| row_value(r, "waves")).collect::<Vec<_>>().join(" ");
         assert!(text.contains("unavailable"));
-        assert!(text.contains("25H2"), "name the actual cause");
+        // Not "25H2 removed the wallpaper layer" -- that was a wrong reading of
+        // a failed probe, and the wallpaper demonstrably works on this build.
+        // Point at the recoverable cause instead, and say how to recover.
+        assert!(text.contains("Explorer"), "name the actual cause");
+        assert!(text.contains("Restarting"), "say how to recover");
         assert!(text.contains("unaffected"), "say what still works");
         assert!(rows.iter().all(row_is_note), "nothing here is selectable");
     }
@@ -1384,5 +1444,68 @@ mod view_tests {
             param_command(true, "waves", "k", v.clone())["cmd"],
             param_command(false, "waves", "k", v)["cmd"]
         );
+    }
+}
+
+#[cfg(test)]
+mod units_tests {
+    use super::*;
+
+    #[test]
+    fn a_x1000_param_shows_its_decimal_value() {
+        // `headroom 1350` really means 1.350. The label hinted at it, but the
+        // division was left to the reader.
+        assert_eq!(value_units("headroom", "headroom (x1000)", 1350), " = 1.350");
+        assert_eq!(value_units("dark", "dark cutoff (x1000)", 276), " = 0.276");
+        assert_eq!(value_units("speed", "speed (x1000)", 1000), " = 1.000");
+    }
+
+    #[test]
+    fn the_suffix_comes_from_the_key_not_a_hardcoded_list() {
+        // A NEW effect shipping a `foo (x1000)` knob must format correctly with
+        // no change to this file -- the TUI renders what it is handed and never
+        // hardcodes effect knowledge.
+        assert_eq!(
+            value_units("brand_new_knob", "brand new knob (x1000)", 42),
+            " = 0.042"
+        );
+    }
+
+    #[test]
+    fn pixel_rows_are_labelled_px() {
+        // These were bare integers with no unit anywhere on screen.
+        assert_eq!(value_units("wallpaper_cell_w", "wp cell width", 15), " px");
+        assert_eq!(value_units("cell_h", "cell height", 15), " px");
+        assert_eq!(value_units("pad_x", "pad x", 10), " px");
+        assert_eq!(value_units("crop_top", "crop top", 0), " px");
+    }
+
+    #[test]
+    fn rates_and_percentages_say_so() {
+        assert_eq!(value_units("fps", "fps", 10), " fps");
+        assert_eq!(value_units("wallpaper_fps", "wallpaper fps", 5), " fps");
+        assert_eq!(value_units("opacity", "opacity", 60), "%");
+    }
+
+    #[test]
+    fn the_detail_row_shows_the_cell_size_it_selects() {
+        // On its own the detail number is an index into a ladder and says
+        // nothing about what will appear on screen.
+        assert_eq!(
+            value_units("wallpaper_detail", "detail", 10),
+            "  -> 6x9 px cells"
+        );
+        assert_eq!(
+            value_units("wallpaper_detail", "detail", 1),
+            "  -> 24x37 px cells"
+        );
+    }
+
+    #[test]
+    fn a_plain_number_gets_no_invented_unit() {
+        // Better silent than wrong: guessing a unit for an unknown knob would
+        // mislabel it confidently.
+        assert_eq!(value_units("rotate_secs", "rotate secs", 0), "");
+        assert_eq!(value_units("mystery", "mystery", 7), "");
     }
 }

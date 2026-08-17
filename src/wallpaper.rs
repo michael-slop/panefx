@@ -1293,3 +1293,62 @@ mod tests {
         assert!(c.cell_explicit, "the renderer must honour the size we chose");
     }
 }
+
+/// Does setting `key` change the wallpaper's character grid?
+///
+/// A `true` here must be followed by [`WallpaperSet::rebuild_surfaces`], or the
+/// value is stored and read back correctly while the LIVE surfaces keep the grid
+/// they were built with — the TUI then reports a change that never reaches the
+/// screen. That was a real bug: `wp cell width` was editable, accepted, and
+/// visibly did nothing.
+///
+/// A named function rather than an inline `matches!` so it is reachable from a
+/// test. The equivalent check for the terminal panes lives at the `needs_query`
+/// arm and is covered by the panel tests.
+pub fn changes_the_grid(key: &str) -> bool {
+    matches!(
+        key,
+        "wallpaper_detail" | "wallpaper_cell_w" | "wallpaper_cell_h"
+    )
+}
+
+#[cfg(test)]
+mod grid_change_tests {
+    use super::*;
+
+    #[test]
+    fn every_key_that_resizes_the_grid_asks_for_a_rebuild() {
+        // THE BUG: without this the value is stored, `cell_for` reads it back
+        // correctly, and the surfaces keep their original grid -- so the number
+        // in the TUI changes and the screen does not.
+        for k in ["wallpaper_detail", "wallpaper_cell_w", "wallpaper_cell_h"] {
+            assert!(changes_the_grid(k), "{k} resizes the grid but skips rebuild");
+        }
+    }
+
+    #[test]
+    fn keys_that_do_not_touch_the_grid_are_left_alone() {
+        // Rebuilding tears down and recreates every surface. Doing that on an
+        // unrelated key would flash the desktop on every keypress.
+        for k in [
+            "wallpaper_fps",
+            "wallpaper_0_effect",
+            "cell_w",
+            "cell_h",
+            "opacity",
+            "fps",
+            "font",
+        ] {
+            assert!(!changes_the_grid(k), "{k} must not force a rebuild");
+        }
+    }
+
+    #[test]
+    fn the_pane_cell_keys_are_not_mistaken_for_the_wallpapers() {
+        // `cell_w` and `wallpaper_cell_w` differ only by a prefix; a sloppy
+        // `contains` here would rebuild the desktop whenever the TERMINAL cell
+        // was tuned.
+        assert!(!changes_the_grid("cell_w"));
+        assert!(changes_the_grid("wallpaper_cell_w"));
+    }
+}
