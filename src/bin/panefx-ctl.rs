@@ -218,12 +218,12 @@ impl App {
             min: 1,
             max: 120,
         });
-        // Opacity of the windows panefx draws behind. A plain Row::Config, so
-        // it inherits the bar, the arrow keys, H/L for x10 and typed entry with
-        // no new rendering code.
+        // Background opacity of the windows panefx draws behind. Labelled "bg"
+        // deliberately: this fades the BACKGROUND and leaves the text solid,
+        // which is the whole distinction from a whole-window alpha.
         rows.push(Row::Config {
             key: "opacity",
-            label: "window opacity %",
+            label: "bg opacity %",
             value: ci("opacity"),
             min: 10,
             max: 100,

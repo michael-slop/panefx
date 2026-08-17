@@ -18,9 +18,10 @@ pub mod animation;
 pub mod config;
 pub mod control;
 // Not `#[cfg(windows)]`: `config` needs the MIN/MAX percent constants to
-// validate its `opacity` field, and that runs everywhere. Only the Win32 calls
-// inside are gated.
+// validate its `opacity` field, and that runs everywhere.
 pub mod opacity;
+// Background opacity, driven through the terminals' own per-pixel alpha.
+pub mod term_opacity;
 pub mod fire;
 pub mod flames;
 pub mod palette;

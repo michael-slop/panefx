@@ -28,7 +28,7 @@
 //!   * every reconcile also RE-PINS z-order, because GlazeWM re-orders windows
 //!     on focus changes and would otherwise strand our panels
 
-use panefx::{animation, config, control, ipc, panel, render, wallpaper};
+use panefx::{animation, config, control, ipc, panel, render, term_opacity, wallpaper};
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -44,6 +44,13 @@ use panel::Panel;
 /// Backstop re-query. Covers layout changes that emit no event at all, such as
 /// a manual drag-resize of a floating window.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How long the opacity slider must settle before the value is written out.
+///
+/// Each write rewrites a line in the terminal's own config, which the terminal
+/// then re-parses — so a drag from 10% to 100% would otherwise cause ~90 writes.
+/// Short enough to feel live against Alacritty's own ~2s reload latency.
+const OPACITY_DEBOUNCE: Duration = Duration::from_millis(150);
 
 /// What the user asked for on the command line.
 enum Mode {
@@ -172,9 +179,30 @@ fn main() -> anyhow::Result<()> {
 
     let mut panels: HashMap<isize, Panel> = HashMap::new();
 
-    // Opacity last applied per window, so reconcile can skip the syscalls when
-    // nothing changed. Cleared per-window when that window closes.
-    let mut applied_opacity: HashMap<isize, u8> = HashMap::new();
+    // Newest requested opacity and when it was requested, for the debounce
+    // below. `None` means nothing is pending.
+    let mut pending_opacity: Option<(u8, Instant)> = None;
+
+    // Push the configured opacity out once at startup so panefx's config and
+    // the terminal's cannot drift apart.
+    match term_opacity::apply(cfg.opacity) {
+        Ok(term_opacity::Outcome::Written) => {
+            println!("[panefx] background opacity -> {}%", cfg.opacity)
+        }
+        Ok(term_opacity::Outcome::AlreadyCorrect) => {}
+        Ok(term_opacity::Outcome::KeyMissing) => eprintln!(
+            "[panefx] alacritty.toml has no '[window] opacity =' line; opacity not applied"
+        ),
+        Err(e) => eprintln!("[panefx] could not set opacity at startup: {e}"),
+    }
+
+    // Undo the previous mechanism on any window that still carries it.
+    //
+    // panefx used to set WS_EX_LAYERED for a WHOLE-WINDOW alpha. Removing that
+    // code does not undo it on windows that are already open — the style
+    // persists until they close, and it would stack with the per-pixel alpha
+    // below, dimming text for reasons invisible in the source.
+    term_opacity::clear_legacy_layered_styles();
 
     // The desktop wallpaper. Never fatal: if Explorer will not give us the
     // WorkerW layer, this is inert and the terminal backdrops carry on exactly
@@ -248,7 +276,6 @@ fn main() -> anyhow::Result<()> {
                             &mut sim_rows,
                             &cfg,
                             cell,
-                            &mut applied_opacity,
                         );
                     }
                     // Occlusion needs the UNFILTERED list: `reconcile` keeps only
@@ -286,7 +313,7 @@ fn main() -> anyhow::Result<()> {
                     sim_cols,
                     sim_rows,
                     &mut needs_query,
-                    &mut applied_opacity,
+                    &mut pending_opacity,
                 );
                 server.reply(peer, &reply);
             }
@@ -342,6 +369,29 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
+        // --- background opacity, debounced ---
+        //
+        // Written to the terminal's own config, so a settle delay keeps a fast
+        // drag from rewriting the file on every keypress. Alacritty's
+        // live_config_reload picks the change up in about two seconds.
+        if let Some((want, since)) = pending_opacity {
+            if since.elapsed() >= OPACITY_DEBOUNCE {
+                pending_opacity = None;
+                match term_opacity::apply(want) {
+                    Ok(term_opacity::Outcome::Written) => {
+                        println!("[panefx] background opacity -> {want}%");
+                    }
+                    Ok(term_opacity::Outcome::AlreadyCorrect) => {}
+                    Ok(term_opacity::Outcome::KeyMissing) => {
+                        eprintln!(
+                            "[panefx] alacritty.toml has no '[window] opacity =' line;                              not changed"
+                        );
+                    }
+                    Err(e) => eprintln!("[panefx] could not set opacity: {e}"),
+                }
+            }
+        }
+
         // --- desktop wallpaper, on its OWN clock ---
         //
         // Called every daemon frame but rate-limited internally to
@@ -387,7 +437,7 @@ fn handle_command(
     sim_cols: usize,
     sim_rows: usize,
     needs_query: &mut bool,
-    applied_opacity: &mut HashMap<isize, u8>,
+    pending_opacity: &mut Option<(u8, Instant)>,
 ) -> control::Reply {
     use control::{Command, ConfigView, Reply, Snapshot, WallpaperMonitorView};
 
@@ -425,14 +475,13 @@ fn handle_command(
             ) {
                 *needs_query = true;
             }
-            // Opacity is cached per window, so the cache has to be dropped or
-            // the new value would not reach any window already open — which is
-            // all of them. Clearing forces a re-apply on the next reconcile,
-            // and `needs_query` makes that happen on THIS frame rather than up
-            // to 500ms later, so the slider feels live.
+            // Opacity goes out to the terminal's OWN config, which means a
+            // file write. Queue it rather than writing per keypress: holding
+            // L to drag would otherwise rewrite alacritty.toml ~90 times and
+            // make it re-parse each one. `needs_query` is deliberately NOT set
+            // — window geometry has nothing to do with opacity.
             if key == "opacity" {
-                applied_opacity.clear();
-                *needs_query = true;
+                *pending_opacity = Some((cfg.opacity, Instant::now()));
             }
             // Rain captures frame_ms at construction, so fps needs a rebuild.
             if key == "fps" {
@@ -491,7 +540,7 @@ fn handle_command(
             // silently half-works — which is worse than not working.
             wall.rebuild_surfaces(cfg);
             // Same for opacity: the reloaded config may carry a different one.
-            applied_opacity.clear();
+            *pending_opacity = Some((cfg.opacity, Instant::now()));
             Reply::with(snapshot(sim, cfg, wall))
         }
 
@@ -532,7 +581,6 @@ fn reconcile(
     sim_rows: &mut usize,
     cfg: &config::Config,
     cell: (i32, i32),
-    applied_opacity: &mut HashMap<isize, u8>,
 ) {
     let (cell_w, cell_h) = cell;
     let terminals: Vec<&ipc::Window> = windows.iter().filter(|w| w.is_target()).collect();
@@ -540,26 +588,6 @@ fn reconcile(
     // Drop panels whose terminal is gone.
     let live: std::collections::HashSet<isize> = terminals.iter().map(|w| w.handle).collect();
     panels.retain(|handle, _| live.contains(handle));
-    // Forget opacity for windows that have closed, or the map grows forever.
-    applied_opacity.retain(|handle, _| live.contains(handle));
-
-    // Opacity is applied HERE rather than once at startup because it has to
-    // catch windows as they appear — a terminal opened a minute from now must
-    // match the others. The cache makes re-running this every reconcile free:
-    // without it the 500ms poll would issue two syscalls per window forever.
-    for w in &terminals {
-        if applied_opacity.get(&w.handle) == Some(&cfg.opacity) {
-            continue;
-        }
-        let hwnd = HWND(w.handle as *mut _);
-        match panefx::opacity::set_opacity(hwnd, cfg.opacity) {
-            Ok(()) => {
-                applied_opacity.insert(w.handle, cfg.opacity);
-            }
-            Err(e) => eprintln!("[panefx] could not set opacity on {}: {e}", w.handle),
-        }
-    }
-
     let mut max_cols = 0usize;
     let mut max_rows = 0usize;
 

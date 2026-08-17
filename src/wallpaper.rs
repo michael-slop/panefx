@@ -448,10 +448,17 @@ impl WallpaperSet {
         };
         self.pool.acquire(&key, cfg);
 
-        let (x, y) = desktop::to_child(&worker, s.monitor.x, s.monitor.y);
+        // SCREEN coordinates: the surface is a top-level popup, not a child of
+        // anything, so no origin conversion is needed. The WorkerW-relative
+        // maths only applied while we were parenting into Explorer.
+        let (x, y) = (s.monitor.x, s.monitor.y);
         match Panel::create_anchored(
             Anchor::Desktop {
-                parent: worker.hwnd,
+                // On the raised model this is Progman, not the WorkerW — the
+                // surface must be a SIBLING of the WorkerW and DefView, sitting
+                // between them.
+                parent: worker.parent,
+                raised: worker.raised,
             },
             x,
             y,
@@ -459,6 +466,13 @@ impl WallpaperSet {
             s.monitor.height,
         ) {
             Ok(p) => {
+                // Assert the z-slot NOW: the surface is created as Progman's
+                // last child, i.e. BELOW the WorkerW that paints the desktop
+                // background — which would hide it completely. It has to sit
+                // between the WorkerW and SHELLDLL_DefView.
+                if let Err(e) = p.pin_behind_target() {
+                    eprintln!("[panefx] wallpaper: z-order for {} failed: {e}", s.monitor.device);
+                }
                 s.panel = Some(p);
                 s.sim = Some(key);
                 s.force_redraw = true;
@@ -590,6 +604,11 @@ impl WallpaperSet {
             let (Some(key), Some(panel)) = (s.sim.clone(), s.panel.as_mut()) else {
                 continue;
             };
+            // Explorer recreates its Progman children on theme and wallpaper
+            // changes, which drops our surface back below the WorkerW where
+            // nothing can see it. Cheap to re-assert; expensive to debug when
+            // the wallpaper silently vanishes an hour later.
+            let _ = panel.pin_behind_target();
             if !(self.pool.dirty(&key) || s.force_redraw) {
                 continue;
             }
@@ -1084,6 +1103,8 @@ mod tests {
         set.worker = Some(Workerw {
             hwnd: windows::Win32::Foundation::HWND(std::ptr::null_mut()),
             origin: (0, 0),
+            parent: windows::Win32::Foundation::HWND(std::ptr::null_mut()),
+            raised: false,
         });
         let mut s = surface_for(mon_at(1, 0, 1080));
         s.effect = "flames".into();
@@ -1104,6 +1125,8 @@ mod tests {
         set.worker = Some(Workerw {
             hwnd: windows::Win32::Foundation::HWND(std::ptr::null_mut()),
             origin: (0, 0),
+            parent: windows::Win32::Foundation::HWND(std::ptr::null_mut()),
+            raised: false,
         });
         let err = set
             .set_effect(Some(9), "waves", &cfg)

@@ -22,8 +22,8 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW, SetWindowPos, ShowWindow,
     HWND_BOTTOM, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
-    SW_SHOWNOACTIVATE, WM_DESTROY, WM_ERASEBKGND, WM_PAINT, WNDCLASSEXW, WS_CHILD,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+    SW_SHOWNOACTIVATE, WM_DESTROY, WM_ERASEBKGND, WM_PAINT, WNDCLASSEXW, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 use crate::animation::AsciiAnimation;
@@ -90,7 +90,17 @@ pub struct GdiCache {
 #[derive(Clone, Copy)]
 pub enum Anchor {
     Window(HWND),
-    Desktop { parent: HWND },
+    Desktop {
+        parent: HWND,
+        /// True on the Windows 11 24H2+ "raised desktop" model.
+        ///
+        /// There the surface is a sibling of Progman's WorkerW and DefView
+        /// children rather than a child of the WorkerW, and Microsoft's guidance
+        /// is explicit that it must be `WS_EX_LAYERED` **at creation** with
+        /// alpha 255. Adding the style after the fact leaves the surface
+        /// mis-composited.
+        raised: bool,
+    },
 }
 
 pub struct Panel {
@@ -203,15 +213,32 @@ impl Panel {
             // does not clip to the parent and does not inherit z-position, so it
             // floats above every application instead of sitting behind the
             // desktop icons. One style bit, and the ugliest possible failure.
-            let (style, parent) = match anchor {
-                // A default HWND here means "no parent" — a normal top-level
-                // popup, exactly as before.
-                Anchor::Window(_) => (WS_POPUP, HWND::default()),
-                Anchor::Desktop { parent } => (WS_CHILD, parent),
-            };
+            // BOTH kinds are top-level WS_POPUP windows with NO parent.
+            //
+            // The wallpaper surface used to be a WS_CHILD of Explorer's Progman,
+            // following Microsoft's guidance for the "raised desktop" model.
+            // That path fought us at every step: WS_EX_LAYERED was refused on a
+            // child, coordinates became parent-relative in a space that did not
+            // match the virtual desktop, and z-order had to be re-asserted
+            // against windows Explorer recreates at will. The surface existed,
+            // was correctly ordered, and drew 340 lit cells a frame -- into
+            // pixels nobody could see.
+            //
+            // The terminal panels have been a top-level popup pinned into a
+            // z-slot since day one, on two machines, without trouble. The
+            // wallpaper is the same problem with a different anchor, so it uses
+            // the same solution: screen coordinates, no parent, pinned to the
+            // BOTTOM of the z-order instead of behind a specific window.
+            let (style, parent) = (WS_POPUP, HWND::default());
+            let _ = &anchor;
+
+            // Same ex-style for both: never focusable, never in the taskbar.
+            // No WS_EX_LAYERED -- that was only needed for the child-of-Progman
+            // approach, and Windows refused it there anyway.
+            let ex_style = WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
 
             let hwnd = CreateWindowExW(
-                WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                ex_style,
                 PANEL_CLASS,
                 w!("panefx panel"),
                 style,
@@ -284,8 +311,31 @@ impl Panel {
     /// changes and can otherwise leave our panel in front of, or detached
     /// from, its terminal.
     pub fn pin_behind_target(&self) -> anyhow::Result<()> {
-        // A desktop surface inherits its z-position from the WorkerW and holds
-        // it permanently, so there is nothing to re-pin.
+        // On the RAISED desktop the surface is a sibling of Progman's WorkerW
+        // and DefView children, so its z-slot is not inherited and must be
+        // asserted: directly after SHELLDLL_DefView, i.e. behind the icons but
+        // above the WorkerW. Explorer recreates these children on theme and
+        // wallpaper changes, so this is re-asserted rather than done once.
+        // A desktop surface sinks to the BOTTOM of the z-order: behind every
+        // application window, and behind the terminal panels too. Re-asserted
+        // on every reconcile for the same reason the terminal panels are --
+        // something else will eventually push it up.
+        if matches!(self.anchor, Anchor::Desktop { .. }) {
+            unsafe {
+                SetWindowPos(
+                    self.hwnd,
+                    HWND_BOTTOM,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+                )?;
+            }
+            return Ok(());
+        }
+        // A classic-model desktop surface inherits its z-position from the
+        // WorkerW it is a child of, so there is nothing to re-pin.
         let Anchor::Window(target) = self.anchor else {
             return Ok(());
         };
@@ -306,11 +356,6 @@ impl Panel {
     /// Drop to the very bottom of the z-order. Used when the target is hidden
     /// (e.g. on another workspace) as a belt-and-braces companion to `hide`.
     pub fn sink(&self) -> anyhow::Result<()> {
-        // Meaningless for a desktop child, and HWND_BOTTOM on one can shove it
-        // behind its own parent.
-        if matches!(self.anchor, Anchor::Desktop { .. }) {
-            return Ok(());
-        }
         unsafe {
             SetWindowPos(
                 self.hwnd,

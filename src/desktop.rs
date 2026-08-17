@@ -5,33 +5,45 @@
 //!     icons — so a panel can be parented into it;
 //!   * enumerate the physical monitors, so each can own its own surface.
 //!
-//! # How the WorkerW is found
+//! # How the WorkerW is found — and there are TWO desktop models
 //!
 //! Sending the undocumented `0x052C` to `Progman` asks Explorer to split the
-//! desktop into two layers: one holding the icons, one behind them. The layer we
-//! want is **not** the window holding the icons — it is that window's *next
-//! sibling*.
+//! desktop into two layers: one holding the icons, one behind them. Where the
+//! second layer ENDS UP changed in Windows 11 24H2.
 //!
-//! Getting this backwards is the ugliest failure in the whole feature: parenting
-//! into the icon host draws the animation ON TOP of the icons, which looks like
-//! success for about two seconds until you notice the icons are gone.
-//! `pick_wallpaper_layer` is factored out so that rule is unit-testable without
-//! Explorer running.
+//! **Classic (Win10, Win11 ≤ 23H2).** The WorkerW is a *top-level sibling* of
+//! the window owning `SHELLDLL_DefView`. Walk top-level windows, find the
+//! DefView owner, take its next sibling.
 //!
-//! # Why this can fail, and why that must be survivable
+//! **Raised (Win11 24H2+).** Microsoft rebuilt this for HDR backgrounds and, in
+//! their own words, "no longer create multiple top-level HWNDs". `Progman` now
+//! carries `WS_EX_NOREDIRECTIONBITMAP` and the WorkerW is a **CHILD of
+//! Progman**, z-ordered under the DefView child. There is no top-level sibling
+//! to find, so the classic hunt returns nothing — which looks exactly like "the
+//! layer does not exist" while it is sitting right there.
 //!
-//! `0x052C` is undocumented, and **on Windows 11 25H2 (build 26200) it does
-//! nothing at all.** Measured here: Progman is found, the message is sent and
-//! acknowledged, and no WorkerW is ever created. Microsoft shipped a built-in
-//! video-wallpaper feature in that release and third-party wallpapers are now
-//! reported as being treated as ordinary windows — the same regression other
-//! wallpaper apps hit on 25H2.
+//! That misreading cost real time during development: the classic search failing
+//! was reported as "Windows removed the wallpaper layer". It had not. Measured
+//! on this machine: `Progman` ex-style `0x200080` (raised), child WorkerW
+//! present.
 //!
-//! So this module is expected to fail on current Windows, and that must cost
-//! nothing. Every entry point returns a *named* error rather than an `Option`,
-//! and the daemon carries on with terminal panels only. A wallpaper you cannot
-//! have is a missing feature; a daemon that refuses to start is a broken
-//! program.
+//! ## Two traps in the discovery itself
+//!
+//! * **`GetShellWindow()`, not `FindWindow("Progman")`.** They disagree.
+//!   Measured here: `FindWindowW("Progman")` returns 0 while `GetShellWindow()`
+//!   returns a valid handle. Every false "Progman not found" came from the
+//!   former.
+//! * **The layer is never the window owning `SHELLDLL_DefView`.** That one holds
+//!   the icons; drawing into it covers them, which looks like success for about
+//!   two seconds. `pick_wallpaper_layer` encodes that rule and is unit-tested
+//!   without Explorer running.
+//!
+//! # Failure must stay survivable
+//!
+//! `0x052C` is undocumented and Explorer's internals are not a contract. Every
+//! entry point returns a *named* error rather than an `Option`, and the daemon
+//! carries on with terminal panels only. A wallpaper you cannot have is a
+//! missing feature; a daemon that refuses to start is a broken program.
 
 use windows::core::w;
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, WPARAM};
@@ -62,6 +74,17 @@ pub struct Workerw {
     /// desktop starts at a negative x, so passing a raw screen coordinate to a
     /// child of this window puts the panel hundreds of pixels off its edge.
     pub origin: (i32, i32),
+    /// The window our surface should be a CHILD of.
+    ///
+    /// Differs by desktop model, which is the whole reason this field exists:
+    ///   * classic  — the WorkerW itself; it sits behind the icons already.
+    ///   * raised   — **Progman**. The surface has to land between Progman's
+    ///     WorkerW child and the `SHELLDLL_DefView` child that holds the icons,
+    ///     so it is a sibling of both rather than a child of the WorkerW.
+    pub parent: HWND,
+    /// True on the 24H2+ "raised desktop" model. Changes both the parent above
+    /// and how z-order is asserted after `SetParent`.
+    pub raised: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,8 +94,8 @@ pub enum DesktopError {
     NoProgman,
     /// Progman exists but no window owning a `SHELLDLL_DefView` was found.
     NoDefViewHost,
-    /// The icon host was found but has no `WorkerW` sibling after it. This is
-    /// the "0x052C did nothing on this build" case.
+    /// No WorkerW was found in either place — neither as a top-level sibling of
+    /// the DefView host (classic) nor as a child of Progman (raised).
     NoSiblingWorkerw,
 }
 
@@ -89,7 +112,7 @@ impl std::fmt::Display for DesktopError {
             ),
             DesktopError::NoSiblingWorkerw => write!(
                 f,
-                "Explorer did not create a WorkerW behind the icons (0x052C had no effect on this build)"
+                "no WorkerW behind the desktop icons — Explorer did not create one"
             ),
         }
     }
@@ -155,28 +178,93 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     BOOL(1)
 }
 
+/// Is the desktop using the "raised" model introduced in Windows 11 24H2?
+///
+/// Microsoft rebuilt desktop rendering for HDR backgrounds and, in their own
+/// words, "no longer create multiple top-level HWNDs" — the top-level `Progman`
+/// now carries `WS_EX_NOREDIRECTIONBITMAP` and the WorkerW is a **child** of it,
+/// z-ordered under `SHELLDLL_DefView`.
+///
+/// Measured on this machine: `Progman` ex-style `0x200080`, so the bit is set.
+#[cfg(windows)]
+fn is_raised_desktop(progman: HWND) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, GWL_EXSTYLE};
+    // WS_EX_NOREDIRECTIONBITMAP. Not exposed as a constant by the windows crate
+    // under the features this crate enables, so spelled out.
+    const WS_EX_NOREDIRECTIONBITMAP: isize = 0x0020_0000;
+    unsafe { GetWindowLongPtrW(progman, GWL_EXSTYLE) & WS_EX_NOREDIRECTIONBITMAP != 0 }
+}
+
 /// Ask Explorer for the wallpaper layer and locate it.
 pub fn find() -> Result<Workerw, DesktopError> {
     unsafe {
-        let progman = FindWindowW(w!("Progman"), None).map_err(|_| DesktopError::NoProgman)?;
+        // `GetShellWindow()`, NOT `FindWindow("Progman")`.
+        //
+        // These disagree. Measured on this machine: `FindWindowW("Progman")`
+        // returns 0 while `GetShellWindow()` returns a valid handle — and every
+        // false "the wallpaper layer is gone" reading during development came
+        // from trusting the former. `GetShellWindow` asks the shell directly
+        // rather than searching by class name.
+        let progman = {
+            use windows::Win32::UI::WindowsAndMessaging::GetShellWindow;
+            let shell = GetShellWindow();
+            if !shell.is_invalid() {
+                shell
+            } else {
+                // Fall back to the class lookup for anything that does not
+                // register a shell window.
+                FindWindowW(w!("Progman"), None).map_err(|_| DesktopError::NoProgman)?
+            }
+        };
         if progman.is_invalid() {
             return Err(DesktopError::NoProgman);
         }
 
-        // Ask for the split. A timeout is NOT fatal: the WorkerW may already
-        // exist from an earlier request, from a previous run of this program, or
-        // from another wallpaper app, so we look regardless of the reply.
+        // Ask for the split.
+        //
+        // wParam 0xD / lParam 0x1, not 0/0. This is the form Explorer itself
+        // uses and the one Lively ships; the bare 0/0 variant is the older
+        // spelling. A timeout is NOT fatal: the WorkerW may already exist from
+        // an earlier request, a previous run, or another wallpaper app, so we
+        // look regardless of the reply.
         let mut _result = 0usize;
         let _ = SendMessageTimeoutW(
             progman,
             WM_SPAWN_WORKERW,
-            WPARAM(0),
-            LPARAM(0),
+            WPARAM(0xD),
+            LPARAM(0x1),
             SMTO_NORMAL,
             1000,
             Some(&mut _result),
         );
 
+        // --- the 24H2+ "raised desktop" model ---
+        //
+        // The WorkerW is a CHILD of Progman here, so the classic hunt for a
+        // top-level sibling finds nothing and reports the layer as missing when
+        // it is simply somewhere else. This is the case on Windows 11 24H2 and
+        // later, which is to say: the common one now.
+        if is_raised_desktop(progman) {
+            let child = FindWindowExW(progman, None, w!("WorkerW"), None);
+            if let Ok(w) = child {
+                if !w.is_invalid() {
+                    let mut rect = RECT::default();
+                    let _ = GetWindowRect(w, &mut rect);
+                    return Ok(Workerw {
+                        hwnd: w,
+                        origin: (rect.left, rect.top),
+                        // Children of Progman are parented to Progman itself,
+                        // not to the WorkerW: the surface must sit BETWEEN the
+                        // WorkerW and the icon layer.
+                        parent: progman,
+                        raised: true,
+                    });
+                }
+            }
+            return Err(DesktopError::NoSiblingWorkerw);
+        }
+
+        // --- the classic model (Windows 10, and 11 up to 23H2) ---
         let mut collector = Collector { found: Vec::new() };
         let _ = EnumWindows(
             Some(enum_proc),
@@ -192,6 +280,10 @@ pub fn find() -> Result<Workerw, DesktopError> {
         Ok(Workerw {
             hwnd,
             origin: (rect.left, rect.top),
+            // Classic model: the WorkerW already sits behind the icons, so the
+            // surface is parented straight into it.
+            parent: hwnd,
+            raised: false,
         })
     }
 }
@@ -202,7 +294,10 @@ pub fn find() -> Result<Workerw, DesktopError> {
 /// window reuses the handle value — so the class name is checked too.
 pub fn is_alive(w: &Workerw) -> bool {
     unsafe {
-        if !IsWindow(w.hwnd).as_bool() {
+        // Both the layer and the window we parent into must still exist.
+        // Explorer restarting destroys both, and on the raised model they are
+        // different windows.
+        if !IsWindow(w.hwnd).as_bool() || !IsWindow(w.parent).as_bool() {
             return false;
         }
         let mut buf = [0u16; 64];
@@ -381,6 +476,33 @@ mod tests {
     }
 
     #[test]
+    fn the_raised_model_parents_into_progman_not_the_workerw() {
+        // On 24H2+ the surface is a SIBLING of Progman's WorkerW and DefView
+        // children, so it must be parented to Progman and z-ordered between
+        // them. Parenting into the WorkerW itself would put the effect BEHIND
+        // the wallpaper, where nothing can see it.
+        let progman = HWND(0x1000 as *mut _);
+        let workerw = HWND(0x2000 as *mut _);
+        let raised = Workerw {
+            hwnd: workerw,
+            origin: (0, 0),
+            parent: progman,
+            raised: true,
+        };
+        assert_eq!(raised.parent, progman, "raised model parents into Progman");
+        assert_ne!(raised.parent, raised.hwnd);
+
+        // Classic is the opposite: the WorkerW already sits behind the icons.
+        let classic = Workerw {
+            hwnd: workerw,
+            origin: (0, 0),
+            parent: workerw,
+            raised: false,
+        };
+        assert_eq!(classic.parent, classic.hwnd);
+    }
+
+    #[test]
     fn to_child_handles_a_negative_virtual_origin() {
         // The virtual desktop starts at the top-left-most monitor, which is
         // negative when a screen sits left of or above the primary. A raw screen
@@ -388,6 +510,8 @@ mod tests {
         let w = Workerw {
             hwnd: HWND(std::ptr::null_mut()),
             origin: (-1440, -1230),
+            parent: HWND(std::ptr::null_mut()),
+            raised: false,
         };
         assert_eq!(to_child(&w, -1440, -1230), (0, 0));
         assert_eq!(to_child(&w, 0, 0), (1440, 1230));
