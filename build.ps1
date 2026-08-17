@@ -91,10 +91,14 @@ foreach ($t in @((Join-Path $binDir 'panefx.exe'), (Join-Path $glzrDir 'panefx.e
 }
 Write-Host 'verified: both installed copies match the build'
 
-Start-Process -FilePath (Join-Path $glzrDir 'panefx.exe') -WindowStyle Hidden
+# --daemon is REQUIRED: without it panefx.exe hands off to the control TUI,
+# because typing `panefx` in a terminal should open the TUI. Omit the flag here
+# and the daemon never starts, which looks exactly like a build that failed.
+# GlazeWM's startup_commands needs the same flag.
+Start-Process -FilePath (Join-Path $glzrDir 'panefx.exe') -ArgumentList '--daemon' -WindowStyle Hidden
 Start-Sleep -Seconds 3
 if (Get-Process -Name panefx -ErrorAction SilentlyContinue) {
     Write-Host 'daemon restarted'
 } else {
-    Write-Warning 'daemon did not come up — run `panefx` by hand to see the error'
+    Write-Warning 'daemon did not come up — run `panefx --daemon` by hand to see the error'
 }

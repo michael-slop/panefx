@@ -45,7 +45,96 @@ use panel::Panel;
 /// a manual drag-resize of a floating window.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// What the user asked for on the command line.
+enum Mode {
+    /// Run the background daemon. What GlazeWM launches.
+    Daemon,
+    /// Hand off to the control TUI. What a person typing `panefx` wants.
+    Tui,
+    Help,
+    /// An unrecognised flag — say so rather than guessing.
+    Unknown(String),
+}
+
+fn parse_args() -> Mode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        None => Mode::Tui,
+        Some("-d") | Some("--daemon") => Mode::Daemon,
+        Some("-h") | Some("--help") => Mode::Help,
+        Some(other) => Mode::Unknown(other.to_string()),
+    }
+}
+
+const HELP: &str = "\
+panefx — animated ASCII backdrops behind windows, and on the desktop
+
+USAGE:
+    panefx              open the control TUI (same as `panefx-ctl`)
+    panefx --daemon     run the background daemon
+    panefx --help       this text
+
+The daemon is normally started by your window manager, not by hand — it
+reads every window position from GlazeWM's IPC, so it is a function of the
+WM rather than an independent service.
+";
+
+/// Launch the control TUI by handing over to `panefx-ctl` next to us.
+///
+/// The TUI is a SEPARATE BINARY rather than a mode of this one, because this
+/// binary is `#![windows_subsystem = "windows"]` — it has no console at all, and
+/// a terminal UI needs one. `AttachConsole(ATTACH_PARENT_PROCESS)` could borrow
+/// the caller's, but that path is full of sharp edges (it fails with
+/// ERROR_INVALID_HANDLE when the parent has no console, the std handles have to
+/// be rebound by hand, and Ctrl-C routing gets murky).
+///
+/// Running the real console binary avoids all of it: `panefx-ctl` owns its
+/// terminal the way any console program does. `build.ps1` installs both to the
+/// same directory, so resolving a sibling is reliable.
+fn launch_tui() -> anyhow::Result<()> {
+    let exe = std::env::current_exe()?;
+    let ctl = exe
+        .parent()
+        .map(|d| d.join("panefx-ctl.exe"))
+        .filter(|p| p.exists())
+        // Fall back to PATH: someone may have copied only one binary, and a
+        // clear "not found" beats a confusing "no such file".
+        .unwrap_or_else(|| std::path::PathBuf::from("panefx-ctl.exe"));
+
+    let status = std::process::Command::new(&ctl)
+        .args(std::env::args().skip(1))
+        .status();
+
+    match status {
+        Ok(s) => std::process::exit(s.code().unwrap_or(0)),
+        Err(e) => {
+            eprintln!(
+                "panefx: cannot start the control TUI ({}): {e}\n\
+                 Expected panefx-ctl.exe next to {}.\n\
+                 Run `panefx --daemon` for the background daemon.",
+                ctl.display(),
+                exe.display()
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
+    match parse_args() {
+        Mode::Tui => return launch_tui(),
+        Mode::Help => {
+            // No console on this binary, so printing here goes nowhere useful.
+            // Hand `--help` to the console binary, which can actually show it.
+            return launch_tui();
+        }
+        Mode::Unknown(flag) => {
+            eprintln!("panefx: unknown option '{flag}'\n\n{HELP}");
+            std::process::exit(2);
+        }
+        Mode::Daemon => {}
+    }
+
     let mut cfg = config::Config::load();
 
     // Font substitution is SILENT — CreateFontW succeeds and you simply get a
@@ -473,4 +562,51 @@ fn reconcile(
 
     *sim_cols = max_cols;
     *sim_rows = max_rows;
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn mode_of(args: &[&str]) -> &'static str {
+        // Mirrors `parse_args` against an explicit list, since that reads the
+        // real argv. The mapping is the contract worth pinning: which spellings
+        // start a DAEMON, and which open the TUI.
+        match args.first().copied() {
+            None => "tui",
+            Some("-d") | Some("--daemon") => "daemon",
+            Some("-h") | Some("--help") => "help",
+            Some(_) => "unknown",
+        }
+    }
+
+    #[test]
+    fn bare_panefx_opens_the_tui() {
+        assert_eq!(mode_of(&[]), "tui");
+    }
+
+    #[test]
+    fn the_daemon_needs_an_explicit_flag() {
+        // GlazeWM launches the daemon by absolute path, and this flag is what
+        // tells it apart from a person typing `panefx`. If this ever changes,
+        // startup_commands on every machine has to change with it.
+        assert_eq!(mode_of(&["--daemon"]), "daemon");
+        assert_eq!(mode_of(&["-d"]), "daemon");
+    }
+
+    #[test]
+    fn help_is_recognised_both_ways() {
+        assert_eq!(mode_of(&["--help"]), "help");
+        assert_eq!(mode_of(&["-h"]), "help");
+    }
+
+    #[test]
+    fn an_unknown_flag_is_not_silently_treated_as_the_daemon() {
+        // The dangerous failure: a typo like `--deamon` starting a SECOND
+        // daemon, which then fights the first over the control port and the
+        // panels. It must be rejected outright.
+        assert_eq!(mode_of(&["--deamon"]), "unknown");
+        assert_eq!(mode_of(&["-D"]), "unknown");
+        assert_eq!(mode_of(&["daemon"]), "unknown");
+    }
 }

@@ -609,7 +609,49 @@ fn row_bar(r: &Row) -> String {
     format!("{}{}", "█".repeat(filled), "░".repeat(12 - filled))
 }
 
+const HELP: &str = "\
+panefx — animated ASCII backdrops behind windows, and on the desktop
+
+USAGE:
+    panefx              open this control TUI
+    panefx --daemon     run the background daemon
+    panefx --help       this text
+
+    panefx-ctl          the TUI directly (what `panefx` hands off to)
+
+KEYS
+    Tab            switch between the Effects and Wallpaper tabs
+    w / e          jump straight to Wallpaper / Effects
+    up/down        move between rows
+    left/right     adjust a value (H / L for x10)
+    Enter          type a value
+    a              (Wallpaper) apply this effect to every monitor
+    s              save to the config file
+    r              revert to the saved config
+    q              quit without saving
+
+Changes apply instantly but are NOT saved until `s`, so experiment freely.
+
+ENVIRONMENT
+    PANEFX_PORT    control-channel port (default 6124)
+";
+
 fn main() -> anyhow::Result<()> {
+    // `panefx` with no arguments hands off to this binary, so any flags the
+    // user typed arrive here. Handle them rather than ignoring them silently.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        None => {}
+        Some("-h") | Some("--help") => {
+            println!("{HELP}");
+            return Ok(());
+        }
+        Some(other) => {
+            eprintln!("panefx: unknown option '{other}'\n\n{HELP}");
+            std::process::exit(2);
+        }
+    }
+
     let port: u16 = std::env::var("PANEFX_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -619,7 +661,12 @@ fn main() -> anyhow::Result<()> {
         Ok(c) => c,
         Err(e) => {
             eprintln!("panefx-ctl: cannot reach the daemon on 127.0.0.1:{port} ({e})");
-            eprintln!("Is panefx running? It logs '[panefx] control channel on ...' at startup.");
+            eprintln!();
+            eprintln!("The daemon is normally started by GlazeWM. To start one by hand:");
+            eprintln!("    panefx --daemon");
+            eprintln!();
+            eprintln!("If GlazeWM is running and this still fails, its startup_commands may");
+            eprintln!("still be launching panefx without the --daemon flag.");
             std::process::exit(1);
         }
     };

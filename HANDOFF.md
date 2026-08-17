@@ -67,7 +67,12 @@ service, because it depends on the WM's IPC for all window geometry.
 
 * Binary is installed to `.glzr\glazewm\scripts\panefx.exe`
   (alongside `glazewm-move.exe`).
-* `startup_commands` in `config.yaml` launches it when the WM starts.
+* `startup_commands` in `config.yaml` launches it **with `--daemon`**.
+  **That flag is required.** Bare `panefx.exe` opens the control TUI, because
+  typing `panefx` in a terminal should give you the TUI. Omit it in
+  `startup_commands` (or in `build.ps1`'s restart) and the daemon never starts —
+  which looks exactly like a build that silently failed. `build.ps1` warns when
+  the daemon does not come up, which is how this was caught.
 * `shutdown_commands` kills it when the WM exits — without this the panels
   linger as orphaned windows with no WM to follow.
 * Note `startup_commands` fires only at WM **startup**, not on config reload.

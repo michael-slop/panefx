@@ -54,12 +54,19 @@ Two problems make this harder than it sounds, both solved here:
 ## Usage
 
 ```powershell
-panefx-ctl        # the control TUI — switch effects, tune them live
-panefx            # the daemon, if you want to run it by hand
+panefx            # open the control TUI
+panefx --daemon   # run the daemon by hand (normally GlazeWM's job)
+panefx --help     # keys and usage
+
+panefx-ctl        # the TUI directly — what `panefx` hands off to
 ```
 
-It autostarts with GlazeWM via `startup_commands`, so normally you never launch
-the daemon yourself.
+Typing `panefx` gives you the TUI, because that is what you actually want from a
+terminal. The daemon needs `--daemon`, and that is what GlazeWM's
+`startup_commands` passes — **drop the flag there and the backdrops silently
+stop appearing at startup.**
+
+It autostarts with GlazeWM, so normally you never launch the daemon yourself.
 
 ### The TUI
 
