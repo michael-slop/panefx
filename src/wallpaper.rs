@@ -173,13 +173,20 @@ impl SimPool {
 /// strictly necessary costs a little CPU; freezing a wallpaper the user can see
 /// is a bug they notice.
 pub fn is_occluded(m: &MonitorInfo, windows: &[ipc::Window]) -> bool {
-    let mon_l = m.x;
-    let mon_t = m.y;
-    let mon_r = m.x + m.width;
-    let mon_b = m.y + m.height;
+    // Check the degenerate case BEFORE computing edges, so a zero-area monitor
+    // never reaches the scanline (where a zero-height band would trivially
+    // "cover" it).
     if m.width <= 0 || m.height <= 0 {
         return false;
     }
+    // Saturating throughout: these are i32 screen coordinates straight off the
+    // wire, and `x + width` on a bogus rect overflows. In release that WRAPS
+    // rather than panicking, turning a far-away window into one that appears to
+    // cover the screen — i.e. a wallpaper frozen for no visible reason.
+    let mon_l = m.x;
+    let mon_t = m.y;
+    let mon_r = m.x.saturating_add(m.width);
+    let mon_b = m.y.saturating_add(m.height);
 
     // Only windows that are actually on screen can occlude.
     //
@@ -190,8 +197,13 @@ pub fn is_occluded(m: &MonitorInfo, windows: &[ipc::Window]) -> bool {
         if !w.is_visible() || w.is_minimized() {
             continue;
         }
+        // Skip degenerate rects outright — a window mid-creation or being
+        // animated closed can report zero or negative extents.
+        if w.width <= 0 || w.height <= 0 {
+            continue;
+        }
         let (l, t) = (w.x, w.y);
-        let (r, b) = (w.x + w.width, w.y + w.height);
+        let (r, b) = (w.x.saturating_add(w.width), w.y.saturating_add(w.height));
         // Clip to the monitor; anything outside contributes nothing.
         let (cl, ct) = (l.max(mon_l), t.max(mon_t));
         let (cr, cb) = (r.min(mon_r), b.min(mon_b));
@@ -419,6 +431,12 @@ impl WallpaperSet {
         if cw <= 0 || ch <= 0 {
             return;
         }
+        // A monitor with no area cannot show anything. Without this it would
+        // still get a 1x1 surface (the `.max(1)` below), i.e. a real window and
+        // a real simulation drawing one cell nobody will ever see.
+        if s.monitor.width <= 0 || s.monitor.height <= 0 {
+            return;
+        }
         let cols = (s.monitor.width / cw).max(1) as usize;
         let rows = (s.monitor.height / ch).max(1) as usize;
 
@@ -505,10 +523,18 @@ impl WallpaperSet {
     /// desktop.
     pub fn observe_windows(&mut self, windows: &[ipc::Window]) {
         for s in self.surfaces.iter_mut() {
+            // An `off` monitor has no panel and no simulation, so whether it is
+            // covered is a question with no consumer. Skip the scanline entirely
+            // — this runs on every window event, and with most screens off it
+            // would otherwise be the bulk of the work the wallpaper does.
+            if s.panel.is_none() {
+                s.occluded = false;
+                continue;
+            }
             let now = is_occluded(&s.monitor, windows);
             if s.occluded && !now {
-                // Coming back into view: force one draw, because the pooled sim
-                // may report unchanged on this frame and leave a stale bitmap.
+                // Coming back into view: force one draw, because the sim may
+                // report unchanged on this frame and leave a stale bitmap.
                 s.force_redraw = true;
             }
             s.occluded = now;
@@ -772,6 +798,50 @@ mod tests {
     }
 
     #[test]
+    fn a_zero_or_negative_size_window_is_ignored() {
+        // Degenerate rects turn up in the wild (a window mid-creation, or one
+        // being animated closed). They must not divide-by-zero, panic, or count
+        // as coverage.
+        let w = [
+            win(0, 0, 0, 0, "tiling", "shown"),
+            win(100, 100, -50, -50, "tiling", "shown"),
+        ];
+        assert!(!is_occluded(&mon(0, 0, 1920, 1080), &w));
+    }
+
+    #[test]
+    fn a_degenerate_monitor_is_never_occluded() {
+        // Guards the scanline against a zero-width band, which would otherwise
+        // trivially "cover" a monitor with no area.
+        let w = [win(0, 0, 1920, 1080, "tiling", "shown")];
+        assert!(!is_occluded(&mon(0, 0, 0, 1080), &w));
+        assert!(!is_occluded(&mon(0, 0, 1920, 0), &w));
+    }
+
+    #[test]
+    fn extreme_coordinates_do_not_overflow() {
+        // A window rect near i32::MAX must not wrap when `x + width` is computed.
+        // Wrapping would make a far-away window look like it covers the screen.
+        let w = [win(i32::MAX - 10, i32::MAX - 10, 100, 100, "tiling", "shown")];
+        assert!(!is_occluded(&mon(0, 0, 1920, 1080), &w));
+    }
+
+    #[test]
+    fn an_off_monitor_is_never_reported_as_occluded() {
+        // `off` means no surface at all, so "covered" is meaningless — and the
+        // TUI must not show a frozen marker for a monitor showing nothing.
+        let mut set = set_with(vec![mon_at(1, 1920, 1080)]);
+        set.surfaces[0].effect = OFF.to_string();
+        set.surfaces[0].panel = None;
+        let covering = [win(0, 0, 1920, 1080, "tiling", "shown")];
+        set.observe_windows(&covering);
+        assert!(
+            !set.surfaces[0].occluded,
+            "an off monitor has no surface to freeze"
+        );
+    }
+
+    #[test]
     fn overlapping_windows_still_occlude() {
         let w = [
             win(0, 0, 1000, 1080, "tiling", "shown"),
@@ -1002,6 +1072,25 @@ mod tests {
         let mut moved = mon_at(1, 1920, 1080);
         moved.x = -1920;
         assert!(set.monitors_changed(&[moved]));
+    }
+
+    #[test]
+    fn a_zero_area_monitor_gets_no_surface() {
+        // A display reporting no area (mid-mode-change, or a virtual device)
+        // would otherwise get a real window and a real simulation drawing a
+        // single cell nobody can see.
+        let cfg = Config::default();
+        let mut set = set_with(vec![]);
+        set.worker = Some(Workerw {
+            hwnd: windows::Win32::Foundation::HWND(std::ptr::null_mut()),
+            origin: (0, 0),
+        });
+        let mut s = surface_for(mon_at(1, 0, 1080));
+        s.effect = "flames".into();
+        let worker = set.worker.unwrap();
+        set.build_surface(&mut s, &cfg, worker);
+        assert!(s.sim.is_none(), "no simulation for a zero-area monitor");
+        assert_eq!(set.sim_count(), 0);
     }
 
     #[test]
