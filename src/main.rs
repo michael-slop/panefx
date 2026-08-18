@@ -730,7 +730,15 @@ fn reconcile(
             }
         };
 
-        if w.is_visible() {
+        // `is_visible()` alone is NOT enough: GlazeWM reports a MINIMIZED
+        // window as displayState "shown", with the full geometry it had before
+        // it was minimized. Trusting that leaves a panel sitting at a rect
+        // nothing occupies -- a blank backdrop floating in the middle of the
+        // screen with no window in front of it.
+        //
+        // The wallpaper's occlusion check already filtered on `is_minimized`
+        // for exactly this reason; the panel path was missed.
+        if w.is_on_screen() {
             panel.show();
             if let Err(e) = panel.reposition(w.x, w.y, w.width, w.height) {
                 panefx::log_warn!("[panefx] reposition failed: {e}");
@@ -749,7 +757,8 @@ fn reconcile(
             max_cols = max_cols.max((usable_w / cell_w).max(1) as usize);
             max_rows = max_rows.max((usable_h / cell_h).max(1) as usize);
         } else {
-            // Terminal is on another workspace — hide rather than draw.
+            // On another workspace, or minimized. Either way it is not on
+            // screen, so hide rather than draw.
             panel.hide();
             let _ = panel.sink();
         }

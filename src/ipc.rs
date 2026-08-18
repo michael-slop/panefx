@@ -134,6 +134,21 @@ impl Window {
     pub fn is_minimized(&self) -> bool {
         self.state.kind.eq_ignore_ascii_case("minimized")
     }
+
+    /// Is this window actually on screen right now?
+    ///
+    /// The question a panel must ask, and NOT the same as [`Window::is_visible`].
+    /// GlazeWM reports a minimized window as displayState `"shown"` carrying the
+    /// full geometry it had before it was minimized, so `is_visible()` alone
+    /// leaves a panel parked at a rect nothing occupies -- a blank backdrop
+    /// floating mid-screen with no window in front of it.
+    ///
+    /// A named method rather than an inline `&&` at each call site because this
+    /// exact mistake has already been made twice: the wallpaper's occlusion
+    /// check learned to filter minimized windows and the panel path did not.
+    pub fn is_on_screen(&self) -> bool {
+        self.is_visible() && !self.is_minimized()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -330,6 +345,51 @@ pub enum IpcMessage {
 mod tests {
     use super::*;
 
+
+    /// A MINIMIZED window must not get a visible panel.
+    ///
+    /// This is the "blank pane floating in the middle of the screen" bug.
+    /// GlazeWM reports a minimized window as displayState "shown" with the
+    /// geometry it had before minimizing -- here a real capture: an Alacritty
+    /// at 800x600, (560,226), state "minimized", displayState "shown". The
+    /// panel path trusted `is_visible()` alone, showed a panel at that rect,
+    /// and left a blank backdrop on screen with no window in front of it.
+    #[test]
+    fn a_minimized_window_is_not_on_screen_even_though_it_says_shown() {
+        let json = r#"{"success":true,"data":{"windows":[
+            {"handle":16909876,"processName":"alacritty","className":"c",
+             "x":560,"y":226,"width":800,"height":600,
+             "displayState":"shown","state":{"type":"minimized"}},
+            {"handle":197278,"processName":"alacritty","className":"c",
+             "x":4,"y":4,"width":1912,"height":1044,
+             "displayState":"shown","state":{"type":"tiling"}}
+        ]}}"#;
+        let env: Envelope = serde_json::from_str(json).unwrap();
+        let w = env.data.unwrap().windows.unwrap();
+        assert!(
+            w[0].is_visible(),
+            "GlazeWM really does report minimized windows as shown"
+        );
+        assert!(
+            !w[0].is_on_screen(),
+            "a minimized window must not get a visible panel"
+        );
+        assert!(w[1].is_on_screen(), "the real tiled window still gets one");
+    }
+
+    #[test]
+    fn a_window_on_another_workspace_is_not_on_screen_either() {
+        // The original reason `is_visible` existed. Both conditions must hold.
+        let json = r#"{"success":true,"data":{"windows":[
+            {"handle":1,"processName":"alacritty","className":"c",
+             "x":0,"y":0,"width":800,"height":600,
+             "displayState":"hidden","state":{"type":"tiling"}}
+        ]}}"#;
+        let env: Envelope = serde_json::from_str(json).unwrap();
+        let w = env.data.unwrap().windows.unwrap();
+        assert!(!w[0].is_minimized(), "not minimized -- just not on this workspace");
+        assert!(!w[0].is_on_screen());
+    }
     #[test]
     fn parses_a_real_query_windows_reply() {
         // Captured from a live IPC session — note the negative coordinates
