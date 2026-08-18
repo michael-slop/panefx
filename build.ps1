@@ -79,9 +79,15 @@ foreach ($d in @($binDir, $glzrDir)) {
 
 Copy-Item $exe    (Join-Path $binDir 'panefx.exe')     -Force
 Copy-Item $ctlExe (Join-Path $binDir 'panefx-ctl.exe') -Force
-Copy-Item $exe    (Join-Path $glzrDir 'panefx.exe')    -Force
+Copy-Item $exe    (Join-Path $glzrDir 'panefx.exe')     -Force
+# panefx-ctl too, NOT just the daemon. The tray's "Open panefx TUI" resolves a
+# SIBLING of the running exe (see `launch_tui`), and GlazeWM starts the daemon
+# from $glzrDir -- so without this the tray opens whatever stale panefx-ctl.exe
+# happens to sit there. That is exactly how a morning build survived a day of
+# fixes: hand-deploying to ~\panefx only, while GlazeWM relaunched from here.
+Copy-Item $ctlExe (Join-Path $glzrDir 'panefx-ctl.exe') -Force
 Write-Host "installed -> $binDir  (panefx, panefx-ctl)"
-Write-Host "installed -> $glzrDir  (panefx)"
+Write-Host "installed -> $glzrDir  (panefx, panefx-ctl)"
 
 # Prove the copies match rather than trusting that Copy-Item did what it said.
 # A stale copy is invisible until you wonder why a change did not take.
@@ -89,7 +95,13 @@ $srcHash = (Get-FileHash $exe).Hash
 foreach ($t in @((Join-Path $binDir 'panefx.exe'), (Join-Path $glzrDir 'panefx.exe'))) {
     if ((Get-FileHash $t).Hash -ne $srcHash) { throw "copy mismatch: $t" }
 }
-Write-Host 'verified: both installed copies match the build'
+# The TUI is checked too: a stale panefx-ctl is just as invisible as a stale
+# daemon, and shows up as a TUI missing controls the daemon already supports.
+$ctlHash = (Get-FileHash $ctlExe).Hash
+foreach ($t in @((Join-Path $binDir 'panefx-ctl.exe'), (Join-Path $glzrDir 'panefx-ctl.exe'))) {
+    if ((Get-FileHash $t).Hash -ne $ctlHash) { throw "copy mismatch: $t" }
+}
+Write-Host 'verified: all four installed copies match the build'
 
 # --daemon is REQUIRED: without it panefx.exe hands off to the control TUI,
 # because typing `panefx` in a terminal should open the TUI. Omit the flag here
