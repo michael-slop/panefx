@@ -139,13 +139,19 @@ mod tests {
         // THE reason this buffer exists: the floating-pane bug logged one
         // identical line per frame. Without collapsing, a minute of that would
         // evict every other clue from the buffer.
-        let before = tail(CAPACITY).len();
-        push(Level::Warn, "reposition failed: Invalid window handle");
-        push(Level::Warn, "reposition failed: Invalid window handle");
-        push(Level::Warn, "reposition failed: Invalid window handle");
+        // A UNIQUE message, and no assertion on the buffer's absolute length.
+        // The buffer is a process-wide static and `cargo test` runs tests in
+        // parallel, so another test logging at the same moment used to make this
+        // fail intermittently -- a flaky test is worse than no test, because it
+        // trains you to re-run instead of read.
+        let msg = "repeats_collapse_probe: Invalid window handle";
+        push(Level::Warn, msg);
+        push(Level::Warn, msg);
+        push(Level::Warn, msg);
         let t = tail(CAPACITY);
-        assert_eq!(t.len(), before + 1, "three identical lines, one entry");
-        assert_eq!(t.last().unwrap().count, 3);
+        let mine: Vec<_> = t.iter().filter(|e| e.text == msg).collect();
+        assert_eq!(mine.len(), 1, "three identical lines must collapse to one entry");
+        assert_eq!(mine[0].count, 3, "and carry the repeat count");
     }
 
     #[test]
