@@ -208,11 +208,18 @@ Copy-Item $exe    (Join-Path $glzrDir 'panefx.exe')     -Force
 # happens to sit there. That is exactly how a morning build survived a day of
 # fixes: hand-deploying to ~\panefx only, while GlazeWM relaunched from here.
 Copy-Item $ctlExe (Join-Path $glzrDir 'panefx-ctl.exe') -Force
-# The GUI goes to ~\bin only. It is launched by hand, not by GlazeWM, so it
-# needs to be on PATH but has no reason to sit beside the daemon.
+# The GUI goes to BOTH, for the same reason panefx-ctl does. "Launched by hand,
+# so ~\bin is enough" was wrong and shipped a real bug: the TRAY launches it,
+# the tray belongs to the daemon, and GlazeWM starts the daemon from $glzrDir.
+# Clicking "Open panefx" spawned a path that did not exist and failed SILENTLY
+# -- nothing happened, with no error anywhere.
+#
+# The daemon now falls back to ~\bin and PATH (see `find_gui`), so this copy is
+# belt and braces rather than the only thing holding it up.
 Copy-Item $guiExe (Join-Path $binDir 'panefx-gui.exe') -Force
+Copy-Item $guiExe (Join-Path $glzrDir 'panefx-gui.exe') -Force
 Write-Host "installed -> $binDir  (panefx, panefx-ctl, panefx-gui)"
-Write-Host "installed -> $glzrDir  (panefx, panefx-ctl)"
+Write-Host "installed -> $glzrDir  (panefx, panefx-ctl, panefx-gui)"
 
 # Prove the copies match rather than trusting that Copy-Item did what it said.
 # A stale copy is invisible until you wonder why a change did not take.
@@ -228,8 +235,9 @@ foreach ($t in @((Join-Path $binDir 'panefx-ctl.exe'), (Join-Path $glzrDir 'pane
 }
 # And the GUI, for the same reason: a stale one shows up as a window missing
 # controls the daemon already supports.
-if ((Get-FileHash (Join-Path $binDir 'panefx-gui.exe')).Hash -ne (Get-FileHash $guiExe).Hash) {
-    throw "copy mismatch: panefx-gui.exe"
+$guiHash = (Get-FileHash $guiExe).Hash
+foreach ($t in @((Join-Path $binDir 'panefx-gui.exe'), (Join-Path $glzrDir 'panefx-gui.exe'))) {
+    if ((Get-FileHash $t).Hash -ne $guiHash) { throw "copy mismatch: $t" }
 }
 Write-Host 'verified: all five installed copies match the build'
 

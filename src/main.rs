@@ -94,6 +94,33 @@ fn mode_for(first: Option<&str>) -> Mode {
 mod tests {
     use super::*;
 
+    /// The GUI must be findable from where the DAEMON runs, not just from
+    /// ~in.
+    ///
+    /// This is the bug this test exists for: GlazeWM starts the daemon from
+    /// ~\.glzr\glazewm\scripts\, build.ps1 installed the GUI only to
+    /// ~in, and the tray looked only beside itself. "Open panefx" spawned a
+    /// path that did not exist and failed silently -- the click did nothing at
+    /// all, with no error anywhere.
+    ///
+    /// Nothing about that is visible to a unit test in isolation, so what is
+    /// pinned here is the fallback CHAIN: find_gui must consult more than one
+    /// location, and must not report success for a path that does not exist.
+    #[test]
+    fn find_gui_does_not_invent_a_path() {
+        // Whatever it returns must actually be on disk. Returning a
+        // plausible-but-absent path is exactly how the silent failure
+        // happened.
+        if let Some(p) = find_gui() {
+            assert!(
+                p.exists(),
+                "find_gui returned a path that does not exist: {}",
+                p.display()
+            );
+            assert!(p.ends_with("panefx-gui.exe"));
+        }
+    }
+
     #[test]
     fn bare_panefx_opens_the_gui() {
         // The whole point of the change: no arguments means the GUI.
@@ -158,6 +185,41 @@ WM rather than an independent service.
 /// Running the real console binary avoids all of it: `panefx-ctl` owns its
 /// terminal the way any console program does. `build.ps1` installs both to the
 /// same directory, so resolving a sibling is reliable.
+/// Find `panefx-gui.exe`, wherever it actually is.
+///
+/// Looking only beside the daemon is NOT enough, and assuming otherwise was a
+/// real bug: GlazeWM starts the daemon from `~\.glzr\glazewm\scripts\`,
+/// while `build.ps1` installs the GUI only to `~in\`. The tray's "open
+/// panefx" spawned a path that did not exist and failed silently -- a click
+/// that did nothing at all, with no error anywhere.
+///
+/// Order: beside us (a self-contained folder, which is how the beta zip ships),
+/// then `~in` (the normal install), then PATH.
+fn find_gui() -> Option<std::path::PathBuf> {
+    const NAME: &str = "panefx-gui.exe";
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(beside) = exe.parent().map(|d| d.join(NAME)) {
+            if beside.exists() {
+                return Some(beside);
+            }
+        }
+    }
+
+    if let Ok(home) = std::env::var("USERPROFILE") {
+        let in_bin = std::path::PathBuf::from(home).join("bin").join(NAME);
+        if in_bin.exists() {
+            return Some(in_bin);
+        }
+    }
+
+    std::env::var("PATH").ok().and_then(|path| {
+        path.split(';')
+            .map(|d| std::path::Path::new(d).join(NAME))
+            .find(|p| p.exists())
+    })
+}
+
 fn launch_sibling(name: &str, pass_args: bool) -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
     let target = exe
@@ -200,7 +262,23 @@ fn main() -> anyhow::Result<()> {
             if panefx::desktop::focus_existing_gui() {
                 return Ok(());
             }
-            return launch_sibling("panefx-gui.exe", false);
+            // find_gui, NOT "the sibling": this binary is installed in two
+            // places and only one of them has the GUI beside it.
+            let Some(gui) = find_gui() else {
+                panefx::log_warn!(
+                    "panefx: cannot find panefx-gui.exe.
+                     Looked next to this program, in %USERPROFILE%\\bin, and on PATH.
+                     Run build.ps1 -Install, or use `panefx --tui`."
+                );
+                std::process::exit(1);
+            };
+            match std::process::Command::new(&gui).status() {
+                Ok(st) => std::process::exit(st.code().unwrap_or(0)),
+                Err(e) => {
+                    panefx::log_warn!("panefx: could not start {}: {e}", gui.display());
+                    std::process::exit(1);
+                }
+            }
         }
         Mode::Tui => return launch_sibling("panefx-ctl.exe", true),
         Mode::Help => {
@@ -351,43 +429,36 @@ fn main() -> anyhow::Result<()> {
         // --- tray clicks ---
         if let Some(action) = tray::take_action() {
             match action {
-                tray::TrayAction::OpenGui | tray::TrayAction::OpenTui => {
-                    let want_gui = action == tray::TrayAction::OpenGui;
-                    let name = if want_gui {
-                        "panefx-gui.exe"
-                    } else {
-                        "panefx-ctl.exe"
-                    };
-                    // Already open? Raise it instead of starting a second one.
-                    // Two GUIs writing the same config is a real way to lose
-                    // settings, and a second window is never what the click
-                    // meant.
+                tray::TrayAction::OpenGui => {
                     // No duplicate check here: `panefx-gui` guards ITSELF on
                     // startup and exits early if one is already open, which
-                    // covers this path and every other way it gets launched.
-                    let exe = std::env::current_exe().ok();
-                    let sibling = exe
-                        .as_ref()
-                        .and_then(|e| e.parent())
-                        .map(|d| d.join(name));
-                    if let Some(sibling) = sibling {
-                        use std::os::windows::process::CommandExt;
-                        // CREATE_NEW_CONSOLE for the TUI: without it the TUI
-                        // inherits the daemon's (nonexistent) console and dies
-                        // immediately. The GUI is a windows-subsystem binary
-                        // and wants no console at all.
-                        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
-                        const DETACHED_PROCESS: u32 = 0x0000_0008;
-                        let flags = if want_gui {
-                            DETACHED_PROCESS
-                        } else {
-                            CREATE_NEW_CONSOLE
-                        };
-                        if let Err(e) = std::process::Command::new(&sibling)
-                            .creation_flags(flags)
-                            .spawn()
-                        {
-                            panefx::log_warn!("[panefx] could not open {name}: {e}");
+                    // covers this path and every other way it is launched.
+                    //
+                    // DETACHED_PROCESS: the GUI is a windows-subsystem binary
+                    // and wants no console at all.
+                    use std::os::windows::process::CommandExt;
+                    const DETACHED_PROCESS: u32 = 0x0000_0008;
+                    match find_gui() {
+                        Some(gui) => {
+                            if let Err(e) = std::process::Command::new(&gui)
+                                .creation_flags(DETACHED_PROCESS)
+                                .spawn()
+                            {
+                                panefx::log_warn!(
+                                    "[panefx] could not open the GUI at {}: {e}",
+                                    gui.display()
+                                );
+                            }
+                        }
+                        None => {
+                            // This was a real bug: GlazeWM starts the daemon
+                            // from ~\.glzr\glazewm\scripts\, but build.ps1
+                            // installs the GUI only to ~in\. Looking only
+                            // beside ourselves found nothing and the tray
+                            // click did nothing at all, silently.
+                            panefx::log_warn!(
+                                "[panefx] panefx-gui.exe not found next to the daemon, on PATH, or in ~\\bin -- run build.ps1 -Install"
+                            );
                         }
                     }
                 }
