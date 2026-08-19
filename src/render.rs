@@ -197,6 +197,35 @@ pub fn draw_animation(
     anim: &dyn AsciiAnimation,
     cfg: &crate::config::Config,
 ) {
+    // One animation is a stack of one. Kept as its own entry point because
+    // every terminal panel draws exactly one thing and should not pay for a
+    // slice indirection to say so.
+    draw_layers(panel, &[anim], cfg)
+}
+
+/// Draw a STACK of animations into one panel, bottom layer first.
+///
+/// The compositing rule is the one `cell_at` already had: **`None` means draw
+/// nothing here**, which on a stack means "let the layer below show through".
+/// So a layer stack needs no alpha, no blending and no second buffer -- walk
+/// the stack from the top and take the first cell that answers.
+///
+/// Top-down rather than painting bottom-up: painting every layer in turn would
+/// issue a GDI call per layer per cell, and the renderer is the hot path (see
+/// the HANDOFF). This way each cell costs one `ExtTextOutW` no matter how deep
+/// the stack is.
+///
+/// The background comes from the BOTTOM layer. It is the only one that can own
+/// it -- an upper layer's background would erase everything beneath it, which
+/// is precisely what a layer is not for.
+pub fn draw_layers(
+    panel: &mut crate::panel::Panel,
+    layers: &[&dyn AsciiAnimation],
+    cfg: &crate::config::Config,
+) {
+    let Some(anim) = layers.first().copied() else {
+        return;
+    };
     let hwnd = panel.hwnd;
     let (width, height) = (panel.width, panel.height);
     // The effect may ask for its own cell size (waves wants chunky cells), but
@@ -418,8 +447,12 @@ pub fn draw_animation(
             buckets.clear();
             let mut any = false;
             for col in 0..ncols {
-                let k = anim
-                    .cell_at(col, row as usize)
+                // Top-down: the first layer that answers wins the cell.
+                // `rev()` because `layers[0]` is the BOTTOM.
+                let k = layers
+                    .iter()
+                    .rev()
+                    .find_map(|l| l.cell_at(col, row as usize))
                     .map(|(ch, c)| (ch, c.colorref()));
                 row_cells[col] = k;
                 if let Some((_, c)) = k {

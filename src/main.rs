@@ -762,6 +762,27 @@ fn handle_command(
             Reply::with(snapshot(sim, cfg, wall))
         }
 
+        Command::WallpaperLayer {
+            monitor,
+            layer,
+            name,
+        } => {
+            let wanted = name.trim().to_lowercase();
+            // `off` is legal here and means "remove this layer", so it is
+            // checked before the effect-name validation.
+            if wanted != "off" && !animation::EFFECTS.contains(&wanted.as_str()) {
+                return Reply::err(format!("unknown effect '{name}'"));
+            }
+            if monitor == 0 {
+                return Reply::err("monitor 0 does not exist; DISPLAY<n> is 1-based".to_string());
+            }
+            cfg.set_wallpaper_layer(monitor, layer, &wanted);
+            // Rebuilt rather than patched in place: the stack's LENGTH changed,
+            // so the surface's sim list has to be rebuilt from the config.
+            wall.rebuild_surfaces(cfg);
+            Reply::with(snapshot(sim, cfg, wall))
+        }
+
         Command::WallpaperEffect { monitor, name } => {
             let wanted = name.trim().to_lowercase();
             if wanted != wallpaper::OFF && !animation::EFFECTS.contains(&wanted.as_str()) {

@@ -57,6 +57,18 @@ pub enum Command {
         monitor: Option<usize>,
         name: String,
     },
+    /// Point ONE LAYER of one monitor at an effect.
+    ///
+    /// Layer 0 is the base and is the same thing `wallpaper_effect` sets;
+    /// layers 1+ stack above it, nearer the viewer. `name: "off"` removes a
+    /// layer rather than storing a hole in the stack.
+    #[serde(rename = "wallpaper_layer")]
+    WallpaperLayer {
+        monitor: usize,
+        layer: usize,
+        name: String,
+    },
+
     /// Set one parameter on the DESKTOP's copy of an effect.
     ///
     /// `effect` is explicit rather than "whichever is current": each monitor

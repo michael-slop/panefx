@@ -309,8 +309,16 @@ pub struct MonitorSurface {
     /// full-screen bitmap, and at 1440x2560 that is ~14MB held for something
     /// nobody asked to see.
     pub panel: Option<Panel>,
+    /// The BOTTOM layer's effect. Kept as its own field because it is what
+    /// `is_on`, the config and the TUI have always meant by "this monitor's
+    /// effect"; the layers above it are additive.
     pub effect: String,
-    pub sim: Option<SimKey>,
+    /// One simulation per layer, bottom first.
+    ///
+    /// A single-effect monitor is a stack of one, so nothing special-cases the
+    /// common case. Empty means nothing is drawn -- an `off` monitor, or one
+    /// whose surface could not be built.
+    pub sims: Vec<SimKey>,
     pub occluded: bool,
     /// Forces one draw after becoming visible again, because a sim may report
     /// `changed() == false` on the resume frame and leave a stale bitmap.
@@ -423,7 +431,7 @@ impl WallpaperSet {
     pub fn rebuild_surfaces(&mut self, cfg: &Config) {
         // Drop old surfaces first so their GDI objects and sim refs go back.
         for s in self.surfaces.drain(..) {
-            if let Some(k) = s.sim {
+            for k in s.sims {
                 self.pool.release(&k);
             }
         }
@@ -441,7 +449,7 @@ impl WallpaperSet {
                 monitor: m,
                 panel: None,
                 effect,
-                sim: None,
+                sims: Vec::new(),
                 occluded: false,
                 force_redraw: true,
             };
@@ -470,13 +478,32 @@ impl WallpaperSet {
         let cols = (s.monitor.width / cw).max(1) as usize;
         let rows = (s.monitor.height / ch).max(1) as usize;
 
-        let key = SimKey {
-            monitor: s.monitor.index,
-            effect: s.effect.clone(),
-            cols,
-            rows,
+        // One simulation per layer, ALL ON THE SAME GRID.
+        //
+        // The grid comes from the bottom layer's preferred cell size, not each
+        // layer's own: the layers composite cell-for-cell into one panel, so a
+        // second grid would have nothing to align to. An upper layer that wants
+        // chunkier cells than the base simply draws at the base's resolution.
+        let stack = cfg.wallpaper_stack(s.monitor.index);
+        let stack = if stack.is_empty() {
+            // `effect` is the bottom layer and `is_on` already passed, so this
+            // only happens if the config and the surface disagree -- fall back
+            // to the surface's own effect rather than drawing nothing.
+            vec![s.effect.clone()]
+        } else {
+            stack
         };
-        self.pool.acquire(&key, cfg);
+        s.sims.clear();
+        for effect in stack {
+            let key = SimKey {
+                monitor: s.monitor.index,
+                effect,
+                cols,
+                rows,
+            };
+            self.pool.acquire(&key, cfg);
+            s.sims.push(key);
+        }
 
         // PARENT-RELATIVE coordinates: the surface is a CHILD of Explorer's
         // icon host, so a screen coordinate would land it off the parent's edge
@@ -504,7 +531,6 @@ impl WallpaperSet {
                     crate::log_warn!("[panefx] wallpaper: z-order for {} failed: {e}", s.monitor.device);
                 }
                 s.panel = Some(p);
-                s.sim = Some(key);
                 s.force_redraw = true;
             }
             Err(e) => {
@@ -512,7 +538,11 @@ impl WallpaperSet {
                     "[panefx] wallpaper: could not create a surface for {}: {e}",
                     s.monitor.device
                 );
-                self.pool.release(&key);
+                // Every layer, not one: a partial release leaks a simulation
+                // per failed monitor, and the pool never frees it.
+                for k in std::mem::take(&mut s.sims) {
+                    self.pool.release(&k);
+                }
             }
         }
     }
@@ -600,7 +630,7 @@ impl WallpaperSet {
         if let Some(w) = self.worker {
             if !desktop::is_alive(&w) {
                 for s in self.surfaces.drain(..) {
-                    if let Some(k) = s.sim {
+                    for k in s.sims {
                         self.pool.release(&k);
                     }
                 }
@@ -646,7 +676,7 @@ impl WallpaperSet {
             .surfaces
             .iter()
             .filter(|s| !s.occluded && s.panel.is_some())
-            .filter_map(|s| s.sim.clone())
+            .flat_map(|s| s.sims.iter().cloned())
             .collect();
         if live.is_empty() {
             return;
@@ -657,7 +687,11 @@ impl WallpaperSet {
             if s.occluded {
                 continue;
             }
-            let (Some(key), Some(panel)) = (s.sim.clone(), s.panel.as_mut()) else {
+            if s.sims.is_empty() {
+                continue;
+            }
+            let keys = s.sims.clone();
+            let Some(panel) = s.panel.as_mut() else {
                 continue;
             };
             // Explorer reorders and rebuilds its desktop children on theme
@@ -665,15 +699,26 @@ impl WallpaperSet {
             // our surface above the icons again. Cheap to re-assert; expensive
             // to debug when the icons silently vanish an hour later.
             let _ = panel.pin_behind_target();
-            if !(self.pool.dirty(&key) || s.force_redraw) {
+            // ANY layer moving means the frame changed -- a still layer above a
+            // moving one still has to be redrawn, because the redraw clears the
+            // panel before compositing.
+            if !(keys.iter().any(|k| self.pool.dirty(k)) || s.force_redraw) {
                 continue;
             }
-            let Some(sim) = self.pool.get(&key) else {
+            let layers: Vec<&dyn animation::AsciiAnimation> = keys
+                .iter()
+                .filter_map(|k| self.pool.get(k))
+                .map(|b| b as &dyn animation::AsciiAnimation)
+                .collect();
+            if layers.is_empty() {
                 continue;
-            };
-            let cell = Self::cell_for(sim, cfg);
+            }
+            // The BOTTOM layer owns the cell size and the background: it is the
+            // only one that can, since an upper layer's background would erase
+            // everything beneath it.
+            let cell = Self::cell_for(layers[0], cfg);
             let surface_cfg = Self::cfg_for_surface(cfg, cell);
-            crate::render::draw_animation(panel, sim, &surface_cfg);
+            crate::render::draw_layers(panel, &layers, &surface_cfg);
             s.force_redraw = false;
         }
     }
@@ -739,7 +784,7 @@ impl WallpaperSet {
             // Tear the old one down first: `off` must free the bitmap, not hide
             // it, and a changed effect may want a different grid entirely.
             let mut s = self.surfaces.remove(pos);
-            if let Some(k) = s.sim.take() {
+            for k in std::mem::take(&mut s.sims) {
                 self.pool.release(&k);
             }
             s.panel = None;
@@ -1086,7 +1131,7 @@ mod tests {
             monitor: m,
             panel: None,
             effect: "flames".into(),
-            sim: None,
+            sims: Vec::new(),
             occluded: false,
             force_redraw: true,
         }
@@ -1181,7 +1226,7 @@ mod tests {
         s.effect = "flames".into();
         let worker = set.worker.unwrap();
         set.build_surface(&mut s, &cfg, worker);
-        assert!(s.sim.is_none(), "no simulation for a zero-area monitor");
+        assert!(s.sims.is_empty(), "no simulation for a zero-area monitor");
         assert_eq!(set.sim_count(), 0);
     }
 

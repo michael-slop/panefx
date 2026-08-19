@@ -137,6 +137,21 @@ pub struct Config {
     /// literal `"off"` — means no surface at all for that monitor, so Windows'
     /// own wallpaper shows through.
     pub wallpaper_effects: std::collections::BTreeMap<usize, String>,
+
+    /// Extra wallpaper layers, keyed `monitor -> layer index -> effect`.
+    ///
+    /// Layer 0 is `wallpaper_effects` above and is written as
+    /// `wallpaper_<n>_effect`; layers 1+ live here as `wallpaper_<n>_layer<k>`.
+    /// Splitting them that way is what keeps every config written before layers
+    /// existed valid and unchanged -- a single-effect monitor is simply a stack
+    /// of one, and nothing has to be migrated.
+    ///
+    /// Higher index = nearer the viewer. `cell_at` returning `None` already
+    /// means "draw nothing here", so an upper layer's empty cells let the one
+    /// below show through with no alpha and no second buffer -- see
+    /// `render::draw_layers`.
+    pub wallpaper_layers:
+        std::collections::BTreeMap<usize, std::collections::BTreeMap<usize, String>>,
     /// Wallpaper cell size.
     ///
     /// SEPARATE from `cell_w`/`cell_h` on purpose. The terminal cell exists so
@@ -190,6 +205,7 @@ impl Default for Config {
             // EMPTY = wallpapers off. A new feature must not change what the
             // user already sees until they ask for it.
             wallpaper_effects: Default::default(),
+            wallpaper_layers: Default::default(),
             // 15x23 matches `waves::preferred_cell()`, which was tuned live
             // against the real thing and is also 57% fewer cells than 10x15.
             wallpaper_cell_w: 15,
@@ -233,6 +249,22 @@ pub fn cell_to_detail(w: i32, h: i32) -> u8 {
     (DETAIL_MIN..=DETAIL_MAX)
         .min_by_key(|d| (detail_to_cell(*d).0 - w).abs())
         .unwrap_or(5)
+}
+
+/// `wallpaper_3_layer2` -> `Some((3, 2))`. Anything else -> `None`.
+///
+/// Layer 0 is deliberately NOT accepted here: the base effect has its own key
+/// (`wallpaper_3_effect`), and allowing both spellings would let one config
+/// disagree with itself about the bottom of the stack.
+pub fn parse_wallpaper_layer_key(k: &str) -> Option<(usize, usize)> {
+    let rest = k.strip_prefix("wallpaper_")?;
+    let (num, tail) = rest.split_once('_')?;
+    let idx: usize = num.parse().ok()?;
+    let layer: usize = tail.strip_prefix("layer")?.parse().ok()?;
+    if idx == 0 || layer == 0 {
+        return None;
+    }
+    Some((idx, layer))
 }
 
 /// `wallpaper_3_effect` -> `Some(3)`. Anything else -> `None`.
@@ -478,6 +510,14 @@ impl Config {
                 self.wallpaper_effects.insert(idx, v.to_lowercase());
                 continue;
             }
+            // `wallpaper_<n>_layer<k>` -- an extra layer above the base effect.
+            if let Some((idx, layer)) = parse_wallpaper_layer_key(&k) {
+                self.wallpaper_layers
+                    .entry(idx)
+                    .or_default()
+                    .insert(layer, v.to_lowercase());
+                continue;
+            }
 
             match k.as_str() {
                 "font" => self.font = v.to_string(),
@@ -706,6 +746,13 @@ impl Config {
         for (idx, eff) in &self.wallpaper_effects {
             s.push_str(&format!("wallpaper_{idx}_effect = \"{eff}\"\n"));
         }
+        // Extra layers, after the base effects so the file reads bottom-up the
+        // way the stack composites.
+        for (idx, layers) in &self.wallpaper_layers {
+            for (layer, eff) in layers {
+                s.push_str(&format!("wallpaper_{idx}_layer{layer} = \"{eff}\"\n"));
+            }
+        }
 
         if !self.effect_params.is_empty() {
             s.push_str("\n# --- per-effect parameters ------------------------------------------\n");
@@ -838,6 +885,51 @@ impl Config {
     ///
     /// Deliberately a separate map from `set_effect_param`: tuning the desktop
     /// must not move the terminal backdrop, which is the whole point.
+    /// Every layer for one monitor, bottom first.
+    ///
+    /// The base effect, then any extra layers in index order. `off` layers are
+    /// dropped rather than kept as holes: an off layer contributes nothing and
+    /// carrying it would make the stack's length lie about what is drawn.
+    pub fn wallpaper_stack(&self, monitor: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(base) = self.wallpaper_effects.get(&monitor) {
+            if base != "off" {
+                out.push(base.clone());
+            }
+        }
+        if let Some(extra) = self.wallpaper_layers.get(&monitor) {
+            out.extend(extra.values().filter(|e| *e != "off").cloned());
+        }
+        out
+    }
+
+    /// Point one layer of one monitor at an effect.
+    ///
+    /// Layer 0 writes the base effect, so the two storages cannot disagree
+    /// about what the bottom of the stack is.
+    pub fn set_wallpaper_layer(&mut self, monitor: usize, layer: usize, effect: &str) {
+        let e = effect.trim().to_lowercase();
+        if layer == 0 {
+            self.wallpaper_effects.insert(monitor, e);
+            return;
+        }
+        if e == "off" {
+            // Removed, not stored as "off": a stack with holes in it is a
+            // different thing to reason about, and nothing needs one.
+            if let Some(m) = self.wallpaper_layers.get_mut(&monitor) {
+                m.remove(&layer);
+                if m.is_empty() {
+                    self.wallpaper_layers.remove(&monitor);
+                }
+            }
+            return;
+        }
+        self.wallpaper_layers
+            .entry(monitor)
+            .or_default()
+            .insert(layer, e);
+    }
+
     pub fn set_wallpaper_effect_param(&mut self, effect: &str, key: &str, value: String) {
         self.wallpaper_effect_params
             .entry(effect.to_lowercase())
@@ -1477,6 +1569,108 @@ ink = \"#0000ff\"");
         let mut back = Config::default();
         back.apply_toml(&c.to_toml());
         assert!(back.pane_off, "pane_off did not survive a save/load");
+    }
+
+    #[test]
+    fn a_single_effect_monitor_is_a_stack_of_one() {
+        // What keeps every config written before layers existed valid: the base
+        // effect IS layer 0, so nothing needs migrating and a monitor that has
+        // never heard of layers behaves exactly as it did.
+        let mut c = Config::default();
+        c.wallpaper_effects.insert(3, "waves".into());
+        assert_eq!(c.wallpaper_stack(3), vec!["waves".to_string()]);
+    }
+
+    #[test]
+    fn layers_stack_bottom_first() {
+        // Michael's example: flames on the bottom, the skull above it. The
+        // ORDER is the feature -- reversed, the skull is behind the fire.
+        let mut c = Config::default();
+        c.set_wallpaper_layer(2, 0, "flames");
+        c.set_wallpaper_layer(2, 1, "skullspin");
+        assert_eq!(
+            c.wallpaper_stack(2),
+            vec!["flames".to_string(), "skullspin".to_string()]
+        );
+    }
+
+    #[test]
+    fn layer_zero_writes_the_base_effect() {
+        // The two storages must not be able to disagree about the bottom of the
+        // stack, so layer 0 is routed to `wallpaper_effects` rather than stored
+        // separately.
+        let mut c = Config::default();
+        c.set_wallpaper_layer(1, 0, "rain");
+        assert_eq!(c.wallpaper_effects.get(&1).map(String::as_str), Some("rain"));
+        assert!(c.wallpaper_layers.get(&1).is_none());
+    }
+
+    #[test]
+    fn an_off_layer_is_removed_not_stored_as_a_hole() {
+        // A stack with holes in it is a different thing to reason about, and
+        // its length would lie about what is actually drawn.
+        let mut c = Config::default();
+        c.set_wallpaper_layer(1, 0, "waves");
+        c.set_wallpaper_layer(1, 1, "skullspin");
+        c.set_wallpaper_layer(1, 2, "plasma");
+        assert_eq!(c.wallpaper_stack(1).len(), 3);
+        c.set_wallpaper_layer(1, 1, "off");
+        assert_eq!(
+            c.wallpaper_stack(1),
+            vec!["waves".to_string(), "plasma".to_string()],
+            "removing a middle layer must close the gap, not leave a hole"
+        );
+        // And the map itself is cleaned up when the last extra layer goes.
+        c.set_wallpaper_layer(1, 2, "off");
+        assert!(c.wallpaper_layers.get(&1).is_none());
+    }
+
+    #[test]
+    fn an_off_base_effect_means_nothing_is_drawn() {
+        // `off` has always meant "no surface at all", and layers must not
+        // resurrect a monitor the user switched off.
+        let mut c = Config::default();
+        c.set_wallpaper_layer(4, 0, "off");
+        assert!(c.wallpaper_stack(4).is_empty());
+    }
+
+    #[test]
+    fn layers_round_trip_through_toml() {
+        let mut c = Config::default();
+        c.set_wallpaper_layer(3, 0, "flames");
+        c.set_wallpaper_layer(3, 1, "skullspin");
+        c.set_wallpaper_layer(1, 1, "tunnel");
+        let mut back = Config::default();
+        back.apply_toml(&c.to_toml());
+        assert_eq!(back.wallpaper_stack(3), c.wallpaper_stack(3));
+        assert_eq!(back.wallpaper_layers, c.wallpaper_layers);
+    }
+
+    #[test]
+    fn parse_wallpaper_layer_key_is_strict() {
+        assert_eq!(parse_wallpaper_layer_key("wallpaper_3_layer2"), Some((3, 2)));
+        // Layer 0 has its own key; accepting both spellings would let one
+        // config disagree with itself about the bottom of the stack.
+        assert_eq!(parse_wallpaper_layer_key("wallpaper_3_layer0"), None);
+        // Monitor 0 does not exist -- DISPLAY<n> is 1-based.
+        assert_eq!(parse_wallpaper_layer_key("wallpaper_0_layer1"), None);
+        // And the base-effect key must not be claimed by this parser.
+        assert_eq!(parse_wallpaper_layer_key("wallpaper_3_effect"), None);
+        assert_eq!(parse_wallpaper_layer_key("wallpaper_x_layer1"), None);
+        assert_eq!(parse_wallpaper_layer_key("wallpaper_3_layerx"), None);
+    }
+
+    #[test]
+    fn the_two_wallpaper_key_parsers_do_not_collide() {
+        // Both start with `wallpaper_<n>_`, so whichever ran second would win
+        // silently if they overlapped.
+        let mut c = Config::default();
+        c.apply_toml("wallpaper_3_effect = \"waves\"\nwallpaper_3_layer1 = \"skullspin\"");
+        assert_eq!(c.wallpaper_effects.get(&3).map(String::as_str), Some("waves"));
+        assert_eq!(
+            c.wallpaper_layers[&3].get(&1).map(String::as_str),
+            Some("skullspin")
+        );
     }
 
     #[test]
