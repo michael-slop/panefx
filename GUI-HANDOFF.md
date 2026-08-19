@@ -354,3 +354,46 @@ and the WinLibs mingw64 `bin` on PATH.
 * **Live previews** (step 4 of the original plan) — the only unfinished item.
 * Params are stored per (monitor, effect), not per layer: two layers running
   the same effect on one monitor share their knobs.
+
+## OPEN: one Alacritty window shows the pane effect, the other does not
+
+Reported 2026-08-19. **Not solved.** Paused mid-investigation; this is what is
+established so far, so the next session does not start over.
+
+### Ruled OUT, with evidence
+
+* **panefx is not skipping a window.** The daemon reports a pane for both:
+  `hwnd 3083162 visible true 1912x1044` and `hwnd 5574520 visible true
+  1432x2552`. Run `REPORT.exe`, or `{"cmd":"get"}` and read `panes` -- that
+  field was added for this and did not exist before.
+* **Both panes are correctly positioned and sized.** Each pane's window rect
+  matches its terminal's exactly.
+* **Both are pinned correctly.** `GetWindow(alacritty, GW_HWNDNEXT)` returns a
+  `PaneFxClass` window for BOTH -- the pane is directly behind its terminal in
+  z-order, which is the whole job of `pin_behind_target`.
+* **The effect IS drawing.** Cropping the BOTTOM of the windows (flames is a
+  bottom band, not a full-height fire -- easy to miss with a top crop) shows the
+  grey `)))` glyphs on one window.
+* **Not the colours.** flames is configured in greys; through a 35%-opacity
+  terminal `c_hot` composites to about rgb(133,134,134), which is plainly
+  visible against the rgb(20,20,20) background measured on the failing window.
+
+### What that leaves
+
+Identical pane state on both, effect visible on one. That points at the
+TERMINAL in front rather than the backdrop behind -- most likely the window's
+own transparency. panefx sets opacity by rewriting `alacritty.toml` and relying
+on `live_config_reload`; a window that did not pick the change up would be
+opaque and hide a perfectly good backdrop.
+
+### The next thing to check
+
+Whether the failing window is actually transparent. The two Alacritty processes
+started ~2h apart (12:43 and 14:33), and the config was last written at 14:35 --
+so both should have reloaded, but that is an assumption, not a measurement.
+Compare `GetLayeredWindowAttributes` / DWM state between the two windows, or
+simply restart the older one and see whether the effect appears.
+
+Worth knowing: the config on disk is Michael's own saved state. An earlier
+`revert` restored it exactly, and the greys are not something this session
+introduced.
