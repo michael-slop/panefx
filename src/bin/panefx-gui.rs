@@ -148,14 +148,19 @@ enum Tab {
     /// The desktop wallpaper, per monitor. Needs nothing.
     Wallpaper,
     Logs,
+    /// Global settings: frame rate, cell size, opacity. These belong to the
+    /// whole daemon rather than to one monitor or one effect, which is why
+    /// they are not on the wallpaper tab.
+    Settings,
 }
 
 impl Tab {
-    const ALL: [Tab; 3] = [Tab::Panes, Tab::Wallpaper, Tab::Logs];
+    const ALL: [Tab; 4] = [Tab::Panes, Tab::Wallpaper, Tab::Settings, Tab::Logs];
     fn label(self) -> &'static str {
         match self {
             Tab::Panes => "TUI-fx",
             Tab::Wallpaper => "wallpaper",
+            Tab::Settings => "settings",
             Tab::Logs => "logs",
         }
     }
@@ -169,6 +174,7 @@ impl Tab {
         match self {
             Tab::Panes => "panes",
             Tab::Wallpaper => "wallpaper",
+            Tab::Settings => "settings",
             Tab::Logs => "logs",
         }
     }
@@ -439,6 +445,7 @@ impl App {
             Daemon::Up(_) => match self.tab {
                 Tab::Panes => self.panes_tab(&mut inner, p),
                 Tab::Wallpaper => self.wallpaper_tab(&mut inner, p),
+                Tab::Settings => self.settings_tab(&mut inner, p),
                 Tab::Logs => self.logs_tab(&mut inner, p),
             },
         }
@@ -551,11 +558,13 @@ impl App {
         ui.horizontal(|ui| {
             ui.label("effect:");
             let effects = self.effects();
-            for e in &effects {
-                if ui.selectable_label(*e == effect, e).clicked() {
-                    self.send(serde_json::json!({"cmd":"effect","name":e}));
+            ui.push_id("pane_effect_row", |ui| {
+                for e in &effects {
+                    if ui.selectable_label(*e == effect, e).clicked() {
+                        self.send(serde_json::json!({"cmd":"effect","name":e}));
+                    }
                 }
-            }
+            });
         });
         ui.add_space(8.0);
         let params: Vec<panefx::animation::Param> = self
@@ -740,27 +749,36 @@ impl App {
         ui.label(egui::RichText::new("set the base effect").color(p.muted));
         let effects = self.effects();
         let base = layers.first().cloned().unwrap_or_else(|| "off".into());
-        ui.horizontal_wrapped(|ui| {
-            for e in std::iter::once("off".to_string()).chain(effects.iter().cloned()) {
-                if ui.selectable_label(e == base, &e).clicked() {
-                    self.send(serde_json::json!({
-                        "cmd":"wallpaper_effect","monitor":idx,"name":e
-                    }));
+        // push_id("base"): this row and the "add a layer above" row below draw
+        // the SAME effect names, and egui derives a widget's id from its label
+        // text. Identical labels in one panel collide, and egui then attributes
+        // one button's interaction state to the other -- which is why buttons
+        // appeared to move around and respond to the wrong click.
+        ui.push_id("base_effect_row", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for e in std::iter::once("off".to_string()).chain(effects.iter().cloned()) {
+                    if ui.selectable_label(e == base, &e).clicked() {
+                        self.send(serde_json::json!({
+                            "cmd":"wallpaper_effect","monitor":idx,"name":e
+                        }));
+                    }
                 }
-            }
+            });
         });
 
         ui.add_space(8.0);
         ui.label(egui::RichText::new("add a layer above").color(p.muted));
         let next = layers.len().max(1);
-        ui.horizontal_wrapped(|ui| {
-            for e in self.effects() {
-                if ui.button(&e).clicked() {
-                    self.send(serde_json::json!({
-                        "cmd":"wallpaper_layer","monitor":idx,"layer":next,"name":e
-                    }));
+        ui.push_id("add_layer_row", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for e in self.effects() {
+                    if ui.button(&e).clicked() {
+                        self.send(serde_json::json!({
+                            "cmd":"wallpaper_layer","monitor":idx,"layer":next,"name":e
+                        }));
+                    }
                 }
-            }
+            });
         });
 
         ui.add_space(10.0);
@@ -821,6 +839,14 @@ impl App {
         let label_w = 150.0;
 
         for param in params {
+            // Scope every knob by (monitor, layer, param). Two layers running
+            // the SAME effect produce identical param labels, and egui derives
+            // a widget's id from its label -- so without this, dragging one
+            // layer's "flame height" could drive the other's.
+            //
+            // The id must WRAP the widgets, not sit beside them: an empty
+            // push_id scope would compile and do nothing at all.
+            ui.push_id((scope, layer, param.key.as_str()), |ui| {
             ui.horizontal(|ui| {
                 ui.allocate_ui(Vec2::new(label_w, 22.0), |ui| {
                     ui.label(egui::RichText::new(&param.label).size(12.0));
@@ -865,6 +891,7 @@ impl App {
                         ui.label(egui::RichText::new(v).size(11.0).color(p.muted));
                     }
                 }
+            });
             });
 
         }
@@ -985,7 +1012,7 @@ impl App {
             });
 
         for to in targets {
-            self.copy_stack(&source, to);
+            self.copy_stack(from, &source, to);
             self.status = format!("copied DISPLAY{from} to DISPLAY{to}");
         }
         if !open {
@@ -994,7 +1021,8 @@ impl App {
     }
 
     /// Replace one monitor's whole stack with `source`.
-    fn copy_stack(&mut self, source: &[String], to: usize) {
+    fn copy_stack(&mut self, from: usize, source: &[String], to: usize) {
+        use panefx::animation::ParamValue;
         // Clear DOWN from the top first. Setting the base while old upper
         // layers survive would leave a taller stack than was copied -- the
         // sheet says "make it look like that one", so leftovers are wrong.
@@ -1021,6 +1049,33 @@ impl App {
             self.send(serde_json::json!({
                 "cmd":"wallpaper_layer","monitor":to,"layer":l,"name":effect
             }));
+        }
+
+        // ...and the SETTINGS, not just the effect names.
+        //
+        // Copying only the names was wrong: params are stored per (monitor,
+        // effect), so the target screen kept whatever values it already had for
+        // that effect -- or fell back to defaults. "Copy to" plainly means make
+        // that screen look like this one, and a flames layer tuned to a
+        // different palette and height is not the same wallpaper.
+        //
+        // Sent AFTER the layers, because a param for an effect the target is
+        // not yet running has nowhere to land.
+        for (l, effect) in source.iter().enumerate() {
+            for param in self.layer_params(from, l) {
+                let val = match &param.value {
+                    ParamValue::Int { v } => serde_json::json!({"kind":"int","v":v}),
+                    ParamValue::Colour { r, g, b } => {
+                        serde_json::json!({"kind":"colour","r":r,"g":g,"b":b})
+                    }
+                    // Text params are read-only in this UI; nothing to copy.
+                    ParamValue::Text { .. } => continue,
+                };
+                self.send(serde_json::json!({
+                    "cmd":"wallpaper_param","monitor":to,"effect":effect,
+                    "key":param.key,"val":val
+                }));
+            }
         }
     }
 
@@ -1138,6 +1193,172 @@ impl App {
             .and_then(|m| m.get(format!("{idx}:{layer}")))
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default()
+    }
+
+    /// Global settings -- the daemon's own, not one monitor's.
+    ///
+    /// These were in the TUI and were never carried across when the GUI was
+    /// built, so the GUI could set every effect and colour but could not change
+    /// the frame rate. Same keys, same ranges, same `Set` command the TUI
+    /// sends, so the two cannot drift apart.
+    fn settings_tab(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        ui.label(egui::RichText::new("global settings").size(16.0));
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new("these apply to the whole of panefx, not one monitor")
+                .size(11.0)
+                .color(p.muted),
+        );
+        ui.add_space(10.0);
+
+        // key, label, min, max, and the one-line reason it matters. The hint is
+        // the point of having this in a GUI rather than a config file.
+        const ROWS: [(&str, &str, i64, i64, &str); 11] = [
+            ("fps", "frame rate", 1, 120, "how often panefx redraws. The wallpaper cannot exceed this."),
+            ("wallpaper_fps", "wallpaper fps", 1, 120, "the desktop layer's own rate, capped by the frame rate above."),
+            ("opacity", "bg opacity %", 10, 100, "background of the windows panefx draws behind. Text stays solid."),
+            ("cell_w", "cell width", 1, 64, "the character cell. Effects that want their own size are overridden by this."),
+            ("cell_h", "cell height", 1, 64, ""),
+            ("pad_x", "pad x", 0, 100, ""),
+            ("pad_y", "pad y", 0, 100, ""),
+            ("crop_top", "crop top (px)", 0, 2000, "hide this many pixels at the top -- for a taskbar or a notch."),
+            ("rotate_secs", "rotate every (s)", 0, 3600, "cycle through effects automatically. 0 = never."),
+            ("wallpaper_cell_w", "wp cell width", 1, 64, "the desktop layer's own cell, set directly."),
+            ("wallpaper_cell_h", "wp cell height", 1, 64, ""),
+        ];
+
+        let label_w = 130.0;
+
+        // `detail` leads, and is handled separately: it is an INDEX into a
+        // ladder of cell sizes, so the number alone means nothing. One lever
+        // for "make it finer" instead of two numbers you have to keep in
+        // proportion by hand -- the raw wp cell rows below stay for anyone who
+        // wants an exact size.
+        if let Some(d) = self
+            .snap
+            .get("config")
+            .and_then(|c| c.get("wallpaper_detail"))
+            .and_then(|v| v.as_i64())
+        {
+            ui.horizontal(|ui| {
+                ui.allocate_ui(Vec2::new(label_w, 22.0), |ui| {
+                    ui.label(egui::RichText::new("detail").size(12.0));
+                });
+                let width = (ui.available_width() - 110.0).max(80.0);
+                if let Some(nv) = win98::fader(
+                    ui,
+                    p,
+                    d,
+                    panefx::config::DETAIL_MIN as i64,
+                    panefx::config::DETAIL_MAX as i64,
+                    width,
+                ) {
+                    self.send(serde_json::json!({"cmd":"set","key":"wallpaper_detail","val":nv}));
+                    self.dirty = true;
+                }
+                let (cw, ch) = panefx::config::detail_to_cell(d as u8);
+                ui.label(egui::RichText::new(format!("{d}  -> {cw}x{ch}px")).size(12.0));
+            });
+            ui.horizontal(|ui| {
+                ui.add_space(label_w + 4.0);
+                ui.label(
+                    egui::RichText::new("coarser cells are cheaper to draw; finer ones cost more")
+                        .size(10.0)
+                        .color(p.muted),
+                );
+            });
+            ui.add_space(4.0);
+        }
+
+        for (key, label, min, max, hint) in ROWS {
+            let cur = self
+                .snap
+                .get("config")
+                .and_then(|c| c.get(key))
+                .and_then(|v| v.as_i64());
+            let Some(cur) = cur else {
+                continue;
+            };
+            ui.horizontal(|ui| {
+                ui.allocate_ui(Vec2::new(label_w, 22.0), |ui| {
+                    ui.label(egui::RichText::new(label).size(12.0));
+                });
+                let width = (ui.available_width() - 60.0).max(80.0);
+                if let Some(nv) = win98::fader(ui, p, cur, min, max, width) {
+                    self.send(serde_json::json!({"cmd":"set","key":key,"val":nv}));
+                    self.dirty = true;
+                }
+                ui.label(egui::RichText::new(format!("{cur}")).size(12.0));
+            });
+            if !hint.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.add_space(label_w + 4.0);
+                    ui.label(egui::RichText::new(hint).size(10.0).color(p.muted));
+                });
+            }
+            ui.add_space(4.0);
+        }
+
+        // The daemon caps the wallpaper at its own frame rate. Saying so beats
+        // showing a number the screen is not delivering.
+        let asked = self
+            .snap
+            .get("config")
+            .and_then(|c| c.get("wallpaper_fps"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let eff = self
+            .snap
+            .get("config")
+            .and_then(|c| c.get("wallpaper_fps_effective"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        if eff > 0 && eff < asked {
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(format!(
+                    "note: the wallpaper is capped to {eff} fps by the frame rate above"
+                ))
+                .size(11.0)
+                .color(p.warn),
+            );
+        }
+
+        ui.add_space(12.0);
+        // backdrops on/off is a toggle, not a range -- a 0..1 fader would be a
+        // strange way to spell a switch.
+        let off = self
+            .snap
+            .get("config")
+            .and_then(|c| c.get("pane_off"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        ui.horizontal(|ui| {
+            ui.allocate_ui(Vec2::new(label_w, 22.0), |ui| {
+                ui.label(egui::RichText::new("backdrops").size(12.0));
+            });
+            let (rect, resp) =
+                ui.allocate_exact_size(Vec2::new(90.0, 22.0), egui::Sense::click());
+            // Pushed in when ON, matching every other toggle in the window.
+            win98::bevel(
+                ui.painter(),
+                rect,
+                win98::toggle_bevel(!off),
+                p,
+                Some(win98::toggle_face(!off, p)),
+            );
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                if off { "off" } else { "on" },
+                egui::FontId::new(win98::size::TEXT, egui::FontFamily::Monospace),
+                p.text,
+            );
+            if resp.clicked() {
+                self.send(serde_json::json!({"cmd":"set","key":"pane_off","val": !off}));
+                self.dirty = true;
+            }
+        });
     }
 
     fn logs_tab(&mut self, ui: &mut egui::Ui, p: &Palette) {
