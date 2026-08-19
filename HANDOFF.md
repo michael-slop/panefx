@@ -54,7 +54,7 @@ machinery is content-agnostic.
 | `src/desktop.rs` | WorkerW discovery + monitor enumeration |
 | `src/wallpaper.rs` | Per-monitor surfaces, sim pool, occlusion freeze |
 
-**110 unit tests passing. Verified visually on screen, not just by exit code.**
+**207 unit tests passing. Verified visually on screen, not just by exit code.**
 
 **The critical tests are sabotage-checked** — each was re-run against a
 deliberately reintroduced bug to confirm it actually fails. A test that cannot
@@ -585,16 +585,21 @@ built-in video-wallpaper feature in 25H2 and third-party wallpapers are now
 reported as being treated as ordinary windows; other wallpaper apps hit the same
 wall on this build.
 
-So the daemon logs a named reason and carries on with terminal backdrops, and
-the TUI's Wallpaper tab explains what happened rather than showing an empty
-list. **Every failure path here is a named error, never a silent `None`** —
-that is deliberate, because "no wallpaper" and "panefx is broken" must not look
-alike. The code is complete and tested; it will light up on any build that still
-provides the layer.
+**Superseded — the wallpaper DOES work on 26200.** The `0x052C` finding above is
+still accurate (no WorkerW is ever spawned), but it turned out not to be the only
+route: the surface is created as a `WS_CHILD` of Explorer's icon host and
+presented through DirectComposition, so no spawned layer is needed. Measured
+running on all four of pHub's monitors.
 
-Do NOT "fix" this by pinning a fullscreen window to `HWND_BOTTOM`. That sits
-above the wallpaper but below nothing, so it hides the desktop icons — a
-different feature, not a fallback.
+The failure-path discipline described here still stands: **every failure is a
+named error, never a silent `None`**, because "no wallpaper" and "panefx is
+broken" must not look alike.
+
+Do NOT "fix" anything here by pinning a fullscreen window to `HWND_BOTTOM`. For a
+CHILD window `HWND_BOTTOM` means the bottom of the PARENT's child list, which is
+what correctly puts the surface under `SysListView32`; for a TOP-LEVEL window it
+sits above the desktop background but below nothing, hiding the icons. The two
+are not the same operation — see `panel::pin_behind_target`.
 
 ### The three traps, each with a regression test
 

@@ -536,9 +536,66 @@ fn handle_command(
                 label: m.monitor.label(),
                 effect: m.effect.clone(),
                 occluded: m.occluded,
+                geometry: m.panel.as_ref().map(|p| {
+                    let (sw, sh) = p
+                        .surface
+                        .as_ref()
+                        .map(|s| s.size())
+                        .unwrap_or((-1, -1));
+                    let (dw, dh, ds) = p
+                        .gdi
+                        .as_ref()
+                        .map(|g| (g.bmp_w, g.bmp_h, g.stride))
+                        .unwrap_or((-1, -1, 0));
+                    let cell = wallpaper::WallpaperSet::cell_for(
+                        &*animation::build(&m.effect, 1, 1, 0x5EED_1234, cfg),
+                        cfg,
+                    );
+                    // Every pair that must agree. The DIB is allowed to be
+                    // absent (-1) before the first frame is drawn; anything
+                    // else disagreeing is the defect.
+                    let drawn = dw > 0 && dh > 0;
+                    let consistent = p.width == m.monitor.width
+                        && p.height == m.monitor.height
+                        && sw == m.monitor.width
+                        && sh == m.monitor.height
+                        && (!drawn
+                            || (dw == m.monitor.width
+                                && dh == m.monitor.height
+                                && ds >= (m.monitor.width as usize) * 4));
+                    control::MonitorGeometry {
+                        monitor_w: m.monitor.width,
+                        monitor_h: m.monitor.height,
+                        panel_w: p.width,
+                        panel_h: p.height,
+                        dib_w: dw,
+                        dib_h: dh,
+                        dib_stride: ds,
+                        surface_w: sw,
+                        surface_h: sh,
+                        cell_w: cell.0,
+                        cell_h: cell.1,
+                        consistent,
+                        presents: p.surface.as_ref().map(|s| s.presents()).unwrap_or(0),
+                        present_us: p.surface.as_ref().map(|s| s.present_us()).unwrap_or(0),
+                        dxgi_presented: p
+                            .surface
+                            .as_ref()
+                            .and_then(|s| s.frame_stats())
+                            .map(|(c, _)| c)
+                            .unwrap_or(0),
+                        dxgi_refresh: p
+                            .surface
+                            .as_ref()
+                            .and_then(|s| s.frame_stats())
+                            .map(|(_, r)| r)
+                            .unwrap_or(0),
+                    }
+                }),
             })
             .collect(),
         wallpaper_error: wall.error.clone(),
+        pin_calls: panel::PIN_CALLS.load(std::sync::atomic::Ordering::Relaxed),
         // Params for every effect in use on any monitor.
         //
         // Built from a throwaway 1x1 instance rather than read off a pooled

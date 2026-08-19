@@ -101,6 +101,11 @@ pub struct Snapshot {
     /// Why there is no wallpaper layer. Absent when it is working.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wallpaper_error: Option<String>,
+    /// Total z-order SetWindowPos calls issued by desktop panes since start.
+    /// See `panel::PIN_CALLS` -- a steady climb is the panes fighting over the
+    /// single bottom z-slot.
+    pub pin_calls: u64,
+
     /// The desktop's own params, for every effect any monitor is running.
     ///
     /// Keyed by effect name because monitors can differ. The daemon does not
@@ -121,6 +126,56 @@ pub struct WallpaperMonitorView {
     /// Fully covered, and therefore frozen. Surfaced so "why isn't it moving"
     /// is answerable at a glance rather than looking like a bug.
     pub occluded: bool,
+
+    /// The monitor rect, the panel, the DIB and the composition surface --
+    /// the four sizes that must agree.
+    ///
+    /// Reported because a wallpaper defect that only affects SOME monitors is
+    /// almost always one of these disagreeing, and from a shell that cannot see
+    /// the desktop there is no other way to compare them. `None` for an `off`
+    /// monitor, which has no panel at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub geometry: Option<MonitorGeometry>,
+}
+
+/// The four sizes behind one wallpaper surface, for diagnosis.
+#[derive(Debug, Serialize)]
+pub struct MonitorGeometry {
+    /// From `EnumDisplayMonitors` -- what Windows says the screen is.
+    pub monitor_w: i32,
+    pub monitor_h: i32,
+    /// The panel window's own size.
+    pub panel_w: i32,
+    pub panel_h: i32,
+    /// The GDI DIB the renderer draws into, and its row length in bytes.
+    pub dib_w: i32,
+    pub dib_h: i32,
+    pub dib_stride: usize,
+    /// The composition surface's swapchain size.
+    pub surface_w: i32,
+    pub surface_h: i32,
+    /// Cell size in use, and the grid it produces.
+    pub cell_w: i32,
+    pub cell_h: i32,
+    /// True when every pair above agrees. A `false` here is the bug.
+    pub consistent: bool,
+    /// Frames presented for this surface since the daemon started.
+    ///
+    /// Sample twice, a known interval apart, and the difference is the real
+    /// present rate for THIS monitor. That is what separates "the flash is our
+    /// frames landing" from "the flash is DWM recomposing an output we are not
+    /// touching".
+    pub presents: u64,
+    /// Cumulative microseconds spent inside `present` for this surface.
+    /// Divided by `presents`, this is the mean cost of putting one frame on
+    /// THIS monitor.
+    pub present_us: u64,
+    /// DXGI `PresentCount` -- frames this swapchain has accepted from us.
+    pub dxgi_presented: u32,
+    /// DXGI `PresentRefreshCount` -- the display refresh the last frame landed
+    /// on. Compared across two samples, a monitor whose refresh count advances
+    /// far faster than its present count is dropping our frames.
+    pub dxgi_refresh: u32,
 }
 
 /// The subset of `Config` the TUI can see and edit. Flat and stringly-typed on

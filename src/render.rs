@@ -8,14 +8,15 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateSolidBrush,
-    DeleteDC, DeleteObject, FillRect, GetDC, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
+    DeleteDC, DeleteObject, FillRect, GdiFlush, GetDC, ReleaseDC, SelectObject, SetBkMode,
+    SetTextColor,
     ExtTextOutW, ETO_OPTIONS, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY,
     DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, FF_DONTCARE, FW_NORMAL, HBITMAP, HBRUSH, HDC,
     HFONT, HGDIOBJ, OUT_TT_PRECIS, SRCCOPY, TRANSPARENT,
 };
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::animation::AsciiAnimation;
 
@@ -85,6 +86,45 @@ thread_local! {
     /// pump run on the same thread (see `main.rs`), so this is never shared.
     static REPAINT: RefCell<HashMap<isize, (isize, i32, i32)>> =
         RefCell::new(HashMap::new());
+
+    /// Desktop surfaces that Windows has asked to repaint, by `HWND`.
+    ///
+    /// A desktop surface must NEVER be repaired the way `REPAINT` repairs a
+    /// terminal panel. It carries `WS_EX_NOREDIRECTIONBITMAP` (see
+    /// `panel::create_anchored`), so it has no redirection bitmap to `BitBlt`
+    /// into at all -- and even if it had one, GDI leaves alpha at 0 and the
+    /// raised desktop composites with alpha, which is the additive-blend trap
+    /// the whole `compositor` module exists to avoid. Blitting there puts a
+    /// visibly wrong frame on screen for an instant: a flash.
+    ///
+    /// So `WM_PAINT` only RECORDS the damage here, and the wallpaper's own tick
+    /// drains it and redraws through the compositor. That keeps every D3D call
+    /// on the render thread, and costs at most one wallpaper frame of latency
+    /// (100ms at the default 10fps) before the damage is repaired properly.
+    static DESKTOP_DAMAGE: RefCell<HashSet<isize>> = RefCell::new(HashSet::new());
+}
+
+/// Record that a desktop surface needs redrawing (called from `WM_PAINT`).
+pub fn note_desktop_damage(hwnd: HWND) {
+    DESKTOP_DAMAGE.with(|d| {
+        d.borrow_mut().insert(hwnd.0 as isize);
+    });
+}
+
+/// Take the damaged-surface set, leaving it empty.
+///
+/// Drained rather than read so a surface that is damaged repeatedly between two
+/// ticks is redrawn once, not once per `WM_PAINT`.
+pub fn take_desktop_damage() -> HashSet<isize> {
+    DESKTOP_DAMAGE.with(|d| std::mem::take(&mut *d.borrow_mut()))
+}
+
+/// Forget any recorded damage for `hwnd`, so a destroyed panel's `HWND` cannot
+/// linger and match a future window that happens to reuse the handle value.
+pub fn forget_desktop_damage(hwnd: HWND) {
+    DESKTOP_DAMAGE.with(|d| {
+        d.borrow_mut().remove(&(hwnd.0 as isize));
+    });
 }
 
 /// Record where `hwnd`'s last frame lives, so `WM_PAINT` can restore it.
@@ -458,6 +498,28 @@ pub fn draw_animation(
         // Explorer's wallpaper rather than a replacement. Measured on build
         // 26200: a (100,100,100) fill over a (9,26,54) desktop pixel read back
         // (109,126,154) via GDI and (100,100,100) via DirectComposition.
+        // FLUSH BEFORE READING THE BITS. Not optional, and not a no-op.
+        //
+        // The frame above is drawn with batched GDI calls (`FillRect` plus one
+        // `ExtTextOutW` per colour run per row), and `present` below reads the
+        // DIB section's memory directly. `CreateDIBSection`'s documentation is
+        // explicit about this:
+        //
+        //   "You need to guarantee that the GDI subsystem has completed any
+        //    drawing to a bitmap created by CreateDIBSection before you draw to
+        //    the bitmap yourself. Access to the bitmap must be synchronized. Do
+        //    this by calling the GdiFlush function. This applies to ANY use of
+        //    the pointer to the bitmap bit values."
+        //
+        // Uploading unflushed bits can hand the compositor a half-drawn frame.
+        // Nothing forces the flush for us here: every `ExtTextOutW` return value
+        // is discarded, and reading a return value is the only thing that would
+        // have made GDI flush incidentally.
+        // The BOOL reports whether the batch flushed cleanly. There is nothing
+        // useful to do if it does not -- the frame below is the best we have
+        // either way -- so it is discarded deliberately rather than ignored.
+        let _ = GdiFlush();
+
         let bits = g.bits;
         let stride = g.stride;
         // Hand the scratch buffers back BEFORE touching `panel` again: `g` is a
@@ -473,12 +535,58 @@ pub fn draw_animation(
             let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
         }
 
-        // Let WM_PAINT restore this frame if Windows asks. Matters for a frozen
-        // desktop surface, which by design has no next frame to repair damage.
-        remember_for_repaint(hwnd, mem_dc, width, height);
+        // Let WM_PAINT restore this frame if Windows asks -- TERMINAL PANELS
+        // ONLY.
+        //
+        // A desktop surface must not be registered here: `paint_cached` repairs
+        // damage with a `BitBlt` into the window DC, and a desktop surface has
+        // no redirection bitmap to receive it (`WS_EX_NOREDIRECTIONBITMAP`) and
+        // composites with alpha GDI never writes. Its damage is recorded by
+        // `note_desktop_damage` instead and repaired by the next tick, through
+        // the compositor.
+        if panel.surface.is_none() {
+            remember_for_repaint(hwnd, mem_dc, width, height);
+        }
 
         // The DC, bitmap, font and brush all STAY selected and alive — they are
         // freed in `Panel::drop`.
         ReleaseDC(hwnd, hdc);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The desktop damage set must round-trip and DRAIN.
+    ///
+    /// Draining matters: a surface damaged several times between two ticks has
+    /// to be redrawn once, not once per `WM_PAINT`. A read-without-clear would
+    /// pin `force_redraw` on permanently and defeat the dirty check that keeps
+    /// an idle wallpaper cheap.
+    #[test]
+    fn desktop_damage_is_recorded_then_drained() {
+        let hwnd = HWND(0x5088C as *mut core::ffi::c_void);
+        note_desktop_damage(hwnd);
+        note_desktop_damage(hwnd); // twice -> still one entry
+        let first = take_desktop_damage();
+        assert!(first.contains(&0x5088C));
+        assert_eq!(first.len(), 1, "repeated damage must coalesce");
+        assert!(
+            take_desktop_damage().is_empty(),
+            "taking must clear, or every later tick redraws forever"
+        );
+    }
+
+    /// A destroyed panel must not leave its HWND behind.
+    ///
+    /// Window handle values are reused by Windows, so a stale entry could match
+    /// an unrelated future window and force pointless redraws on it.
+    #[test]
+    fn forgetting_a_panel_clears_its_damage() {
+        let hwnd = HWND(0x1234 as *mut core::ffi::c_void);
+        note_desktop_damage(hwnd);
+        forget_desktop_damage(hwnd);
+        assert!(take_desktop_damage().is_empty());
     }
 }

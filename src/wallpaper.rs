@@ -554,7 +554,15 @@ impl WallpaperSet {
             self.surfaces.len(),
             current.len()
         );
-        self.rebuild_surfaces(cfg);
+        // Re-ATTACH, not just rebuild. Every pane's position is computed
+        // relative to the parent layer's top-left (`desktop::to_child`), and a
+        // layout change moves that origin: unrotating a portrait monitor
+        // reshapes the whole virtual desktop. Rebuilding against the origin
+        // captured at first attach placed every pane offset by the delta --
+        // black squares where no pane covered the screen, and a flashing strip
+        // where a neighbour's misplaced edge overlapped. `try_attach` re-runs
+        // `desktop::find()`, refreshing the origin, then rebuilds.
+        self.try_attach(cfg);
         true
     }
 
@@ -611,6 +619,24 @@ impl WallpaperSet {
             return;
         }
         self.last_frame = now;
+
+        // Repair anything Windows asked us to repaint since the last tick.
+        //
+        // `WM_PAINT` on a desktop surface only RECORDS the damage (see
+        // `render::note_desktop_damage`); this is where it is acted on, because
+        // repairing means presenting, and every present belongs on this thread.
+        // Setting `force_redraw` reuses the same path the occluded->visible
+        // transition already uses.
+        let damaged = crate::render::take_desktop_damage();
+        if !damaged.is_empty() {
+            for s in self.surfaces.iter_mut() {
+                if let Some(p) = s.panel.as_ref() {
+                    if damaged.contains(&(p.hwnd.0 as isize)) {
+                        s.force_redraw = true;
+                    }
+                }
+            }
+        }
 
         // Only sims with at least one VISIBLE consumer are stepped. This is the
         // freeze: a covered monitor's simulation does no work at all.

@@ -54,12 +54,41 @@ if ($installed -match 'nightly-x86_64-pc-windows-gnu') {
     $toolchain = @()
     Write-Host 'nightly-x86_64-pc-windows-gnu not installed; using the default toolchain'
 }
+
+# WHICH cargo, not just which toolchain.
+#
+# `+toolchain` is a RUSTUP PROXY feature -- the real cargo.exe has no idea what
+# it means. pHub has two cargos on PATH:
+#
+#   scoop\apps\rustup\current\.cargo\bin\cargo.exe   the rustup proxy, understands +toolchain
+#   scoop\shims\cargo.exe                            a scoop shim, does NOT
+#
+# and which one wins depends on PATH order, which DIFFERS BETWEEN AN ELEVATED
+# AND A NORMAL SHELL. Run from an Administrator prompt the scoop shim came
+# first and the build died with
+#
+#     error: no such command: `+nightly-x86_64-pc-windows-gnu`
+#
+# after the script had already stopped the daemon -- so the wallpaper stayed
+# down. The same script succeeded in a non-elevated shell minutes earlier,
+# which makes this look like a broken toolchain rather than a PATH-order
+# problem.
+#
+# `rustup run <toolchain> cargo ...` asks rustup by name and cannot be captured
+# by a shim. When no preferred toolchain is installed, fall back to plain cargo.
+if ($toolchain.Count -gt 0) {
+    $cargo = @('rustup', 'run', 'nightly-x86_64-pc-windows-gnu', 'cargo')
+} else {
+    $cargo = @('cargo')
+}
+$cargoExe  = $cargo[0]
+$cargoArgs = @($cargo[1..($cargo.Count - 1)])
 $binDir    = Join-Path $env:USERPROFILE 'bin'
 $glzrDir   = Join-Path $env:USERPROFILE '.glzr\glazewm\scripts'
 
 if ($Test) {
     Write-Host 'running tests ...'
-    cargo @toolchain test
+    & $cargoExe @cargoArgs test
     if ($LASTEXITCODE -ne 0) { throw 'tests failed' }
     return
 }
@@ -76,7 +105,7 @@ if ($wasRunning) {
 }
 
 Write-Host 'building release ...'
-cargo @toolchain build --release
+& $cargoExe @cargoArgs build --release
 if ($LASTEXITCODE -ne 0) { throw 'build failed' }
 
 $exe    = Join-Path $PSScriptRoot 'target\release\panefx.exe'

@@ -101,11 +101,12 @@ screens of the same size running the same effect would otherwise share one
 simulation and show the identical frame at the identical instant, which looks
 like a mirror rather than two wallpapers.
 
-> **This does not work on Windows 11 25H2 (build 26200).** The undocumented
-> message that asks Explorer for the layer behind the desktop icons is a no-op
-> there — measured, not assumed — and other wallpaper apps hit the same wall on
-> that build. panefx says so plainly and carries on with terminal backdrops; the
-> code is complete and will work on any build that still provides the layer.
+> **This works on Windows 11 25H2 (build 26200)** — measured on a four-monitor
+> desk. An earlier note here said it did not, on the basis that the undocumented
+> `0x052C` message is a no-op on that build. That much is true, but it is not
+> the only way in: the desktop surface is created as a `WS_CHILD` of Explorer's
+> own icon host and presented through DirectComposition, which needs no spawned
+> WorkerW. See `compositor.rs` for why GDI alone cannot present there.
 
 ### Control protocol
 
@@ -228,7 +229,7 @@ covers a lot of ground:
   tests and still looked wrong.
 * **The ports are faithful to sources I chose**, and where they deviate the code
   says so and why.
-* It is **not vibe-coded and not unreviewed**: 66 tests, measured before/after
+* It is **not vibe-coded and not unreviewed**: 207 tests, measured before/after
   numbers on every optimisation, and the commit history shows the failures as
   well as the fixes — including changes that were reverted because they measured
   no better.

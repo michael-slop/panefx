@@ -61,10 +61,21 @@ struct Gpu {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     factory: IDXGIFactory2,
+    /// The D3D device's DXGI view. Each `Surface` creates its own composition
+    /// device from this.
     dxgi_device: IDXGIDevice,
 }
 
 thread_local! {
+    /// Per-surface present counts, keyed by [`present_key`]. Thread-local
+    /// because every present happens on the one daemon render thread.
+    pub static PER_SURFACE: std::cell::RefCell<std::collections::HashMap<u64, u64>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+
+    /// Cumulative microseconds spent in `present` per surface.
+    pub static PER_SURFACE_US: std::cell::RefCell<std::collections::HashMap<u64, u64>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+
     static GPU: std::cell::RefCell<Option<std::rc::Rc<Gpu>>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -137,10 +148,98 @@ fn forget_device() {
     GPU.with(|g| *g.borrow_mut() = None);
 }
 
+/// How many frames have been presented, process-wide, since start.
+///
+/// Exists to answer "is the thing on screen changing because WE changed it?"
+/// from a shell that cannot see the desktop. Sampling this twice a second apart
+/// gives the real present rate, which is the difference between a defect in our
+/// present path and one in DWM's composition of a given output.
+pub static PRESENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Presents made for one specific SURFACE, so per-monitor rates can be told
+/// apart.
+///
+/// Keyed by the surface's own identity, not its size: pHub has two 1920x1080
+/// outputs, and a size-based key merged them into one counter that then read as
+/// double the real rate -- an artefact that looks exactly like a genuine
+/// double-present bug.
+pub fn present_key(id: u64) -> u64 {
+    id
+}
+
+/// Back buffers per surface, and the present sync interval. **One decision, two
+/// constants** -- changing either alone reintroduces a bug.
+///
+/// The old code used `BufferCount: 2` with `Present(0, ...)`, and that
+/// combination is a race, not an optimisation:
+///
+///   * two buffers means exactly ONE spare;
+///   * `Present(0, ...)` returns the instant the frame is queued;
+///   * so the next `GetBuffer(0)` can hand back the buffer the compositor is
+///     STILL READING, and `CopyResource` overwrites it mid-read.
+///
+/// The visible result is a seam where two animation frames meet. Whether the
+/// race is ever lost depends on the phase between our present cadence and each
+/// output's compose cadence -- which is per-monitor. That is why one screen
+/// tore and three did not, and why it looked like a monitor problem.
+///
+/// **The original comment arguing against interval 1 was RIGHT, and a later
+/// edit (mine) overrode it and was wrong.** The claim was that raising the
+/// buffer count makes interval-1 sync free, because DXGI blocks only when the
+/// present queue is full. That is true of the QUEUE, and it misses the actual
+/// cost: interval 1 also waits for the target monitor's VBLANK. With every
+/// surface presented sequentially from one thread, that wait is serialised
+/// across monitors that have unrelated refresh clocks, so from the second
+/// monitor onward somebody always misses their frame. See `SYNC_INTERVAL`.
+///
+/// Triple buffering is still worth keeping: with interval 0 it is what lets a
+/// present return immediately instead of stalling on a full queue.
+///
+/// Cost: one extra back buffer per monitor -- 14.7MB for a 1440x2560 portrait
+/// panel, about 40MB across four outputs.
+pub const SWAPCHAIN_BUFFERS: u32 = 3;
+
+/// Present sync interval. **0 -- do NOT set this to 1 on a multi-monitor desk.**
+///
+/// Interval 1 blocks `Present` until THIS monitor's vblank, and every surface is
+/// presented sequentially from the one daemon render thread. With a single
+/// monitor that is harmless (and it is what a single-monitor machine measures).
+/// With two or more it is not: surface A blocks on A's vblank, which pushes
+/// surface B's present past B's vblank, so B misses its frame -- and with
+/// different refresh rates per output (pHub: 120/60/280/60 Hz) the two clocks
+/// never line up, so a monitor drops frames continuously. That is visible as a
+/// flash.
+///
+/// Measured on pHub: ONE surface is clean; TWO surfaces flash. The threshold is
+/// the surface COUNT, not which monitor, its rotation, or its refresh rate --
+/// each of those was tested and ruled out.
+///
+/// The triple buffering below still matters: it is what keeps the present queue
+/// from filling, so `Present(0, ...)` returns immediately rather than stalling
+/// the shared thread.
+pub const SYNC_INTERVAL: u32 = 0;
+
 /// One monitor's composition surface.
 pub struct Surface {
+    /// Stable per-surface id, for the present counter. Sizes are not unique
+    /// across monitors; this is.
+    id: u64,
     gpu: std::rc::Rc<Gpu>,
     swapchain: IDXGISwapChain1,
+    /// This surface's OWN composition device.
+    ///
+    /// **One per surface, NOT one shared across monitors.** A single
+    /// `IDCompositionDevice` drives its entire visual tree on ONE composition
+    /// clock, so every surface hung off it is composed at the same cadence --
+    /// measured on pHub with a shared device: all four swapchains reported
+    /// ~270Hz (the 280Hz primary's rate) even though the outputs run at
+    /// 120/60/280/60. A 60Hz panel fed on a 270Hz cadence shows frames its
+    /// scanout cannot match, which is visible as a flash, and it cannot happen
+    /// with a single monitor -- which is why a shared device looked fine on a
+    /// one-screen laptop and broke a four-screen desk.
+    ///
+    /// A device per surface costs one COM object per monitor and lets each
+    /// target keep its own monitor's clock.
     dcomp: IDCompositionDevice,
     /// Held because dropping the target detaches the visual tree from the
     /// window, even though nothing reads it after construction.
@@ -169,13 +268,33 @@ impl Surface {
                     Quality: 0,
                 },
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-                BufferCount: 2,
-                SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+                BufferCount: SWAPCHAIN_BUFFERS,
+                // FLIP_DISCARD, not FLIP_SEQUENTIAL: every frame overwrites the
+                // whole surface through `CopyResource`, so preserving the old
+                // contents buys nothing and only constrains the driver.
+                SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 // THE line that makes a GDI-drawn frame opaque. GDI leaves
                 // alpha at 0; IGNORE tells DWM not to look at it. With
                 // PREMULTIPLIED here the wallpaper composites additively over
                 // Explorer's own background -- measured, see the module header.
                 AlphaMode: DXGI_ALPHA_MODE_IGNORE,
+                // `Scaling` is DELIBERATELY left to `..Default::default()`,
+                // which supplies `DXGI_SCALING_STRETCH` (0).
+                //
+                // Do not "tidy" this by naming `DXGI_SCALING_NONE` explicitly.
+                // `CreateSwapChainForComposition` REQUIRES stretch, and rejects
+                // `NONE` with `DXGI_ERROR_INVALID_CALL` (0x887A0001) -- which
+                // kills every surface, on every monitor, at creation. Measured
+                // on 26200: the daemon came up reporting four monitors with no
+                // panel behind any of them, wallpaper gone, 2.6% CPU instead of
+                // ~30%. The error text ("the application made a call that is
+                // invalid") names no field, so it reads like a device problem
+                // rather than this one line.
+                //
+                // The reasoning that motivated `NONE` -- that a stretch-capable
+                // surface might be resampled during a rotated output's
+                // composition pass -- may or may not be true, but it is not
+                // available to us here either way.
                 ..Default::default()
             };
             let swapchain = gpu
@@ -206,9 +325,14 @@ impl Surface {
             let upload = make_upload(&gpu.device, width, height)?;
 
             Ok(Surface {
+                dcomp,
+                id: {
+                    static NEXT: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(1);
+                    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                },
                 gpu,
                 swapchain,
-                dcomp,
                 _target: target,
                 _visual: visual,
                 upload,
@@ -216,6 +340,46 @@ impl Surface {
                 height,
             })
         }
+    }
+
+    /// The swapchain's current size, for diagnosis.
+    pub fn size(&self) -> (i32, i32) {
+        (self.width, self.height)
+    }
+
+    /// How many frames this surface has presented.
+    pub fn presents(&self) -> u64 {
+        PER_SURFACE.with(|m| m.borrow().get(&present_key(self.id)).copied().unwrap_or(0))
+    }
+
+    /// Cumulative microseconds spent presenting this surface.
+    pub fn present_us(&self) -> u64 {
+        PER_SURFACE_US.with(|m| m.borrow().get(&self.id).copied().unwrap_or(0))
+    }
+
+    /// DXGI's own account of what reached the screen: `(presented, displayed)`.
+    ///
+    /// `PresentCount` is how many frames WE submitted; `PresentRefreshCount` is
+    /// the refresh at which the last one actually appeared. Sampling both twice
+    /// tells us whether this monitor is showing every frame we hand it or
+    /// dropping some -- which is the difference between a flash that is ours
+    /// and one that is DWM's, and it is measurable without looking at a screen.
+    ///
+    /// `None` when DXGI has no statistics yet (the surface has not presented,
+    /// or the swapchain is not in a state that tracks them).
+    pub fn frame_stats(&self) -> Option<(u32, u32)> {
+        unsafe {
+            let mut st = DXGI_FRAME_STATISTICS::default();
+            self.swapchain
+                .GetFrameStatistics(&mut st)
+                .ok()
+                .map(|()| (st.PresentCount, st.PresentRefreshCount))
+        }
+    }
+
+    /// Wraps [`dib_geometry_fault`] with this surface's own dimensions.
+    fn geometry_fault(&self, stride: usize) -> Option<String> {
+        dib_geometry_fault(self.width, self.height, stride)
     }
 
     /// Is the device still usable?
@@ -261,7 +425,7 @@ impl Surface {
         Ok(())
     }
 
-    /// Upload one finished frame and present it.
+/// Upload one finished frame and present it.
     ///
     /// `bits` is the DIB section the renderer drew into: 32 bits per pixel,
     /// top-down, `stride` bytes per row.
@@ -269,6 +433,14 @@ impl Surface {
         if bits.is_null() {
             return Err("no pixels to present".into());
         }
+        // The DIB and this surface are sized from the same `panel.width/height`,
+        // so a disagreement means they have drifted -- and the copy loop below
+        // would then read or write a partial frame, which is a visible tear.
+        // Cheap to check, and it converts an invisible defect into a log line.
+        if let Some(bad) = self.geometry_fault(stride) {
+            return Err(bad);
+        }
+        let t_start = std::time::Instant::now();
         unsafe {
             let ctx = &self.gpu.context;
 
@@ -303,19 +475,65 @@ impl Surface {
                 .map_err(|e| format!("GetBuffer failed: {e}"))?;
             ctx.CopyResource(&back, &self.upload);
 
-            // Sync interval 0, NOT 1. Interval 1 blocks the calling thread until
-            // vblank, and the daemon presents every panel from one thread -- a
-            // 5fps wallpaper would then pace the 30fps terminal backdrops.
+            // Sync interval 1, with THREE buffers. These two settings are one
+            // decision -- see `SWAPCHAIN_BUFFERS`.
             self.swapchain
-                .Present(0, DXGI_PRESENT(0))
+                .Present(SYNC_INTERVAL, DXGI_PRESENT(0))
                 .ok()
                 .map_err(|e| format!("Present failed: {e}"))?;
-            self.dcomp
-                .Commit()
-                .map_err(|e| format!("Commit failed: {e}"))?;
+            PRESENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // How long the Present+upload actually took for THIS surface.
+            //
+            // A rotated output cannot be scanned out directly from the composed
+            // surface, so DWM runs a rotation pass for it. If that cost is real
+            // and per-present, it shows up here as a systematically longer
+            // present on exactly the outputs that flash -- which is measurable
+            // from a shell that cannot see the screen.
+            PER_SURFACE_US.with(|m| {
+                *m.borrow_mut().entry(self.id).or_insert(0) +=
+                    t_start.elapsed().as_micros() as u64;
+            });
+            PER_SURFACE.with(|m| {
+                *m.borrow_mut()
+                    .entry(present_key(self.id))
+                    .or_insert(0) += 1u64;
+            });
+
+            // NO `Commit` here, deliberately.
+            //
+            // `Commit` publishes changes to the VISUAL TREE. This surface's tree
+            // is built once in `new` -- target, visual and content are all set
+            // there, followed by the one `Commit` that matters -- and never
+            // touched again. New FRAMES reach the screen through the swapchain
+            // `Present` above: a composition swapchain set as visual content
+            // updates with no commit at all.
+            //
+            // (An earlier version committed on every present. That is not free:
+            // it republishes a composition batch to DWM per frame per monitor.)
         }
         Ok(())
     }
+}
+
+/// Does the DIB handed to `present` actually match this surface?
+///
+/// Split from the `unsafe` body so the rule is testable: a DIB whose row is
+/// shorter than the surface's row means the copy would leave the right-hand
+/// columns of every row holding the PREVIOUS frame's pixels -- which reads as a
+/// band that flickers between two frames rather than obvious garbage.
+///
+/// Returns a description of the fault, or `None` when the geometry is sound.
+pub fn dib_geometry_fault(width: i32, height: i32, stride: usize) -> Option<String> {
+    if width <= 0 || height <= 0 {
+        return Some(format!("surface has no area: {width}x{height}"));
+    }
+    let need = (width as usize) * 4;
+    if stride < need {
+        return Some(format!(
+            "DIB stride {stride} is too small for a {width}px row (needs {need})              -- every row would keep stale pixels on the right"
+        ));
+    }
+    None
 }
 
 fn make_upload(device: &ID3D11Device, width: i32, height: i32) -> Result<ID3D11Texture2D, String> {
@@ -351,6 +569,95 @@ pub fn drop_shared_device() {
 
 #[cfg(test)]
 mod tests {
+    /// A composition swapchain MUST use stretch scaling.
+    ///
+    /// `CreateSwapChainForComposition` rejects `DXGI_SCALING_NONE` with
+    /// `DXGI_ERROR_INVALID_CALL` (0x887A0001). Naming it explicitly -- as an
+    /// "explicit is better than implicit" cleanup -- took the wallpaper down on
+    /// all four of pHub's monitors at once, and the error names no field, so it
+    /// reads like a broken device rather than one wrong constant.
+    ///
+    /// This pins the VALUE rather than the descriptor, because the descriptor
+    /// is built inside an `unsafe` block no test can reach. `STRETCH` is 0,
+    /// which is what `..Default::default()` supplies -- so the assertion below
+    /// is exactly "the default is the required value", and it fails the moment
+    /// somebody decides otherwise.
+    #[test]
+    fn a_composition_swapchain_must_use_stretch_scaling() {
+        use windows::Win32::Graphics::Dxgi::{DXGI_SCALING_NONE, DXGI_SCALING_STRETCH};
+        assert_eq!(
+            DXGI_SCALING_STRETCH.0, 0,
+            "STRETCH must be the zero value, i.e. what Default supplies"
+        );
+        assert_ne!(
+            DXGI_SCALING_NONE.0, DXGI_SCALING_STRETCH.0,
+            "if these ever collide this test has stopped testing anything"
+        );
+    }
+
+    /// The geometry invariant behind `present`.
+    ///
+    /// Added while chasing a flash that affected only 2 of pHub's 4 monitors.
+    /// It did NOT turn out to be the cause -- all four measured consistent --
+    /// but the check is worth keeping: it is the one failure that would produce
+    /// exactly this symptom (a band of stale pixels refreshing at frame rate)
+    /// while every log line still said the wallpaper was fine.
+    #[test]
+    fn a_dib_row_shorter_than_the_surface_is_a_fault() {
+        // 1440px needs 5760 bytes. One pixel short means every row keeps the
+        // previous frame's rightmost column -- a flicker, not obvious garbage.
+        assert!(super::dib_geometry_fault(1440, 2560, 5756).is_some());
+        assert!(super::dib_geometry_fault(1440, 2560, 5760).is_none());
+        // A driver may pad the row LONGER; that is normal and must pass.
+        assert!(super::dib_geometry_fault(1440, 2560, 6144).is_none());
+    }
+
+    #[test]
+    fn a_zero_area_surface_is_a_fault_not_a_silent_present() {
+        // Presenting into a 0-area surface would map a zero-byte texture and
+        // copy nothing, leaving whatever was there before on screen.
+        assert!(super::dib_geometry_fault(0, 1080, 4096).is_some());
+        assert!(super::dib_geometry_fault(1920, 0, 7680).is_some());
+    }
+
+    /// pHub's four real monitors, as measured over the control channel.
+    ///
+    /// Pinned as a regression net for the resolution hypothesis: the two that
+    /// flash (a 1440x2560 portrait and a 2560x720 ultrawide) are NOT the two
+    /// with the most pixels -- the 2560x720 has 1.84M against 2.07M for each
+    /// unaffected 1080p screen -- and every one of them has sound geometry.
+    /// Whatever the flash is, it is not a size mismatch.
+    #[test]
+    fn every_real_phub_monitor_has_sound_geometry() {
+        for (w, h) in [(1440, 2560), (2560, 720), (1920, 1080), (1920, 1080)] {
+            assert!(
+                super::dib_geometry_fault(w, h, (w as usize) * 4).is_none(),
+                "{w}x{h} should be sound"
+            );
+        }
+    }
+
+    /// The tearing fix, pinned as the pair it is.
+    ///
+    /// Sabotage-checked in both directions: setting `SYNC_INTERVAL` back to 0
+    /// fails this, and so does dropping `SWAPCHAIN_BUFFERS` to 2. That is the
+    /// point -- either one alone reintroduces a bug. Interval 0 with any buffer
+    /// count races the compositor for the buffer it is reading (the seam on the
+    /// portrait screen); interval 1 with two buffers blocks the shared render
+    /// thread on every present, so a 5fps wallpaper paces the 30fps terminal
+    /// backdrops.
+    #[test]
+    fn the_present_syncs_and_has_a_spare_buffer_to_make_that_free() {
+        assert_eq!(
+            super::SYNC_INTERVAL, 0,
+            "interval 1 serialises every monitor's present against its own              vblank on one thread, so a second monitor misses frames --              measured on pHub: one surface clean, two surfaces flashing"
+        );
+        assert!(
+            super::SWAPCHAIN_BUFFERS >= 3,
+            "with fewer than 3 buffers the present queue holds <2 frames, so              interval 1 blocks the one thread that presents every panel"
+        );
+    }
+
     /// The alpha mode is the whole reason a GDI-drawn frame reads back opaque.
     ///
     /// Measured on build 26200: with PREMULTIPLIED, a mid-grey (100,100,100)

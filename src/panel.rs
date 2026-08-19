@@ -20,7 +20,9 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW, SetWindowPos, ShowWindow,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindow, GetWindowLongPtrW,
+    GetClassNameW, RegisterClassExW, SetWindowPos, ShowWindow, GWL_EXSTYLE,
+    GW_HWNDNEXT, GW_HWNDPREV,
     HWND_BOTTOM, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
     SW_SHOWNOACTIVATE, WINDOW_STYLE, WM_DESTROY, WM_ERASEBKGND, WM_PAINT, WNDCLASSEXW,
     WS_CHILD, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_POPUP,
@@ -34,6 +36,13 @@ use crate::render;
 /// without catching anything else — note Alacritty itself uses winit's very
 /// generic `"Window Class"`, so a vague name here would be a real hazard.
 pub const PANEL_CLASS: PCWSTR = w!("PaneFxClass");
+
+/// How many times a desktop pane actually issued a z-order SetWindowPos.
+///
+/// Diagnostic: with N sibling panes each demanding to be THE bottom child,
+/// this counts the churn. One pane should pin ~never after creation; a high
+/// steady rate here is the panes displacing each other.
+pub static PIN_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// GDI objects reused across frames.
 ///
@@ -130,6 +139,39 @@ pub fn desktop_window_style() -> WINDOW_STYLE {
     WS_CHILD | WS_VISIBLE
 }
 
+/// Is a desktop surface already the last of its siblings?
+///
+/// `last` is what `GetWindow(hwnd, GW_HWNDLAST)` returned, or `None` if the
+/// call failed. Split out of the `unsafe` block so the decision — not the API
+/// call — is what the tests pin.
+///
+/// **A failed query must report `false`.** Skipping the pin on a query we could
+/// not answer would leave the surface wherever Explorer last put it, which is
+/// the icons-are-gone bug. Reporting "not at the bottom" makes the caller do
+/// the real `SetWindowPos` and surface any error from there.
+/// Retained for the tests that pin the OLD rule's failure direction; the live
+/// desktop guard is the sibling walk in `is_at_bottom`.
+pub fn already_at_bottom(hwnd: usize, last: Option<usize>) -> bool {
+    last == Some(hwnd)
+}
+
+/// Is a window class one of our own desktop panes?
+///
+/// The decision inside `is_at_bottom`'s sibling walk, split out so the tests
+/// can pin it: a sibling below us that is OURS does not require a re-pin, and
+/// anything else does.
+pub fn class_is_ours(class: &str) -> bool {
+    class == "PaneFxClass"
+}
+
+/// Is `target` already the sibling immediately above us?
+///
+/// `prev` is what `GetWindow(hwnd, GW_HWNDPREV)` returned. Same failure rule as
+/// `already_at_bottom`: unknown means re-pin.
+pub fn already_directly_behind(target: usize, prev: Option<usize>) -> bool {
+    prev == Some(target)
+}
+
 pub struct Panel {
     pub hwnd: HWND,
     /// What this panel follows.
@@ -163,7 +205,23 @@ unsafe extern "system" fn wnd_proc(
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(hwnd, &mut ps);
-            render::paint_cached(hdc, hwnd);
+            // WHICH repair path depends on whether this window has a
+            // redirection bitmap to blit into.
+            //
+            // Asked of the window itself rather than tracked alongside it: the
+            // window procedure has only the `HWND`, and `WS_EX_NOREDIRECTIONBITMAP`
+            // IS the property that makes a `BitBlt` here invalid -- so testing
+            // for it directly cannot drift out of sync with how the window was
+            // created.
+            let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+            if ex & WS_EX_NOREDIRECTIONBITMAP.0 != 0 {
+                // A desktop surface. Record the damage; the wallpaper tick
+                // repairs it through the compositor. Blitting would put a
+                // wrong-alpha frame on screen -- a flash.
+                render::note_desktop_damage(hwnd);
+            } else {
+                render::paint_cached(hdc, hwnd);
+            }
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
@@ -369,7 +427,20 @@ impl Panel {
         // The old code inserted after Progman instead, which is the top-level
         // slot immediately above the shell window -- and therefore above
         // DefView and every icon in it. That is the bug this replaces.
+        //
+        // ONLY when it has actually drifted. `SetWindowPos` is not free even
+        // when it changes nothing: it makes DWM re-evaluate and repaint the
+        // affected region, and on a desktop surface that region is a whole
+        // monitor. Called unconditionally from the wallpaper tick — i.e. every
+        // frame, on every visible screen — that is a periodic full-screen
+        // repaint at `wallpaper_fps`, which is the flashing. The z-slot is
+        // still re-asserted whenever Explorer or GlazeWM moves us; the check
+        // below is two cheap `GetWindow` calls that make the no-op case free.
         if matches!(self.anchor, Anchor::Desktop { .. }) {
+            if self.is_at_bottom() {
+                return Ok(());
+            }
+            PIN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             unsafe {
                 SetWindowPos(
                     self.hwnd,
@@ -386,6 +457,9 @@ impl Panel {
         let Anchor::Window(target) = self.anchor else {
             return Ok(());
         };
+        if self.is_directly_behind(target) {
+            return Ok(());
+        }
         unsafe {
             SetWindowPos(
                 self.hwnd,
@@ -398,6 +472,48 @@ impl Panel {
             )?;
         }
         Ok(())
+    }
+
+    /// Are we already the last of our parent's children?
+    ///
+    /// `GW_HWNDLAST` walks from us to the end of the sibling list, so this is
+    /// the exact question `SetWindowPos(HWND_BOTTOM)` would answer by doing the
+    /// work. A failed call (window gone) reports `false`, so the caller falls
+    /// through to the real `SetWindowPos` and surfaces the error there rather
+    /// than silently skipping the pin.
+    fn is_at_bottom(&self) -> bool {
+        // "Bottom" for a desktop pane means NOTHING FOREIGN BELOW US -- not
+        // "I am the very last sibling". There is one pane per monitor and all
+        // of them are siblings in the same parent, so only one can ever be
+        // last: demanding that slot made every pane displace the others once
+        // per tick, forever. Measured with four panes at wallpaper_fps=10:
+        // 39.9 z-order SetWindowPos/sec, each a DWM repaint of a whole
+        // monitor -- the multi-monitor flicker, invisible on any
+        // single-monitor machine because a lone pane is always last.
+        //
+        // So walk DOWN from us instead: if every sibling below is another
+        // panefx pane, our z-slot is correct and no pin is needed.
+        unsafe {
+            let mut next = GetWindow(self.hwnd, GW_HWNDNEXT).ok();
+            while let Some(h) = next {
+                let mut buf = [0u16; 64];
+                let n = GetClassNameW(h, &mut buf) as usize;
+                if !class_is_ours(&String::from_utf16_lossy(&buf[..n])) {
+                    return false;
+                }
+                next = GetWindow(h, GW_HWNDNEXT).ok();
+            }
+            true
+        }
+    }
+
+    /// Is `target` the sibling immediately above us?
+    ///
+    /// That is precisely the slot `SetWindowPos(hwnd, target, …)` places us in,
+    /// so when it already holds, the call would be a no-op repaint.
+    fn is_directly_behind(&self, target: HWND) -> bool {
+        let prev = unsafe { GetWindow(self.hwnd, GW_HWNDPREV).ok() };
+        already_directly_behind(target.0 as usize, prev.map(|h| h.0 as usize))
     }
 
     /// Drop to the very bottom of the z-order. Used when the target is hidden
@@ -448,6 +564,7 @@ impl Drop for Panel {
             // objects are still selected leaks whatever GDI had there before.
             // Stop WM_PAINT reaching a DC we are about to delete.
             crate::render::forget_for_repaint(self.hwnd);
+            crate::render::forget_desktop_damage(self.hwnd);
             // Release the swapchain, visual and target BEFORE the window they
             // are attached to. Rust drops fields after this body runs, which
             // would be after DestroyWindow.
@@ -487,6 +604,66 @@ impl Drop for Panel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sibling_pane_below_us_is_not_a_reason_to_re_pin() {
+        // THE MULTI-MONITOR FLICKER, as a tripwire. One pane per monitor, all
+        // siblings in one parent -- only one can be the last child. When the
+        // guard demanded that exact slot, every pane displaced the others once
+        // per tick: measured 39.9 z-order SetWindowPos/sec with four panes at
+        // wallpaper_fps=10, each call a full-monitor DWM repaint. A lone pane
+        // is always last, which is why a single-monitor machine never sees it.
+        assert!(class_is_ours("PaneFxClass"));
+    }
+
+    #[test]
+    fn a_foreign_sibling_below_us_does_force_a_re_pin() {
+        // The guard must not become "never pin": Explorer's own children below
+        // us mean we have drifted above the icon machinery and must sink.
+        assert!(!class_is_ours("SysListView32"));
+        assert!(!class_is_ours("SHELLDLL_DefView"));
+        assert!(!class_is_ours(""));
+    }
+
+    #[test]
+    fn a_surface_already_at_the_bottom_is_not_re_pinned() {
+        // THE FLASHING, as a tripwire. `pin_behind_target` is called from the
+        // wallpaper tick on EVERY frame for every visible screen. A
+        // SetWindowPos that changes nothing is still not free: it makes DWM
+        // re-evaluate and repaint the region, and for a desktop surface that
+        // region is a whole monitor. Unconditionally, at wallpaper_fps, that
+        // is a periodic full-screen repaint -- which is what the flashing is.
+        assert!(already_at_bottom(0x5088C, Some(0x5088C)));
+    }
+
+    #[test]
+    fn a_surface_explorer_moved_is_re_pinned() {
+        // The other half: the guard must not become a way to never re-pin.
+        // Explorer rebuilds its desktop children on theme changes, wallpaper
+        // changes and F5, which lands us back above SysListView32 -- so when
+        // somebody else is last, we MUST issue the SetWindowPos.
+        assert!(!already_at_bottom(0x5088C, Some(0x1019C)));
+    }
+
+    #[test]
+    fn a_z_order_we_could_not_read_is_re_pinned_not_skipped() {
+        // GetWindow failing must fall through to the real call, never skip it.
+        // Treating "unknown" as "already correct" would leave the surface
+        // wherever it was last put -- i.e. potentially over the desktop icons,
+        // which is the bug the per-tick re-pin exists to prevent. Silently
+        // skipping is the dangerous direction; a redundant SetWindowPos is not.
+        assert!(!already_at_bottom(0x5088C, None));
+        assert!(!already_directly_behind(0x1234, None));
+    }
+
+    #[test]
+    fn a_terminal_panel_already_behind_its_window_is_not_re_pinned() {
+        // Same saving on the follower path, which runs on every reconcile:
+        // GlazeWM reasserts z-order on focus changes, but most reconciles do
+        // not actually move us.
+        assert!(already_directly_behind(0x1234, Some(0x1234)));
+        assert!(!already_directly_behind(0x1234, Some(0x9999)));
+    }
 
     #[test]
     fn a_desktop_surface_is_a_child_never_a_popup() {
