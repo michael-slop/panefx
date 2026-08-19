@@ -179,7 +179,8 @@ def to_art(rows, width=WIDTH):
 
 HEADER = u'''//! The `{mod}` artwork, as shade levels.
 //!
-//! Traced from `{src}` (ACiD-style CP437 block art): {desc}
+//! Traced from `{src}` (ACiD-style CP437 block art):
+//! {desc}
 //!
 //! Near enough every glyph in the original is a shade block or a half block,
 //! so the drawing reduces to a per-cell shade level. The original's own colour

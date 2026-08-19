@@ -1,6 +1,7 @@
 //! The `raalien_art` artwork, as shade levels.
 //!
-//! Traced from `ra-alien.ans` (ACiD-style CP437 block art): a full-length Giger biomechanical xenomorph drawn in NEGATIVE
+//! Traced from `ra-alien.ans` (ACiD-style CP437 block art):
+//! a full-length Giger biomechanical xenomorph drawn in NEGATIVE
 //! -- hatched half-block scanlines carve the creature out of the page rather
 //! than fill it in -- from the ribbed elongated cranium and inner jaw down
 //! through the segmented spine, clawed limbs and coiling tail.

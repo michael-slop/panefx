@@ -1,6 +1,7 @@
 //! The `tgevil_art` artwork, as shade levels.
 //!
-//! Traced from `TG-EVIL.ANS` (ACiD-style CP437 block art): a horned demon skull inside a stone arch, a third eye burning
+//! Traced from `TG-EVIL.ANS` (ACiD-style CP437 block art):
+//! a horned demon skull inside a stone arch, a third eye burning
 //! above its brow and a bare fanged jaw below, over a lower panel of long
 //! molten drips signed `tgFiRE`.
 //!

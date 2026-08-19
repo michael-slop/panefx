@@ -1,6 +1,7 @@
 //! The `wzfire_art` artwork, as shade levels.
 //!
-//! Traced from `WZ-FIRE.ANS` (ACiD-style CP437 block art): a winged dragon perched on the battlement of a stone tower,
+//! Traced from `WZ-FIRE.ANS` (ACiD-style CP437 block art):
+//! a winged dragon perched on the battlement of a stone tower,
 //! ribbed body and spread wings filling the frame under blackletter `Fire`
 //! lettering, with the tower's shuttered windows below it.
 //!

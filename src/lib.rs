@@ -39,7 +39,10 @@ pub mod starfield;
 pub mod tunnel;
 pub mod waves;
 pub mod wizardtorch;
+pub mod raalien_art;
+pub mod tgevil_art;
 pub mod wizardtorch_art;
+pub mod wzfire_art;
 
 // Windows-only: the daemon's panel/render/IPC layer. The TUI does not need it,
 // and keeping it out of a non-Windows build would let the effects be tested

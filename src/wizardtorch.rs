@@ -36,7 +36,23 @@
 
 use crate::animation::{AsciiAnimation, Param, ParamValue};
 use crate::palette::{fcos, fsin, quantise, Rgb};
-use crate::wizardtorch_art::{ART, COLS, ROWS};
+/// One still ASCII-art piece: its rows, and the defaults it wants.
+///
+/// Borrowed, so the art stays in `.rodata` and switching pieces costs nothing.
+/// The DEFAULTS travel with the art because they are properties of the drawing,
+/// not preferences: `ra-alien` is negative art four times taller than it is
+/// wide, and the `darkcut` and `fit` that suit `wizardtorch` erase it.
+#[derive(Clone, Copy)]
+pub struct Piece {
+    pub cols: usize,
+    pub rows: usize,
+    pub art: &'static [&'static str],
+    /// Starting dark cutoff, x1000 of full shade.
+    pub darkcut: i64,
+    /// Starting fit. A very tall piece letterboxes to a sliver under Contain.
+    pub fit: Fit,
+    pub ink: Rgb,
+}
 
 /// Shade ramp, dimmest first. The art's own blocks, so a sampled value
 /// re-quantises into the vocabulary it was drawn in.
@@ -71,6 +87,79 @@ impl Fit {
             Fit::Contain => "contain",
             Fit::Stretch => "stretch",
             Fit::Cover => "cover",
+        }
+    }
+}
+
+/// The still pieces panefx ships, each with the defaults its drawing needs.
+pub mod pieces {
+    use super::{Fit, Piece};
+    use crate::palette::Rgb;
+
+    /// A robed wizard holding a torch above a bank of skulls.
+    pub fn wizardtorch() -> Piece {
+        Piece {
+            cols: crate::wizardtorch_art::COLS,
+            rows: crate::wizardtorch_art::ROWS,
+            art: &crate::wizardtorch_art::ART,
+            darkcut: 120,
+            fit: Fit::Contain,
+            ink: Rgb(0xc9, 0xb8, 0x9a),
+        }
+    }
+
+    /// A horned demon skull in a stone arch, a third eye above, molten drips
+    /// below. Signed `tgFiRE`.
+    pub fn tgevil() -> Piece {
+        Piece {
+            cols: crate::tgevil_art::COLS,
+            rows: crate::tgevil_art::ROWS,
+            art: &crate::tgevil_art::ART,
+            darkcut: 120,
+            fit: Fit::Contain,
+            // Bone, against the drips.
+            ink: Rgb(0xd8, 0xd2, 0xc4),
+        }
+    }
+
+    /// A winged dragon on the battlement of a stone tower, under blackletter
+    /// lettering.
+    pub fn wzfire() -> Piece {
+        Piece {
+            cols: crate::wzfire_art::COLS,
+            rows: crate::wzfire_art::ROWS,
+            art: &crate::wzfire_art::ART,
+            // Densest of the four (79% of cells lit), so it can afford to cull
+            // more of the low end without losing the drawing.
+            darkcut: 200,
+            fit: Fit::Contain,
+            ink: Rgb(0xff, 0x9a, 0x4a),
+        }
+    }
+
+    /// A Giger biomechanical xenomorph, drawn in NEGATIVE: the hatching is the
+    /// ink and the creature is the unlit space between it.
+    ///
+    /// Two defaults differ from the others because of that, and both matter:
+    ///
+    /// * `darkcut` is 0. On positive art a cutoff culls background; here the
+    ///   background IS the subject, so the usual 120 eats the creature.
+    /// * `fit` is `Cover`. The piece is 80x508 -- a 6.3:1 scroll, four times
+    ///   `wizardtorch`'s aspect -- and `Contain` letterboxes it to a sliver on
+    ///   any landscape monitor.
+    pub fn raalien() -> Piece {
+        Piece {
+            cols: crate::raalien_art::COLS,
+            rows: crate::raalien_art::ROWS,
+            art: &crate::raalien_art::ART,
+            darkcut: 0,
+            // CONTAIN, not Cover. `Cover` on a 6.3:1 scroll crops so hard that
+            // a landscape monitor shows a scatter of unreadable hatching --
+            // rendered and looked at, not assumed. Contained it is a narrow
+            // vertical strip, which is at least the drawing; `detail` and
+            // `fit` are both live knobs for anyone who wants otherwise.
+            fit: Fit::Contain,
+            ink: Rgb(0x9e, 0xc4, 0xb8),
         }
     }
 }
@@ -133,6 +222,8 @@ fn smooth_field(h: usize, w: usize, freq: f32, seed: u32) -> Vec<f32> {
 }
 
 pub struct WizardTorch {
+    name: &'static str,
+    piece: Piece,
     cols: usize,
     rows: usize,
 
@@ -159,8 +250,10 @@ pub struct WizardTorch {
 }
 
 impl WizardTorch {
-    pub fn new(cols: usize, rows: usize) -> Self {
+    pub fn new(name: &'static str, piece: Piece, cols: usize, rows: usize) -> Self {
         let mut w = WizardTorch {
+            name,
+            piece,
             cols,
             rows,
             t: 0.0,
@@ -168,9 +261,9 @@ impl WizardTorch {
             speed_milli: 1000,
             swirl_milli: 700,
             detail_milli: 1000,
-            darkcut_milli: 120,
-            fit: Fit::Contain,
-            ink: Rgb(0xc9, 0xb8, 0x9a),
+            darkcut_milli: piece.darkcut,
+            fit: piece.fit,
+            ink: piece.ink,
             bg: Rgb(0, 0, 0),
             warp_a: Vec::new(),
             warp_b: Vec::new(),
@@ -199,10 +292,10 @@ impl WizardTorch {
         let x0 = ax.floor() as i32;
         let (fy, fx) = (ay - y0 as f32, ax - x0 as f32);
         let at = |y: i32, x: i32| -> f32 {
-            if y < 0 || x < 0 || y >= ROWS as i32 || x >= COLS as i32 {
+            if y < 0 || x < 0 || y >= self.piece.rows as i32 || x >= self.piece.cols as i32 {
                 return 0.0;
             }
-            let line = ART[y as usize].as_bytes();
+            let line = self.piece.art[y as usize].as_bytes();
             let b = if (x as usize) < line.len() {
                 line[x as usize]
             } else {
@@ -230,7 +323,7 @@ impl WizardTorch {
 
         if self.fit != Fit::Stretch {
             let panel_aspect = gw / (gh * 2.0);
-            let art_aspect = COLS as f32 / (ROWS as f32 * 2.0);
+            let art_aspect = self.piece.cols as f32 / (self.piece.rows as f32 * 2.0);
             let wider = panel_aspect > art_aspect;
             // Contain letterboxes on the long axis; Cover crops it instead --
             // the same comparison with the branch reversed.
@@ -249,13 +342,13 @@ impl WizardTorch {
         su = (su - 0.5) / detail + 0.5;
         sv = (sv - 0.5) / detail + 0.5;
 
-        (sv * ROWS as f32, su * COLS as f32)
+        (sv * self.piece.rows as f32, su * self.piece.cols as f32)
     }
 }
 
 impl AsciiAnimation for WizardTorch {
     fn name(&self) -> &'static str {
-        "wizardtorch"
+        self.name
     }
 
     fn resize(&mut self, cols: usize, rows: usize) {
@@ -296,7 +389,7 @@ impl AsciiAnimation for WizardTorch {
         let swirl = self.swirl_milli as f32 / 1000.0;
         // Amplitude in ART cells, so the ripple is the same size on the drawing
         // whatever grid it happens to be fitted to.
-        let amp = 0.02 * COLS.min(ROWS) as f32 * swirl;
+        let amp = 0.02 * self.piece.cols.min(self.piece.rows) as f32 * swirl;
         let dx = fsin(phase + wa * std::f32::consts::TAU) * amp;
         let dy = fcos(phase + wb * std::f32::consts::TAU) * amp;
 
@@ -309,7 +402,7 @@ impl AsciiAnimation for WizardTorch {
         // all of it discarded for a cell that was never going to be drawn.
         // Measured at 26% of cells lit but ~100% of a core, against `waves` at
         // 46% lit and 35%: the cost was the work done for the other 74%.
-        if sy < -1.0 || sx < -1.0 || sy >= ROWS as f32 || sx >= COLS as f32 {
+        if sy < -1.0 || sx < -1.0 || sy >= self.piece.rows as f32 || sx >= self.piece.cols as f32 {
             return None;
         }
         let v = self.art_sample(sy, sx) / 4.0;
@@ -421,8 +514,13 @@ mod tests {
 
     /// A landscape grid, which is the case the fit logic exists for.
     fn landscape() -> WizardTorch {
-        WizardTorch::new(160, 60)
+        WizardTorch::new("wizardtorch", pieces::wizardtorch(), 160, 60)
     }
+
+    /// The art the tests measure against.
+    const COLS: usize = crate::wizardtorch_art::COLS;
+    const ROWS: usize = crate::wizardtorch_art::ROWS;
+    const ART: [&str; ROWS] = crate::wizardtorch_art::ART;
 
     fn drawn_cells(w: &WizardTorch) -> usize {
         let mut n = 0;
@@ -451,6 +549,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn every_shipped_piece_is_rectangular_and_draws_something() {
+        // One test for all four, so adding a piece cannot skip validation.
+        // A ragged row or an unknown glyph renders as a hole in the drawing
+        // with nothing in any log to say why.
+        for (name, p) in [
+            ("wizardtorch", pieces::wizardtorch()),
+            ("tgevil", pieces::tgevil()),
+            ("wzfire", pieces::wzfire()),
+            ("raalien", pieces::raalien()),
+        ] {
+            assert_eq!(p.art.len(), p.rows, "{name}: ROWS disagrees with the art");
+            for (i, row) in p.art.iter().enumerate() {
+                assert_eq!(row.len(), p.cols, "{name} row {i} is not {} wide", p.cols);
+                for &b in row.as_bytes() {
+                    assert!(
+                        b == b' ' || shade_of(b) > 0.0,
+                        "{name} row {i}: unknown glyph {:?}",
+                        b as char
+                    );
+                }
+            }
+            let mut w = WizardTorch::new("t", p, 120, 44);
+            w.step();
+            let lit = (0..44)
+                .flat_map(|r| (0..120).map(move |c| (c, r)))
+                .filter(|&(c, r)| w.cell_at(c, r).is_some())
+                .count();
+            assert!(lit > 100, "{name} drew only {lit} cells");
+        }
+    }
+
+    #[test]
+    fn negative_art_keeps_its_own_defaults() {
+        // `raalien` is negative -- the hatching is the ink and the creature is
+        // the space between. The cutoff that suits positive art erases it, and
+        // Contain letterboxes a 6.3:1 scroll to a sliver. The defaults travel
+        // with the ART for exactly this reason.
+        let p = pieces::raalien();
+        assert_eq!(p.darkcut, 0, "a cutoff would eat negative art");
+        // Contain: rendered at 150x55, `Cover` cropped a 6.3:1 scroll into
+        // unreadable scatter. A letterboxed strip is at least the drawing.
+        assert_eq!(p.fit, Fit::Contain);
     }
 
     #[test]
@@ -591,7 +734,7 @@ mod tests {
 
     #[test]
     fn a_degenerate_grid_does_not_panic() {
-        let w = WizardTorch::new(0, 0);
+        let w = WizardTorch::new("wizardtorch", pieces::wizardtorch(), 0, 0);
         assert_eq!(w.cell_at(0, 0), None);
     }
 }

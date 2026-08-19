@@ -113,7 +113,17 @@ impl FramePlay {
             elapsed_ms: 0,
             speed_milli: 1000,
             detail_milli: 1000,
-            fit: Fit::Contain,
+            // COVER, not Contain. These canvases are small (Fish Loop is
+            // 60x30), and contained on a 150x55 grid the fish renders as a
+            // thumbnail adrift in black -- rendered and looked at.
+            //
+            // KNOWN LIMITATION: fit centres the CANVAS, not the drawing. Fish
+            // Loop's subject sits off-centre in a mostly empty canvas, so Cover
+            // enlarges it but also pushes it toward one edge. Auto-cropping to
+            // the drawn bounds would fix it, but the bounds move every frame
+            // and a per-frame crop makes the subject jitter as it swims. Left
+            // as-is deliberately; `detail` and `fit` are live knobs.
+            fit: Fit::Cover,
             tint_milli: 1000,
             bg: Rgb(reel.bg.0, reel.bg.1, reel.bg.2),
             grid: Vec::new(),
@@ -453,6 +463,7 @@ mod tests {
     fn stretch_fills_more_than_contain() {
         // Contain letterboxes a 60x30 canvas on a wide panel; stretch must not.
         let mut c = built(160, 40);
+        assert!(c.set_param("fit", &ParamValue::Text { v: "contain".into() }));
         c.step();
         let contained = lit(&c);
         let mut s = built(160, 40);
@@ -469,7 +480,7 @@ mod tests {
     fn an_unknown_fit_is_rejected() {
         let mut f = built(80, 30);
         assert!(!f.set_param("fit", &ParamValue::Text { v: "sideways".into() }));
-        assert_eq!(f.fit, Fit::Contain);
+        assert_eq!(f.fit, Fit::Cover);
     }
 
     #[test]

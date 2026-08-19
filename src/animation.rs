@@ -213,6 +213,9 @@ pub const EFFECTS: &[&str] = &[
     "waves",
     "fire",
     "wizardtorch",
+    "tgevil",
+    "wzfire",
+    "raalien",
     "plasma",
     "tunnel",
     "starfield",
@@ -249,8 +252,17 @@ pub fn build(
             Box::new(w)
         }
         "fire" => Box::new(crate::fire::Fire::new(cols, rows, seed)),
-        "wizardtorch" => {
-            let mut w = crate::wizardtorch::WizardTorch::new(cols, rows);
+        // Still ASCII-art pieces, all through one effect: the art and its
+        // defaults are data, so a new piece is a `Piece`, not a new module.
+        "wizardtorch" | "tgevil" | "wzfire" | "raalien" => {
+            use crate::wizardtorch::pieces;
+            let (name, piece) = match name.trim().to_lowercase().as_str() {
+                "tgevil" => ("tgevil", pieces::tgevil()),
+                "wzfire" => ("wzfire", pieces::wzfire()),
+                "raalien" => ("raalien", pieces::raalien()),
+                _ => ("wizardtorch", pieces::wizardtorch()),
+            };
+            let mut w = crate::wizardtorch::WizardTorch::new(name, piece, cols, rows);
             w.set_frame_ms(cfg.frame_time().as_millis() as u64);
             Box::new(w)
         }
