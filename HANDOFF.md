@@ -572,6 +572,24 @@ AfterWindow(handle)`) on every focus change — see
 Panels must re-pin behind their terminal after Glaze finishes, every focus
 change, forever. The re-pin-every-reconcile strategy has held up in practice.
 
+## The GUI, and layered effects
+
+Both landed 2026-08-19 and have their own document: **`GUI-HANDOFF.md`**. Read
+that before touching `src/win98.rs`, `src/bin/panefx-gui.rs`, or anything to do
+with wallpaper layers.
+
+The short version:
+
+* **`panefx-gui`** is the TUI with a better input device, not a new product.
+  Same control channel, same commands; the TUI keeps working over SSH. Step 1
+  (the Windows 98 chrome, ported from slopkit) is done and verified on screen.
+* **Wallpaper effects now STACK.** A monitor holds a list, not one effect.
+  `wallpaper_<n>_effect` is layer 0; `wallpaper_<n>_layer<k>` are the layers
+  above it. Every config written before this stays valid.
+* The compositing rule needed no new machinery: `cell_at` returning `None`
+  already meant "draw nothing here", which on a stack means "let the layer below
+  show through".
+
 ## The desktop wallpaper (`desktop.rs` + `wallpaper.rs`)
 
 One animated surface per monitor, drawn into Explorer's WorkerW layer behind
