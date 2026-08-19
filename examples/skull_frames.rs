@@ -7,36 +7,34 @@
 //! irregular event is exactly what you miss.
 
 use panefx::animation::AsciiAnimation;
-use panefx::skullspin::{jump_phase, wink_phase, SkullSpin};
+use panefx::skullspin::{sequence, Act, SkullSpin};
 
 fn main() {
     let (cols, rows) = (46usize, 26usize);
     let (cw, ch) = (8usize, 12usize);
     let step_ms = 40u64;
 
-    // Walk time and collect the interesting moments: a plain frame, one
-    // mid-wink, and several across one jump.
-    let mut want: Vec<f32> = vec![0.0, 0.35, 0.7];
+    // Walk time and collect one frame of each ACT, plus a couple of plain
+    // spins. Sampling at fixed intervals would miss them: the sequence is
+    // deliberately irregular, which is the whole point of it.
+    let mut want: Vec<f32> = vec![0.0, 0.4];
     let mut t = 0.0f32;
     let (mut got_wink, mut got_jump) = (false, false);
-    while t < 40.0 && !(got_wink && got_jump) {
-        if !got_wink {
-            if let Some((p, _)) = wink_phase(t, 5.0, 0xBEEF) {
-                if p > 0.4 && p < 0.6 {
-                    want.push(t);
-                    got_wink = true;
-                }
+    while t < 90.0 && !(got_wink && got_jump) {
+        let (act, phase, _) = sequence(t, 4.0, 0x5EED);
+        match act {
+            Act::Wink if !got_wink && phase > 0.4 && phase < 0.6 => {
+                want.push(t);
+                got_wink = true;
             }
-        }
-        if !got_jump {
-            let (lift, _) = jump_phase(t, 9.0, 0x5EED, rows as f32 * 0.55);
-            if lift > 1.0 {
+            Act::Jump if !got_jump && phase > 0.1 => {
                 // The whole arc: crouch, rise, peak, fall, land.
-                for d in [-0.16f32, -0.05, 0.0, 0.14, 0.28] {
+                for d in [-0.10f32, 0.0, 0.16, 0.30, 0.46] {
                     want.push((t + d).max(0.0));
                 }
                 got_jump = true;
             }
+            _ => {}
         }
         t += step_ms as f32 / 1000.0;
     }

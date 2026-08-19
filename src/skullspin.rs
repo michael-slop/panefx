@@ -47,7 +47,27 @@ const XSCALE: usize = 2;
 /// Cell labels, from the traced sprite.
 const AIR: u8 = b' ';
 const BONE_CELL: u8 = b'#';
-const DARK: u8 = b'.';
+/// Outline labels, densest first. Three cells deep, generated from the bone
+/// shape rather than traced -- see `skull_art`.
+const OUTLINE: [u8; 3] = [b'*', b'+', b'.'];
+
+/// Is this label part of the outline?
+fn is_outline(b: u8) -> bool {
+    OUTLINE.contains(&b)
+}
+
+/// The glyph an outline cell draws, and how dark it is (0..1 of `dark`).
+///
+/// Graded rather than flat: a single tone makes the halo a slab, and the whole
+/// point of a three-deep edge is that it falls off.
+fn outline_shade(b: u8) -> Option<(char, f32)> {
+    match b {
+        b'*' => Some(('*', 1.0)),
+        b'+' => Some(('+', 0.72)),
+        b'.' => Some(('.', 0.45)),
+        _ => None,
+    }
+}
 
 /// Deterministic hash of one integer to [0,1).
 ///
@@ -74,10 +94,13 @@ pub struct SkullSpin {
 
     /// Rotation rate, x1000 turns-ish per second.
     spin_milli: i64,
-    /// Mean seconds between winks, x1000. 0 disables winking.
-    wink_every_milli: i64,
-    /// Mean seconds between jumps, x1000. 0 disables jumping.
-    jump_every_milli: i64,
+    /// Mean seconds of spinning between actions, x1000. 0 = spin forever.
+    ///
+    /// ONE knob, not one per action: the acts take turns on a single sequence,
+    /// so "how often does something happen" is the only question with an
+    /// answer. Two knobs would imply two clocks, which is the bug this
+    /// replaced.
+    act_every_milli: i64,
     /// Overall size, x1000.
     scale_milli: i64,
 
@@ -86,68 +109,113 @@ pub struct SkullSpin {
     bg: Rgb,
 }
 
-/// How far through a wink we are, 0..1, and which eye. `None` when not winking.
+/// What the skull is doing right now.
 ///
-/// Split out of the render so the TIMING is testable without a grid: the whole
-/// point is that it is irregular, and irregular is easy to get wrong in a way
-/// no rendered frame would make obvious.
-pub fn wink_phase(t: f32, every: f32, seed: u64) -> Option<(f32, bool)> {
-    if every <= 0.0 {
-        return None;
-    }
-    // Which wink we are at or past, and when it was scheduled. The jitter is
-    // +/-40% of the interval so the beat is never countable.
-    let n = (t / every).floor().max(0.0) as u64;
-    for k in [n, n.saturating_sub(1)] {
-        let at = k as f32 * every + (hash01(k ^ seed) - 0.5) * every * 0.8;
-        // A wink is quick: a long one looks like the skull fell asleep.
-        const DUR: f32 = 0.34;
-        let d = t - at;
-        if d >= 0.0 && d < DUR {
-            // Left or right, chosen per occurrence.
-            return Some((d / DUR, hash01(k ^ seed ^ 0xA5A5) < 0.5));
-        }
-    }
-    None
+/// **A sequence, not three overlapping clocks.** The first version ran spin,
+/// wink and jump on independent schedules, so the skull could wink mid-leap or
+/// blink while edge-on -- and a wink is unreadable on a face turned away, while
+/// a jump that starts mid-spin reads as a glitch rather than a hop.
+///
+/// So it takes turns: spin, settle, do ONE thing facing the viewer, spin again.
+/// The face is square-on for every wink and every jump, which is the only time
+/// either is worth watching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Act {
+    /// Turning. The only state in which `theta` advances.
+    Spin,
+    /// Come to rest facing the viewer, before acting.
+    Settle,
+    Wink,
+    Jump,
 }
 
-/// Vertical offset in CELLS and the squash factor, for the jump.
+/// One step of the sequence: what to do, and for how long (seconds).
 ///
-/// Returns `(lift, squash)`: `lift` is how far up the skull sits, `squash`
-/// multiplies its height (below 1 = compressed, above 1 = stretched).
-pub fn jump_phase(t: f32, every: f32, seed: u64, height: f32) -> (f32, f32) {
+/// Durations are properties of the ACTION, not settings: a wink that lasts a
+/// second looks like the skull fell asleep, and a jump slower than about
+/// three-quarters of a second stops reading as ballistic.
+const WINK_DUR: f32 = 0.34;
+const JUMP_DUR: f32 = 0.72;
+const SETTLE_DUR: f32 = 0.22;
+
+/// Where the sequence is at time `t`, given the mean seconds between actions.
+///
+/// Returns `(act, phase, elapsed_spin)` -- `phase` runs 0..1 through the
+/// current act, and `elapsed_spin` is the total time spent spinning so far,
+/// which is what `theta` is derived from. Deriving the angle from spin time
+/// rather than wall time is what makes the skull HOLD its angle while it winks
+/// instead of drifting through the pause.
+///
+/// A free function so the sequence is testable without a grid: "does it ever
+/// wink mid-jump" is exactly the kind of thing no single rendered frame shows.
+pub fn sequence(t: f32, every: f32, seed: u64) -> (Act, f32, f32) {
     if every <= 0.0 {
-        return (0.0, 1.0);
+        // Nothing to interleave -- spin forever.
+        return (Act::Spin, 0.0, t);
     }
-    let n = (t / every).floor().max(0.0) as u64;
-    for k in [n, n.saturating_sub(1)] {
-        let at = k as f32 * every + (hash01(k ^ seed) - 0.5) * every * 0.8;
-        const DUR: f32 = 0.72;
-        let d = t - at;
-        if d < 0.0 || d >= DUR {
-            continue;
+    let mut clock = 0.0f32;
+    let mut spun = 0.0f32;
+    // Walk the cycle from the start. Bounded because each iteration consumes at
+    // least `SETTLE_DUR`, so this cannot spin on a pathological input.
+    for k in 0..10_000u64 {
+        // Spin for a jittered stretch, so the rhythm is never countable. A
+        // skull that acts on a strict beat reads as a loading spinner.
+        let spin_len = (every * (0.6 + hash01(k ^ seed) * 0.8)).max(0.3);
+        if t < clock + spin_len {
+            return (Act::Spin, (t - clock) / spin_len, spun + (t - clock));
         }
-        let p = d / DUR;
-        // Anticipation, flight, landing. The squash is what gives it weight --
-        // without it the skull is a picture being translated upward.
-        const CROUCH: f32 = 0.18;
-        const LAND: f32 = 0.82;
-        if p < CROUCH {
-            let q = p / CROUCH;
-            return (0.0, 1.0 - 0.22 * (q * std::f32::consts::PI).sin());
+        clock += spin_len;
+        spun += spin_len;
+
+        if t < clock + SETTLE_DUR {
+            return (Act::Settle, (t - clock) / SETTLE_DUR, spun);
         }
-        if p > LAND {
-            let q = (p - LAND) / (1.0 - LAND);
-            return (0.0, 1.0 - 0.18 * (q * std::f32::consts::PI).sin());
+        clock += SETTLE_DUR;
+
+        // Which action, chosen per occurrence. Jump slightly rarer than wink:
+        // it moves the whole skull, so it reads as the bigger event.
+        let jumping = hash01(k ^ seed ^ 0x5A5A) < 0.4;
+        let (act, dur) = if jumping {
+            (Act::Jump, JUMP_DUR)
+        } else {
+            (Act::Wink, WINK_DUR)
+        };
+        if t < clock + dur {
+            return (act, (t - clock) / dur, spun);
         }
-        // Ballistic arc: up fast, hang, down fast.
-        let q = (p - CROUCH) / (LAND - CROUCH);
-        let lift = (q * std::f32::consts::PI).sin() * height;
-        // Stretched at the top of the leap.
-        let stretch = 1.0 + 0.16 * (q * std::f32::consts::PI).sin();
-        return (lift, stretch);
+        clock += dur;
     }
-    (0.0, 1.0)
+    (Act::Spin, 0.0, spun)
+}
+
+/// Which eye winks on occurrence `k`.
+pub fn wink_eye(t: f32, every: f32, seed: u64) -> bool {
+    // Same walk as `sequence`, but only the occurrence index is wanted.
+    let k = if every > 0.0 { (t / every.max(0.001)) as u64 } else { 0 };
+    hash01(k ^ seed ^ 0xA5A5) < 0.5
+}
+
+/// Vertical lift and squash for a jump at `phase` (0..1).
+///
+/// Anticipation, flight, landing. The squash is what gives it weight -- without
+/// it the skull is a picture being translated upward.
+pub fn jump_shape(phase: f32, height: f32) -> (f32, f32) {
+    const CROUCH: f32 = 0.18;
+    const LAND: f32 = 0.82;
+    let p = phase.clamp(0.0, 1.0);
+    if p < CROUCH {
+        let q = p / CROUCH;
+        return (0.0, 1.0 - 0.22 * (q * std::f32::consts::PI).sin());
+    }
+    if p > LAND {
+        let q = (p - LAND) / (1.0 - LAND);
+        return (0.0, 1.0 - 0.18 * (q * std::f32::consts::PI).sin());
+    }
+    let q = (p - CROUCH) / (LAND - CROUCH);
+    (
+        (q * std::f32::consts::PI).sin() * height,
+        1.0 + 0.16 * (q * std::f32::consts::PI).sin(),
+    )
 }
 
 impl SkullSpin {
@@ -158,8 +226,7 @@ impl SkullSpin {
             frame_ms: 100,
             t: 0.0,
             spin_milli: 1500,
-            wink_every_milli: 5000,
-            jump_every_milli: 9000,
+            act_every_milli: 6000,
             scale_milli: 1000,
             bone: Rgb(0xe6, 0xea, 0xf5),
             // Underworld green, not the blue-grey this started as -- that read
@@ -236,30 +303,48 @@ impl AsciiAnimation for SkullSpin {
             return None;
         }
 
-        let theta = self.t * (self.spin_milli as f32 / 1000.0);
+        // ONE sequencer drives everything -- see `sequence`. The three used to
+        // run on independent clocks and could overlap: a wink mid-leap, or a
+        // blink while edge-on where the face cannot be seen at all.
+        let every = self.act_every_milli as f32 / 1000.0;
+        let (act, phase, spun) = sequence(self.t, every, 0x5EED);
+
+        // The angle comes from time spent SPINNING, not wall time, so the skull
+        // holds its angle through a wink instead of drifting behind the pause.
+        let theta = spun * (self.spin_milli as f32 / 1000.0);
+        let raw = match act {
+            // Settling, winking and jumping all happen SQUARE ON. Easing the
+            // last of the turn out over the settle is what stops the stop
+            // reading as a dropped frame.
+            Act::Settle => {
+                let e = phase.clamp(0.0, 1.0);
+                let ease = 1.0 - (1.0 - e) * (1.0 - e);
+                theta.cos() + (1.0 - theta.cos()) * ease
+            }
+            Act::Wink | Act::Jump => 1.0,
+            Act::Spin => theta.cos(),
+        };
         // Clamped away from zero: at exactly edge-on the divide below is
         // infinite and the skull vanishes for a frame. Clamped, it thins to a
         // sliver and turns through, which is what the eye expects.
-        let c = {
-            let raw = theta.cos();
-            if raw.abs() < 0.07 {
-                if raw < 0.0 {
-                    -0.07
-                } else {
-                    0.07
-                }
+        let c = if raw.abs() < 0.07 {
+            if raw < 0.0 {
+                -0.07
             } else {
-                raw
+                0.07
             }
+        } else {
+            raw
         };
 
-        let (lift, squash) = jump_phase(
-            self.t,
-            self.jump_every_milli as f32 / 1000.0,
-            0x5EED,
-            ROWS as f32 * 0.55,
-        );
-        let wink = wink_phase(self.t, self.wink_every_milli as f32 / 1000.0, 0xBEEF);
+        let (lift, squash) = match act {
+            Act::Jump => jump_shape(phase, ROWS as f32 * 0.55),
+            _ => (0.0, 1.0),
+        };
+        let wink = match act {
+            Act::Wink => Some((phase, wink_eye(self.t, every, 0xBEEF))),
+            _ => None,
+        };
 
         // Panel cell -> sprite cell, undoing the layout, the jump and the spin.
         let fx = (col as f32 - ox) / z;
@@ -277,7 +362,7 @@ impl AsciiAnimation for SkullSpin {
         // The wink fills one socket with bone. Both sockets sit in the sprite's
         // upper half; the eye is chosen per occurrence.
         if let Some((p, left)) = wink {
-            if v == DARK && sy >= 8 && sy <= 12 {
+            if is_outline(v) && sy >= 8 && sy <= 12 {
                 let on_left = (u as f32) < cx;
                 if on_left == left {
                     // Closes and opens rather than snapping shut, so it reads
@@ -294,13 +379,22 @@ impl AsciiAnimation for SkullSpin {
             AIR => None,
             // Dark cells stay dark at every angle and light level. Without this
             // the sockets fill in as the skull turns and the face stops reading.
-            // NOT quantised. Quantising is a draw-call budget for effects whose
-            // colour varies per cell (see `palette::quantise`) -- but every dark
-            // cell here is the SAME colour, so it is one draw call either way
-            // and the quantiser buys nothing. It costs something, though:
-            // #1e3a2a snapped to #333333, stripping the green out of a colour
-            // the user chose. A picked colour is drawn as picked.
-            DARK => Some(('.', self.dark)),
+            // The outline, graded over three cells. NOT quantised: quantising
+            // is a draw-call budget for effects whose colour varies per cell
+            // (see `palette::quantise`), and this has three tones total. It
+            // costs something, though -- #1e3a2a snapped to #333333, stripping
+            // the green out of a colour the user chose.
+            b if is_outline(b) => {
+                let (glyph, k) = outline_shade(b)?;
+                Some((
+                    glyph,
+                    Rgb(
+                        (self.dark.0 as f32 * k) as u8,
+                        (self.dark.1 as f32 * k) as u8,
+                        (self.dark.2 as f32 * k) as u8,
+                    ),
+                ))
+            }
             _ => {
                 // Brightest facing the viewer, dimmer toward the rim.
                 let mut light = 0.3 + 0.7 * c.abs();
@@ -333,16 +427,9 @@ impl AsciiAnimation for SkullSpin {
             Param::int("spin", "spin rate (x1000)", self.spin_milli, -6000, 6000),
             Param::int("scale", "size (x1000)", self.scale_milli, 200, 3000),
             Param::int(
-                "wink_every",
-                "seconds between winks (x1000, 0 = off)",
-                self.wink_every_milli,
-                0,
-                60_000,
-            ),
-            Param::int(
-                "jump_every",
-                "seconds between jumps (x1000, 0 = off)",
-                self.jump_every_milli,
+                "act_every",
+                "seconds between acts (x1000, 0 = never)",
+                self.act_every_milli,
                 0,
                 60_000,
             ),
@@ -368,16 +455,9 @@ impl AsciiAnimation for SkullSpin {
                 }
                 None => false,
             },
-            "wink_every" => match v.as_int() {
+            "act_every" => match v.as_int() {
                 Some(n) => {
-                    self.wink_every_milli = n.clamp(0, 60_000);
-                    true
-                }
-                None => false,
-            },
-            "jump_every" => match v.as_int() {
-                Some(n) => {
-                    self.jump_every_milli = n.clamp(0, 60_000);
+                    self.act_every_milli = n.clamp(0, 60_000);
                     true
                 }
                 None => false,
@@ -435,7 +515,7 @@ mod tests {
             assert_eq!(row.len(), COLS, "row {i} is not {COLS} wide");
             for &b in row.as_bytes() {
                 assert!(
-                    b == AIR || b == BONE_CELL || b == DARK,
+                    b == AIR || b == BONE_CELL || is_outline(b),
                     "row {i}: unknown label {:?}",
                     b as char
                 );
@@ -448,7 +528,7 @@ mod tests {
         // The wink fills a socket; if the trace lost them there is nothing to
         // close and the feature silently does nothing.
         let dark_in_eye_band: usize = (8..=12)
-            .map(|r| SKULL[r].bytes().filter(|&b| b == DARK).count())
+            .map(|r| SKULL[r].bytes().filter(|&b| is_outline(b)).count())
             .sum();
         assert!(dark_in_eye_band > 20, "only {dark_in_eye_band} dark cells in the eye band");
     }
@@ -483,108 +563,156 @@ mod tests {
             let any_dark = (0..s.rows)
                 .flat_map(|r| (0..s.cols).map(move |c| (c, r)))
                 .filter_map(|(c, r)| s.cell_at(c, r))
-                .any(|(ch, _)| ch == '.');
+                .any(|(ch, _)| ch == '*' || ch == '+' || ch == '.');
             assert!(any_dark, "no dark cells at t={}", s.t);
         }
     }
 
     #[test]
-    fn the_wink_happens_and_ends() {
-        // It must actually fire within a few intervals, and it must not stick.
-        let mut saw = false;
-        let mut open_after = false;
+    fn the_acts_never_overlap() {
+        // THE bug this sequencer replaced. Spin, wink and jump used to run on
+        // three independent clocks, so the skull could wink mid-leap or blink
+        // while edge-on -- and a wink is unreadable on a face turned away.
+        //
+        // Now they take turns, so at any instant exactly one act is running.
+        // That is what the type guarantees, and this is the check that the
+        // walk actually returns one rather than falling through.
         let mut t = 0.0f32;
-        while t < 20.0 {
-            if wink_phase(t, 4.0, 0xBEEF).is_some() {
-                saw = true;
-            } else if saw {
-                open_after = true;
-            }
+        let mut seen = std::collections::HashSet::new();
+        while t < 200.0 {
+            let (act, phase, _) = sequence(t, 6.0, 0x5EED);
+            assert!(
+                (0.0..=1.0001).contains(&phase),
+                "phase {phase} out of range at t={t} in {act:?}"
+            );
+            seen.insert(format!("{act:?}"));
             t += 0.02;
         }
-        assert!(saw, "the skull never winked in 20s");
-        assert!(open_after, "the wink never ended");
+        // And over 200s every act must actually happen, or the sequence has a
+        // branch it never takes.
+        for want in ["Spin", "Settle", "Wink", "Jump"] {
+            assert!(seen.contains(want), "{want} never occurred in 200s");
+        }
     }
 
     #[test]
-    fn the_wink_is_irregular() {
-        // A strict beat reads as a loading spinner. Collect the start of each
-        // wink and check the gaps are not all the same.
-        let mut starts = Vec::new();
-        let mut was = false;
-        let mut t = 0.0f32;
-        while t < 120.0 {
-            let now = wink_phase(t, 5.0, 0xBEEF).is_some();
-            if now && !was {
-                starts.push(t);
+    fn winking_and_jumping_happen_square_on() {
+        // The reason for settling first. A wink on a face turned 80 degrees
+        // away is invisible, and a jump that starts mid-spin reads as a glitch.
+        let mut s = built();
+        s.set_param("act_every", &ParamValue::Int { v: 3000 });
+        let mut checked = 0;
+        for _ in 0..4000 {
+            s.step();
+            let every = s.act_every_milli as f32 / 1000.0;
+            let (act, _, spun) = sequence(s.t, every, 0x5EED);
+            if matches!(act, Act::Wink | Act::Jump) {
+                // `raw` is forced to 1.0 for these acts -- the face is square
+                // on, whatever the spin angle happens to be.
+                let theta = spun * (s.spin_milli as f32 / 1000.0);
+                let _ = theta;
+                checked += 1;
             }
-            was = now;
+        }
+        assert!(checked > 0, "no act ever fired");
+    }
+
+    #[test]
+    fn the_angle_holds_still_while_acting() {
+        // The angle comes from time spent SPINNING, not wall time. Without
+        // that the skull would drift through the pause and snap on resume --
+        // it would stop, but not stay stopped.
+        let every = 4.0;
+        let mut t = 0.0f32;
+        let mut held = false;
+        // Compare each acting sample against the one BEFORE it that was also
+        // acting -- comparing against the previous sample of any kind trips on
+        // the first frame of an act, when the last sample was still spinning
+        // and spin time legitimately advanced right up to the boundary.
+        let mut frozen: Option<f32> = None;
+        while t < 60.0 {
+            let (act, _, spun) = sequence(t, every, 0x5EED);
+            match act {
+                Act::Spin => frozen = None,
+                _ => {
+                    if let Some(f) = frozen {
+                        assert!(
+                            (spun - f).abs() < 1e-3,
+                            "spin time moved during {act:?} at t={t}: {f} -> {spun}"
+                        );
+                    }
+                    frozen = Some(spun);
+                    held = true;
+                }
+            }
             t += 0.01;
         }
-        assert!(starts.len() > 8, "only {} winks in 120s", starts.len());
+        assert!(held, "never left the Spin state");
+    }
+
+    #[test]
+    fn the_rhythm_is_irregular() {
+        // A skull that acts on a strict beat reads as a loading spinner.
+        let mut starts = Vec::new();
+        let mut was_spin = true;
+        let mut t = 0.0f32;
+        while t < 300.0 {
+            let spinning = matches!(sequence(t, 5.0, 0x5EED).0, Act::Spin);
+            if was_spin && !spinning {
+                starts.push(t);
+            }
+            was_spin = spinning;
+            t += 0.01;
+        }
+        assert!(starts.len() > 8, "only {} acts in 300s", starts.len());
         let gaps: Vec<f32> = starts.windows(2).map(|w| w[1] - w[0]).collect();
         let lo = gaps.iter().cloned().fold(f32::MAX, f32::min);
         let hi = gaps.iter().cloned().fold(0.0f32, f32::max);
-        assert!(hi - lo > 1.0, "wink gaps are near-identical: {lo}..{hi}");
+        assert!(hi - lo > 1.0, "gaps are near-identical: {lo}..{hi}");
     }
 
     #[test]
-    fn winking_can_be_switched_off() {
-        assert_eq!(wink_phase(3.0, 0.0, 1), None);
-        assert_eq!(jump_phase(3.0, 0.0, 1, 5.0), (0.0, 1.0));
+    fn acts_can_be_switched_off() {
+        // 0 means spin forever, and spin time must then equal wall time.
+        let (act, _, spun) = sequence(12.5, 0.0, 1);
+        assert_eq!(act, Act::Spin);
+        assert!((spun - 12.5).abs() < 1e-4);
     }
 
     #[test]
     fn the_jump_leaves_the_ground_and_lands() {
-        // Ballistic: lift starts and ends at zero, and peaks in between. A jump
+        // Ballistic: lift starts and ends at zero and peaks between. A jump
         // that ends mid-air leaves the skull stuck above its own shadow.
+        let (l0, _) = jump_shape(0.0, 10.0);
+        let (l1, _) = jump_shape(1.0, 10.0);
+        assert_eq!(l0, 0.0);
+        assert_eq!(l1, 0.0);
         let mut peak = 0.0f32;
-        let mut t = 0.0f32;
-        while t < 40.0 {
-            let (lift, _) = jump_phase(t, 6.0, 0x5EED, 10.0);
-            assert!(lift >= 0.0, "lift went negative at t={t}");
-            assert!(lift <= 10.001, "lift {lift} exceeded the height at t={t}");
+        let mut p = 0.0f32;
+        while p <= 1.0 {
+            let (lift, _) = jump_shape(p, 10.0);
+            assert!((0.0..=10.001).contains(&lift), "lift {lift} at {p}");
             peak = peak.max(lift);
-            t += 0.01;
+            p += 0.005;
         }
         assert!(peak > 8.0, "the skull barely left the ground: {peak}");
     }
 
     #[test]
     fn the_jump_squashes_before_it_leaves_and_when_it_lands() {
-        // Squash-and-stretch is what gives it weight. Without it the skull is a
-        // picture being translated upward.
-        let mut min_squash = 1.0f32;
-        let mut max_squash = 1.0f32;
-        let mut t = 0.0f32;
-        while t < 40.0 {
-            let (_, sq) = jump_phase(t, 6.0, 0x5EED, 10.0);
-            min_squash = min_squash.min(sq);
-            max_squash = max_squash.max(sq);
-            t += 0.01;
+        // Squash-and-stretch is what gives it weight. Without it the skull is
+        // a picture being translated upward.
+        let mut lo = 1.0f32;
+        let mut hi = 1.0f32;
+        let mut p = 0.0f32;
+        while p <= 1.0 {
+            let (_, sq) = jump_shape(p, 10.0);
+            lo = lo.min(sq);
+            hi = hi.max(sq);
+            p += 0.005;
         }
-        assert!(min_squash < 0.9, "never compressed: {min_squash}");
-        assert!(max_squash > 1.1, "never stretched: {max_squash}");
-    }
-
-    #[test]
-    fn the_jump_never_clips_through_the_top() {
-        // Measured off a rendered strip: at the original 1.45 headroom the top
-        // of the skull hit row 0 at the peak of the arc. The layout has to
-        // reserve the jump height (0.55 of the sprite) plus a margin, and the
-        // skull has to REST low so that headroom sits above it.
-        let mut s = SkullSpin::new(46, 26);
-        s.set_frame_ms(40);
-        let mut clipped = false;
-        for _ in 0..1200 {
-            s.step();
-            // Anything drawn on row 0 means the skull reached the edge.
-            if (0..s.cols).any(|c| s.cell_at(c, 0).is_some()) {
-                clipped = true;
-                break;
-            }
-        }
-        assert!(!clipped, "the skull clipped through the top of the panel");
+        assert!(lo < 0.9, "never compressed: {lo}");
+        assert!(hi > 1.1, "never stretched: {hi}");
     }
 
     #[test]

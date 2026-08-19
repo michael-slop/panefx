@@ -12,35 +12,39 @@
 //!
 //! Cells are LABELS, not pixels:
 //!
-//!   ` ` air   `#` bone   `.` dark (outline, eye sockets, nose, tooth gaps)
+//!   ` ` air   `#` bone   `*` `+` `.` outline, densest nearest the bone
 //!
-//! The dark cells must stay dark at every angle and every light level, or
-//! the sockets fill in and the face stops reading as a face. That is a
-//! property of the drawing, which is why the labels are stored rather than
-//! a finished picture.
+//! The outline is DERIVED, not traced. The sprite's own dark pixels are
+//! baked in asymmetrically -- heavy under the bottom-right, thin across the
+//! front -- which reads as a lopsided smudge once the skull turns. They are
+//! discarded and the edge is regenerated from the bone shape, so it cannot
+//! be heavier on one side: the rule does not know which side it is on.
+//!
+//! Outline cells must stay DARK at every angle and light level, or the
+//! sockets fill in and the face stops reading as a face.
 
 pub const COLS: usize = 23;
 pub const ROWS: usize = 19;
 
 /// One row per line. See the module header for the alphabet.
 pub const SKULL: [&str; ROWS] = [
-    "   ................    ",
-    "  ..................   ",
-    " .....############...  ",
-    ".....##############... ",
-    "....################...",
-    "...##################..",
-    "...###################.",
-    "..####################.",
-    "..######....#####....#.",
-    "..#####......###......#",
-    "..#####......###......#",
-    "..#####......###......#",
-    "..######....##.##....##",
-    "..###########...#####..",
-    "...##################..",
-    "......###############..",
-    ".......##############..",
-    " ......###.##.##.##.#..",
-    "     ..###.##.##.##.#..",
+    "  ..++++++++++++++++.. ",
+    " ..++**************++..",
+    "..++**############**++.",
+    ".++**##############**++",
+    ".+**################**+",
+    "++*##################**",
+    "+**###################*",
+    "+*####################*",
+    "+*######****#####****#*",
+    "+*#####**++**###**++**#",
+    "+*#####*++++*###*++++*#",
+    "+*#####**++**###**++**#",
+    "+*######****##*##****##",
+    "+*###########***#####**",
+    "+**##################*+",
+    "++****###############*+",
+    ".++++**##############*+",
+    "....++*###*##*##*##*#*+",
+    "   ..+*###*##*##*##*#*+",
 ];

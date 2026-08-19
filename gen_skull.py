@@ -38,25 +38,68 @@ im = Image.open(SPRITE).convert("RGBA")
 crop = im.crop((SX, SY, SX + SW, SY + SH))
 px = crop.load()
 
+# --- classify -------------------------------------------------------------
+#
+# TWO passes, and the second is the point.
+#
+# The sprite's own dark pixels are NOT used as the outline. They are baked into
+# the art asymmetrically -- heavy under the bottom-right, thin across the front
+# -- which reads as a lopsided smudge rather than a drawn edge once the skull
+# starts turning. So they are discarded, and the outline is DERIVED from the
+# bone shape instead: every empty cell touching bone becomes outline, at a
+# depth measured in cells from the edge.
+#
+# Derived means uniform by construction. There is no way for one side to end up
+# heavier than another, because the rule does not know which side it is on.
+BONE = 1
+AIR = 0
+
+bone = [[False] * SW for _ in range(SH)]
+for y in range(SH):
+    for x in range(SW):
+        r, g, b, a = px[x, y]
+        # Opaque AND bright is bone. Everything else -- transparent, or the
+        # sprite's own dark edge -- is treated as empty and re-outlined below.
+        bone[y][x] = a >= 40 and (r + g + b) >= 384
+
+def dist_to_bone(x, y, limit):
+    """Chebyshev distance from (x, y) to the nearest bone cell, capped."""
+    for d in range(1, limit + 1):
+        for yy in range(y - d, y + d + 1):
+            for xx in range(x - d, x + d + 1):
+                # Only the ring at exactly distance d.
+                if max(abs(yy - y), abs(xx - x)) != d:
+                    continue
+                if 0 <= yy < SH and 0 <= xx < SW and bone[yy][xx]:
+                    return d
+    return None
+
+# The outline ramp, densest nearest the bone. Real ASCII rather than block
+# shades: the skull itself is drawn in blocks, so an ASCII edge separates the
+# silhouette from its surround instead of blending into it.
+#
+# Three cells deep -- one is a hard line, and beyond three the halo starts
+# competing with the face for attention.
+OUTLINE = "*+."
+DEPTH = len(OUTLINE)
+
 rows = []
-counts = {0: 0, 1: 0, 2: 0}
+counts = {"bone": 0, "outline": 0, "air": 0}
 for y in range(SH):
     line = ""
     for x in range(SW):
-        r, g, b, a = px[x, y]
-        if a < 40:
-            v = 0
-        elif r + g + b < 384:
-            v = 2
+        if bone[y][x]:
+            line += "#"
+            counts["bone"] += 1
+            continue
+        d = dist_to_bone(x, y, DEPTH)
+        if d is None:
+            line += " "
+            counts["air"] += 1
         else:
-            v = 1
-        counts[v] += 1
-        line += " #."[v] if v != 1 else "#"
-    # ' ' air, '#' bone, '.' dark
-    rows.append("".join(" #."[v] for v in
-                        [(0 if px[x, y][3] < 40 else
-                          (2 if sum(px[x, y][:3]) < 384 else 1))
-                         for x in range(SW)]))
+            line += OUTLINE[d - 1]
+            counts["outline"] += 1
+    rows.append(line)
 
 out = []
 out.append("//! The michael.slop skull, traced out of the mascot sprite.")
@@ -73,12 +116,16 @@ out.append("//! cleaner silhouette, and it stops the jump lifting a floating nec
 out.append("//!")
 out.append("//! Cells are LABELS, not pixels:")
 out.append("//!")
-out.append("//!   ` ` air   `#` bone   `.` dark (outline, eye sockets, nose, tooth gaps)")
+out.append("//!   ` ` air   `#` bone   `*` `+` `.` outline, densest nearest the bone")
 out.append("//!")
-out.append("//! The dark cells must stay dark at every angle and every light level, or")
-out.append("//! the sockets fill in and the face stops reading as a face. That is a")
-out.append("//! property of the drawing, which is why the labels are stored rather than")
-out.append("//! a finished picture.")
+out.append("//! The outline is DERIVED, not traced. The sprite\'s own dark pixels are")
+out.append("//! baked in asymmetrically -- heavy under the bottom-right, thin across the")
+out.append("//! front -- which reads as a lopsided smudge once the skull turns. They are")
+out.append("//! discarded and the edge is regenerated from the bone shape, so it cannot")
+out.append("//! be heavier on one side: the rule does not know which side it is on.")
+out.append("//!")
+out.append("//! Outline cells must stay DARK at every angle and light level, or the")
+out.append("//! sockets fill in and the face stops reading as a face.")
 out.append("")
 out.append("pub const COLS: usize = {};".format(SW))
 out.append("pub const ROWS: usize = {};".format(SH))
@@ -90,7 +137,7 @@ for r in rows:
 out.append("];")
 
 io.open(OUT, "w", encoding="utf-8", newline="\n").write("\n".join(out) + "\n")
-print("{}: {}x{}  air={} bone={} dark={}".format(
-    OUT, SW, SH, counts[0], counts[1], counts[2]))
+print("{}: {}x{}  bone={} outline={} air={}".format(
+    OUT, SW, SH, counts["bone"], counts["outline"], counts["air"]))
 for r in rows:
     print("   |" + r + "|")
