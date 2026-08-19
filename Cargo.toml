@@ -17,6 +17,10 @@ path = "src/main.rs"
 name = "panefx-ctl"
 path = "src/bin/panefx-ctl.rs"
 
+[[bin]]
+name = "panefx-gui"
+path = "src/bin/panefx-gui.rs"
+
 [dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
@@ -24,6 +28,23 @@ serde_json = "1"
 tungstenite = "0.24"
 ratatui = "0.29"
 crossterm = "0.28"
+# The GUI. See src/win98.rs for why one exists at all when the TUI works.
+#
+# GLOW, NOT WGPU, and default features OFF. eframe's default backend is wgpu,
+# which pulls `windows 0.62` while panefx pins `windows 0.58` for its own Win32
+# and DirectComposition work. Two major versions of that crate in one binary do
+# not merely coexist -- wgpu-hal's DX12 backend fails to compile against the
+# wrong one, with a wall of trait errors pointing into other people's crates
+# rather than at the real cause. Measured, not guessed: the build failed exactly
+# this way before the switch.
+#
+# glow is an OpenGL backend with no windows-crate dependency at all, so the
+# conflict cannot recur. For a control panel drawing rectangles and text it is
+# also the right tool -- nothing here needs a GPU compute pipeline.
+eframe = { version = "0.36", default-features = false, features = [
+  "glow",
+  "default_fonts",
+] }
 
 [dependencies.windows]
 version = "0.58"
