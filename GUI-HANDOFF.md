@@ -1,7 +1,7 @@
 # panefx-gui — handoff
 
-Written 2026-08-19. **Step 1 of 5 is done and on screen.** This is where to pick
-it up.
+Written 2026-08-19. **Steps 1 and 2 of 5 are done — there is a GUI you can run
+and click.** This is where to pick it up.
 
 Read `HANDOFF.md` first for panefx itself; this covers only the GUI and the
 layer model built alongside it.
@@ -100,14 +100,37 @@ Screenshot it with `scratchpad\shot.ps1` run through a scheduled task with
 
 ---
 
-## Steps 2-5 — TODO
+## Step 2 — DONE: connection, tabs, and layers
 
-2. **The connection and three tabs, read-only.** Reuse
-   `panefx::control::{Command, Snapshot, DEFAULT_PORT}` so the protocol cannot
-   drift, and the TUI's connection shape (`panefx-ctl.rs:151-167`).
-   **Include the GlazeWM check here** — Michael asked for it: if GlazeWM is
-   absent the Effects tab must say so and link **glzr.io**, mentioning Alacritty
-   too, rather than showing dead controls. TUI-fx panes cannot work without it.
+`src/bin/panefx-gui.rs`. Run it with GlazeWM's `shell-exec` (see below).
+
+What works: it connects and polls, shows all four monitors with their effect
+and stack depth, and the detail pane sets the base effect or adds a layer above
+it. **That is the first UI layers have had at all** — before this the control
+command was the only way in.
+
+The GlazeWM check is in: with GlazeWM absent the TUI-fx tab explains that the
+backdrops have nothing to follow and links glzr.io and alacritty.org. Not a
+greyed control — a disabled slider reads as "broken" where this says why.
+
+The dirty flag is SHOWN: "unsaved" in the title bar, save/revert in the status
+bar. The daemon being down is a state with a Start button, not an exit.
+
+### Two traps this cost
+
+* **The window froze.** `TcpStream::connect` to a refused port blocks about a
+  second on Windows, and it runs on the UI thread — long enough that Windows
+  paints "(Not Responding)" over the title bar. Use `connect_timeout` (120ms)
+  with short read/write timeouts (400ms) and back off to 2s while down. Anything
+  blocking on the UI thread will do this.
+* **A snapshot field does nothing until the DAEMON is reinstalled.** Adding
+  `layers` to `WallpaperMonitorView` and rebuilding the GUI is not enough — the
+  running daemon still serialises the old shape, and the symptom (detail pane
+  says "off", list says "skullspin") looks exactly like a GUI bug. Run
+  `.uild.ps1 -Install`.
+
+## Steps 3-5 — TODO
+
 3. **Editing** — faders (Sunken trough + Raised thumb), the colour picker,
    effect cycling, save/revert. **slopkit has NO fader or meter widget**:
    s0nar.slop's DESIGN.md describes them but `voicepanel.go` uses stock
