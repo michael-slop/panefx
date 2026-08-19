@@ -127,7 +127,7 @@ bar. The daemon being down is a state with a Start button, not an exit.
   `layers` to `WallpaperMonitorView` and rebuilding the GUI is not enough — the
   running daemon still serialises the old shape, and the symptom (detail pane
   says "off", list says "skullspin") looks exactly like a GUI bug. Run
-  `.uild.ps1 -Install`.
+  `build.ps1 -Install`.
 
 ## Steps 3-5 — TODO
 
