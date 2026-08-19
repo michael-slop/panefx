@@ -287,6 +287,117 @@ pub fn install_font(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+/// A Windows 98 fader: a sunken trough with a raised thumb.
+///
+/// **Created, not ported.** s0nar.slop's DESIGN.md describes "a beveled trough
+/// with a raised thumb", but slopkit never built one -- `voicepanel.go` uses a
+/// stock Fyne slider. So this is the idiom being written down for the first
+/// time, from the `Bevel` primitive.
+///
+/// Returns `Some(new_value)` only when the value actually CHANGED, so a caller
+/// can send a command per change rather than per frame. A slider that fires
+/// every frame while held would flood the daemon with identical writes.
+pub fn fader(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    value: i64,
+    min: i64,
+    max: i64,
+    width: f32,
+) -> Option<i64> {
+    let height = 22.0;
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::click_and_drag());
+    let painter = ui.painter();
+
+    // The trough is a thin sunken groove down the middle, not the full height:
+    // a full-height well would leave no room for the thumb to stand proud of.
+    let groove_h = 6.0;
+    let groove = Rect::from_min_size(
+        egui::pos2(rect.min.x, rect.center().y - groove_h / 2.0),
+        Vec2::new(rect.width(), groove_h),
+    );
+    bevel(painter, groove, Bevel::Sunken, p, Some(p.field_bg));
+
+    let span = (max - min).max(1) as f32;
+    let t = ((value - min) as f32 / span).clamp(0.0, 1.0);
+
+    // The thumb is inset by its own width so it never hangs off either end.
+    let thumb_w = 11.0;
+    let travel = (rect.width() - thumb_w).max(1.0);
+    let thumb = Rect::from_min_size(
+        egui::pos2(rect.min.x + t * travel, rect.min.y),
+        Vec2::new(thumb_w, height),
+    );
+    bevel(painter, thumb, Bevel::Raised, p, Some(p.button_face));
+
+    // Clicking anywhere on the trough jumps there -- Win98 pages by a step, but
+    // jump-to-click is what a mouse user expects now and it is strictly less
+    // fiddly on a 300px slider with a 5000-wide range.
+    if resp.dragged() || resp.clicked() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let x = (pos.x - rect.min.x - thumb_w / 2.0).clamp(0.0, travel);
+            let nt = x / travel;
+            let nv = min + (nt * span).round() as i64;
+            let nv = nv.clamp(min, max);
+            if nv != value {
+                return Some(nv);
+            }
+        }
+    }
+    None
+}
+
+/// A colour swatch: a sunken well showing the colour, clickable.
+///
+/// Sunken rather than raised because it is a sample you look INTO, the way a
+/// field is -- a raised swatch reads as a button that happens to be coloured.
+pub fn swatch(ui: &mut egui::Ui, p: &Palette, colour: Color32, size: Vec2) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    bevel(ui.painter(), rect, Bevel::Sunken, p, Some(colour));
+    resp
+}
+
+/// A hard-edged segment meter. Blocks, never a gradient or a smooth bar.
+///
+/// `value` is 0..1. Segments light up left to right; the unlit ones stay as
+/// visible wells so the meter's full range is always readable, which is what
+/// stops a quiet meter looking like a broken one.
+pub fn segment_meter(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    value: f32,
+    segments: usize,
+    size: Vec2,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::hover());
+    bevel(ui.painter(), rect, Bevel::Sunken, p, Some(p.field_bg));
+    let n = segments.max(1);
+    let inner = rect.shrink(BEVEL_THICKNESS + 1.0);
+    let gap = 1.0;
+    let seg_w = ((inner.width() - gap * (n - 1) as f32) / n as f32).max(1.0);
+    let lit = (value.clamp(0.0, 1.0) * n as f32).round() as usize;
+    for i in 0..n {
+        let x = inner.min.x + i as f32 * (seg_w + gap);
+        let r = Rect::from_min_size(egui::pos2(x, inner.min.y), Vec2::new(seg_w, inner.height()));
+        // Green through amber to red: the meter says "how close to the top" as
+        // well as "how much", which a single colour cannot.
+        let frac = i as f32 / n as f32;
+        let c = if i < lit {
+            if frac > 0.85 {
+                p.bad
+            } else if frac > 0.65 {
+                p.warn
+            } else {
+                p.ok
+            }
+        } else {
+            p.panel_bg
+        };
+        ui.painter().rect_filled(r, CornerRadius::ZERO, c);
+    }
+    resp
+}
+
 /// Theme sizes, from slopkit's `theme.go`. The numbers are the design.
 pub mod size {
     pub const TEXT: f32 = 14.0;

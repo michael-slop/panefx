@@ -137,6 +137,24 @@ struct App {
     dirty: bool,
     status: String,
     dark: bool,
+    /// Which colour param has its picker open, as `(scope, key)`. `scope` is
+    /// the monitor index, or `usize::MAX` for the pane.
+    ///
+    /// One at a time: two open pickers would both be editing and only one can
+    /// have the pointer, which reads as the other being stuck.
+    open_picker: Option<(usize, String)>,
+    /// The colour being built in the open picker. Committed on Apply, so
+    /// dragging around the wheel does not send a command per pixel.
+    picker_rgb: [u8; 3],
+    /// Which effect and layer the open picker belongs to.
+    picker_effect: String,
+    picker_layer: usize,
+    /// Deferred, because the window closure borrows `self` immutably and
+    /// cannot send a command from inside it.
+    pending_apply: Option<(Option<usize>, String, usize, String, [u8; 3])>,
+    pending_close: bool,
+    /// The copy-to-displays sheet is open for this monitor.
+    copy_from: Option<usize>,
     /// Cached: probing the filesystem every frame would be silly.
     glazewm: bool,
     last_poll: std::time::Instant,
@@ -157,6 +175,13 @@ impl App {
             dirty: false,
             status: String::new(),
             dark: false,
+            open_picker: None,
+            picker_rgb: [128, 128, 128],
+            picker_effect: String::new(),
+            picker_layer: 0,
+            pending_apply: None,
+            pending_close: false,
+            copy_from: None,
             glazewm: glazewm_path().is_some(),
             last_poll: std::time::Instant::now(),
         };
@@ -296,6 +321,26 @@ impl eframe::App for App {
         );
         let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(body));
         self.chrome(&mut ui, &p);
+
+        // These float above everything, so they are drawn last.
+        self.colour_picker_window(&ctx, &p);
+        self.copy_sheet(&ctx, &p);
+        // Its buttons cannot send commands from inside the window closure --
+        // that borrows `self` -- so they leave an intent here and it is acted
+        // on now.
+        if let Some((monitor, effect, layer, key, [r, g, b])) = self.pending_apply.take() {
+            self.send_param(
+                monitor,
+                &effect,
+                layer,
+                &key,
+                serde_json::json!({"kind":"colour","r":r,"g":g,"b":b}),
+            );
+            self.open_picker = None;
+        }
+        if std::mem::take(&mut self.pending_close) {
+            self.open_picker = None;
+        }
     }
 }
 
@@ -432,9 +477,20 @@ impl App {
             }
         });
         ui.add_space(8.0);
-        ui.label(
-            egui::RichText::new("knobs and previews land here in the next step.").color(p.muted),
-        );
+        let params: Vec<panefx::animation::Param> = self
+            .snap
+            .get("params")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        if params.is_empty() {
+            ui.label(egui::RichText::new("no tunable knobs").color(p.muted));
+            return;
+        }
+        egui::ScrollArea::vertical()
+            .id_salt("paneparams")
+            .show(ui, |ui| {
+                self.params_editor(ui, p, &params, None, &effect, 0);
+            });
     }
 
     /// What to show when GlazeWM is absent.
@@ -568,7 +624,16 @@ impl App {
             .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
             .unwrap_or_default();
 
-        ui.label(egui::RichText::new(format!("DISPLAY{idx}")).size(16.0));
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(format!("DISPLAY{idx}")).size(16.0));
+            ui.add_space(10.0);
+            // Copying the whole STACK, not one effect: "make that screen look
+            // like this one" means the layers too, and applying only the base
+            // would silently drop them.
+            if !layers.is_empty() && ui.button("copy to…").clicked() {
+                self.copy_from = Some(idx);
+            }
+        });
         ui.add_space(6.0);
 
         // The stack, TOP FIRST -- the way it is seen, not the way it is stored.
@@ -617,7 +682,324 @@ impl App {
         });
 
         ui.add_space(10.0);
-        ui.label(egui::RichText::new("faders and previews land here next.").color(p.muted));
+        if layers.is_empty() {
+            ui.label(egui::RichText::new("nothing to tune -- this screen is off").color(p.muted));
+            return;
+        }
+        // EVERY layer gets its own knobs, top first so the list matches the
+        // stack above it. Scrolled, because a stack can hold far more params
+        // than the pane is tall.
+        egui::ScrollArea::vertical()
+            .id_salt(("wallparams", idx))
+            .show(ui, |ui| {
+                for (li, name) in layers.iter().enumerate().rev() {
+                    let params = self.layer_params(idx, li);
+                    let head = if li == 0 {
+                        format!("layer 0 · {name}  (base)")
+                    } else {
+                        format!("layer {li} · {name}")
+                    };
+                    egui::CollapsingHeader::new(
+                        egui::RichText::new(head).color(p.text),
+                    )
+                    // The top layer opens by default: it is the one just added
+                    // and therefore the one being tuned.
+                    .default_open(li + 1 == layers.len())
+                    .id_salt(("layer", idx, li))
+                    .show(ui, |ui| {
+                        if params.is_empty() {
+                            ui.label(
+                                egui::RichText::new("no tunable knobs").color(p.muted),
+                            );
+                        } else {
+                            self.params_editor(ui, p, &params, Some(idx), name, li);
+                        }
+                    });
+                    ui.add_space(2.0);
+                }
+            });
+    }
+
+    /// Render one effect's params as real controls.
+    ///
+    /// `monitor` is the screen these belong to, or `None` for the pane. That
+    /// decides which command carries the edit -- and for the wallpaper it must
+    /// name the monitor, or every screen running the effect gets the change.
+    fn params_editor(
+        &mut self,
+        ui: &mut egui::Ui,
+        p: &Palette,
+        params: &[panefx::animation::Param],
+        monitor: Option<usize>,
+        effect: &str,
+        layer: usize,
+    ) {
+        use panefx::animation::ParamValue;
+        let scope = monitor.unwrap_or(usize::MAX);
+        let label_w = 150.0;
+
+        for param in params {
+            ui.horizontal(|ui| {
+                ui.allocate_ui(Vec2::new(label_w, 22.0), |ui| {
+                    ui.label(egui::RichText::new(&param.label).size(12.0));
+                });
+                match &param.value {
+                    ParamValue::Int { v } => {
+                        let width = (ui.available_width() - 60.0).max(80.0);
+                        if let Some(nv) =
+                            win98::fader(ui, p, *v, param.min, param.max, width)
+                        {
+                            self.send_param(monitor, effect, layer, &param.key,
+                                serde_json::json!({"kind":"int","v":nv}));
+                        }
+                        ui.label(egui::RichText::new(format!("{v}")).size(11.0).color(p.muted));
+                    }
+                    ParamValue::Colour { r, g, b } => {
+                        let open = self.open_picker.as_ref()
+                            == Some(&(scope, param.key.clone()));
+                        if win98::swatch(
+                            ui, p,
+                            Color32::from_rgb(*r, *g, *b),
+                            Vec2::new(56.0, 20.0),
+                        )
+                        .clicked()
+                        {
+                            if open {
+                                self.open_picker = None;
+                            } else {
+                                self.picker_rgb = [*r, *g, *b];
+                                self.picker_effect = effect.to_string();
+                                self.picker_layer = layer;
+                                self.open_picker = Some((scope, param.key.clone()));
+                            }
+                        }
+                        ui.label(
+                            egui::RichText::new(format!("#{r:02x}{g:02x}{b:02x}"))
+                                .size(11.0)
+                                .color(p.muted),
+                        );
+                    }
+                    ParamValue::Text { v } => {
+                        ui.label(egui::RichText::new(v).size(11.0).color(p.muted));
+                    }
+                }
+            });
+
+        }
+    }
+
+    /// "Apply this display's layers to…" — a checklist of the other monitors.
+    ///
+    /// A sheet rather than an "apply to all" button: with four screens, "all"
+    /// is rarely what is meant. The portrait Acer and the 2560x720 ultrawide
+    /// want different things, and copying to both to fix one is worse than not
+    /// having the feature.
+    fn copy_sheet(&mut self, ctx: &egui::Context, p: &Palette) {
+        let Some(from) = self.copy_from else {
+            return;
+        };
+        let monitors = self.monitors();
+        let source: Vec<String> = monitors
+            .iter()
+            .find(|m| m.get("index").and_then(|v| v.as_u64()) == Some(from as u64))
+            .and_then(|m| m.get("layers"))
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+
+        let mut open = true;
+        let mut targets: Vec<usize> = Vec::new();
+        egui::Window::new(format!("copy DISPLAY{from} to…"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .frame(
+                egui::Frame::NONE
+                    .fill(p.button_face)
+                    .inner_margin(egui::Margin::same(10)),
+            )
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(format!("layers: {}", source.join(" → ")))
+                        .color(p.muted),
+                );
+                ui.add_space(8.0);
+                for m in &monitors {
+                    let i = m.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    if i == from {
+                        continue;
+                    }
+                    let label = m.get("label").and_then(|v| v.as_str()).unwrap_or("?");
+                    let cur = m.get("effect").and_then(|v| v.as_str()).unwrap_or("off");
+                    if ui
+                        .button(format!("DISPLAY{i}  ({label}, now: {cur})"))
+                        .clicked()
+                    {
+                        targets.push(i);
+                    }
+                }
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("click a display to copy onto it")
+                        .color(p.muted)
+                        .size(11.0),
+                );
+            });
+
+        for to in targets {
+            self.copy_stack(&source, to);
+            self.status = format!("copied DISPLAY{from} to DISPLAY{to}");
+        }
+        if !open {
+            self.copy_from = None;
+        }
+    }
+
+    /// Replace one monitor's whole stack with `source`.
+    fn copy_stack(&mut self, source: &[String], to: usize) {
+        // Clear DOWN from the top first. Setting the base while old upper
+        // layers survive would leave a taller stack than was copied -- the
+        // sheet says "make it look like that one", so leftovers are wrong.
+        let existing = self
+            .monitors()
+            .iter()
+            .find(|m| m.get("index").and_then(|v| v.as_u64()) == Some(to as u64))
+            .and_then(|m| m.get("layers"))
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        for l in (1..existing).rev() {
+            self.send(serde_json::json!({
+                "cmd":"wallpaper_layer","monitor":to,"layer":l,"name":"off"
+            }));
+        }
+        if source.is_empty() {
+            self.send(serde_json::json!({
+                "cmd":"wallpaper_effect","monitor":to,"name":"off"
+            }));
+            return;
+        }
+        for (l, effect) in source.iter().enumerate() {
+            self.send(serde_json::json!({
+                "cmd":"wallpaper_layer","monitor":to,"layer":l,"name":effect
+            }));
+        }
+    }
+
+    /// The colour wheel, in its own window.
+    ///
+    /// A WINDOW, not a panel drawn under the swatch. The params live in a
+    /// `ScrollArea`, and a fixed-size child rect inside one fights the scroll
+    /// layout: egui gave the saturation/value square no room and silently drew
+    /// only the RGB fields -- a hex box with extra steps. A window is outside
+    /// that layout and can simply be the size it needs.
+    ///
+    /// egui's own picker draws the saturation/value square with a hue strip,
+    /// which is the wheel in rectangular form. Rebuilding colour theory to get
+    /// a literal circle would look no better and behave worse.
+    fn colour_picker_window(&mut self, ctx: &egui::Context, p: &Palette) {
+        let Some((scope, key)) = self.open_picker.clone() else {
+            return;
+        };
+        let monitor = (scope != usize::MAX).then_some(scope);
+        let effect = self.picker_effect.clone();
+        let layer = self.picker_layer;
+
+        let mut open = true;
+        let mut colour = Color32::from_rgb(
+            self.picker_rgb[0],
+            self.picker_rgb[1],
+            self.picker_rgb[2],
+        );
+        let title = match monitor {
+            Some(m) => format!("{key} — DISPLAY{m} layer {layer}"),
+            None => format!("{key} — terminal backdrop"),
+        };
+        egui::Window::new(title)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .frame(
+                egui::Frame::NONE
+                    .fill(p.button_face)
+                    .inner_margin(egui::Margin::same(8)),
+            )
+            .show(ctx, |ui| {
+                // `slider_width` is what sizes the saturation/value square:
+                // `color_slider_2d` allocates `Vec2::splat(slider_width)`.
+                ui.spacing_mut().slider_width = 200.0;
+                egui::widgets::color_picker::color_picker_color32(
+                    ui,
+                    &mut colour,
+                    egui::widgets::color_picker::Alpha::Opaque,
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    // Committed on APPLY, not on every drag -- dragging around
+                    // the wheel would otherwise send a command per pixel.
+                    if ui.button("  apply  ").clicked() {
+                        self.pending_apply = Some((
+                            monitor,
+                            effect.clone(),
+                            layer,
+                            key.clone(),
+                            [colour.r(), colour.g(), colour.b()],
+                        ));
+                    }
+                    if ui.button("  cancel  ").clicked() {
+                        self.pending_close = true;
+                    }
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "#{:02x}{:02x}{:02x}",
+                            colour.r(),
+                            colour.g(),
+                            colour.b()
+                        ))
+                        .color(p.muted),
+                    );
+                });
+            });
+        self.picker_rgb = [colour.r(), colour.g(), colour.b()];
+        if !open {
+            self.pending_close = true;
+        }
+    }
+
+    /// Route a param edit to the right command.
+    ///
+    /// The wallpaper one MUST carry the monitor: without it the daemon writes
+    /// the shared block and every screen running the effect changes together --
+    /// which is the exact bug per-monitor params were added to fix.
+    fn send_param(
+        &mut self,
+        monitor: Option<usize>,
+        effect: &str,
+        _layer: usize,
+        key: &str,
+        val: serde_json::Value,
+    ) {
+        // NOTE: params are stored per (monitor, EFFECT), not per layer -- so
+        // two layers running the same effect on one screen share their knobs.
+        // The layer is threaded through anyway because that is a storage
+        // limitation to lift, not a decision, and every call site already
+        // knows which layer it is editing.
+        let msg = match monitor {
+            Some(m) => serde_json::json!({
+                "cmd":"wallpaper_param","monitor":m,"effect":effect,"key":key,"val":val
+            }),
+            None => serde_json::json!({"cmd":"param","key":key,"val":val}),
+        };
+        self.send(msg);
+    }
+
+    /// The params the daemon reports for one LAYER of one monitor.
+    fn layer_params(&self, idx: usize, layer: usize) -> Vec<panefx::animation::Param> {
+        self.snap
+            .get("wallpaper_params")
+            .and_then(|m| m.get(format!("{idx}:{layer}")))
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default()
     }
 
     fn logs_tab(&mut self, ui: &mut egui::Ui, p: &Palette) {

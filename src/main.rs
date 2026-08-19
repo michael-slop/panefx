@@ -614,13 +614,27 @@ fn handle_command(
             // difference it is editing.
             let mut m = std::collections::BTreeMap::new();
             for surf in wall.monitors().iter().filter(|s| s.is_on()) {
-                let mut probe = animation::build(&surf.effect, 1, 1, 0, cfg);
-                animation::apply_saved_params(
-                    probe.as_mut(),
-                    cfg,
-                    animation::Scope::Wallpaper(surf.monitor.index),
-                );
-                m.insert(surf.monitor.index.to_string(), probe.params());
+                let idx = surf.monitor.index;
+                // One entry PER LAYER, keyed `<monitor>:<layer>` -- a stacked
+                // monitor has a set of knobs per layer, and a client that could
+                // only see the base could only ever tune the base.
+                //
+                // The bare `<monitor>` key is ALSO written, pointing at layer 0,
+                // so the TUI (which knows nothing about layers) keeps working
+                // unchanged.
+                for (layer, effect) in cfg.wallpaper_stack(idx).iter().enumerate() {
+                    let mut probe = animation::build(effect, 1, 1, 0, cfg);
+                    animation::apply_saved_params(
+                        probe.as_mut(),
+                        cfg,
+                        animation::Scope::Wallpaper(idx),
+                    );
+                    let params = probe.params();
+                    if layer == 0 {
+                        m.insert(idx.to_string(), params.clone());
+                    }
+                    m.insert(format!("{idx}:{layer}"), params);
+                }
             }
             m
         },
