@@ -31,14 +31,11 @@
 //! squash it is a picture being translated upward; with it, it has weight.
 
 use crate::animation::{AsciiAnimation, Param, ParamValue};
-use crate::palette::{quantise, Rgb};
+use crate::palette::Rgb;
 use crate::skull_art::{COLS, ROWS, SKULL};
 
 /// Bone shading ramp, dimmest first. The site's ramp, kept identical.
 const BONE: [char; 8] = ['.', ':', '=', '+', '*', '#', '%', '@'];
-
-/// Colour steps per channel. See `palette::quantise`.
-const COLOUR_LEVELS: u8 = 6;
 
 /// Two glyph columns per source pixel.
 ///
@@ -165,8 +162,11 @@ impl SkullSpin {
             jump_every_milli: 9000,
             scale_milli: 1000,
             bone: Rgb(0xe6, 0xea, 0xf5),
-            dark: Rgb(0x2a, 0x2e, 0x3d),
-            bg: Rgb(0x14, 0x14, 0x1c),
+            // Underworld green, not the blue-grey this started as -- that read
+            // as a blue cast across the sockets against bone-white. Every one
+            // of these is a live `Param`, so this is only where it STARTS.
+            dark: Rgb(0x1e, 0x3a, 0x2a),
+            bg: Rgb(0x0d, 0x11, 0x0f),
         }
     }
 
@@ -294,7 +294,13 @@ impl AsciiAnimation for SkullSpin {
             AIR => None,
             // Dark cells stay dark at every angle and light level. Without this
             // the sockets fill in as the skull turns and the face stops reading.
-            DARK => Some(('.', quantise(self.dark, COLOUR_LEVELS))),
+            // NOT quantised. Quantising is a draw-call budget for effects whose
+            // colour varies per cell (see `palette::quantise`) -- but every dark
+            // cell here is the SAME colour, so it is one draw call either way
+            // and the quantiser buys nothing. It costs something, though:
+            // #1e3a2a snapped to #333333, stripping the green out of a colour
+            // the user chose. A picked colour is drawn as picked.
+            DARK => Some(('.', self.dark)),
             _ => {
                 // Brightest facing the viewer, dimmer toward the rim.
                 let mut light = 0.3 + 0.7 * c.abs();
@@ -307,7 +313,9 @@ impl AsciiAnimation for SkullSpin {
                 // to six levels per channel banded the skull into vertical
                 // stripes -- rendered and looked at. The site varies only the
                 // glyph for the same reason, and bone is one colour anyway.
-                Some((BONE[idx], quantise(self.bone, COLOUR_LEVELS)))
+                // Also unquantised, and for the same reason: the glyph carries
+                // the shading so every bone cell is one flat colour.
+                Some((BONE[idx], self.bone))
             }
         }
     }
