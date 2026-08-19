@@ -1,7 +1,7 @@
 # panefx-gui — handoff
 
-Written 2026-08-19. **Steps 1 and 2 of 5 are done — there is a GUI you can run
-and click.** This is where to pick it up.
+Written 2026-08-19. **The GUI is built and installed.** Everything but live
+previews is done; this is where to pick that up.
 
 Read `HANDOFF.md` first for panefx itself; this covers only the GUI and the
 layer model built alongside it.
@@ -129,7 +129,50 @@ bar. The daemon being down is a state with a Start button, not an exit.
   says "off", list says "skullspin") looks exactly like a GUI bug. Run
   `build.ps1 -Install`.
 
-## Steps 3-5 — TODO
+## Step 3 — DONE: per-layer editing
+
+Every LAYER of the selected monitor gets its own collapsible section of
+controls, so a stacked screen is tuned layer by layer rather than only at its
+base. The daemon reports params keyed `<monitor>:<layer>`; the bare
+`<monitor>` key still points at layer 0 so the TUI keeps working unchanged.
+
+New widgets in `win98.rs`, **created not ported** — slopkit never built the
+fader s0nar.slop's DESIGN.md describes:
+
+* `fader` — sunken groove, raised thumb, click-to-jump. Returns `Some(v)` only
+  when the value CHANGED, so a held drag sends one command per step.
+* `swatch` — sunken, because it is a sample you look into.
+* `segment_meter` — hard blocks, unlit segments still visible.
+
+`copy to…` applies one display's whole stack to another. A sheet, not an
+"apply to all" button: with four screens "all" is rarely what is meant.
+
+### The trap
+
+**The colour picker had to become a WINDOW.** The params live in a
+`ScrollArea`, and a fixed-size child rect inside one fights the scroll layout —
+egui gave the saturation/value square no room and silently drew only the RGB
+fields. Anything that needs a guaranteed size does not belong inside a scroll
+area.
+
+## Steps 4-5 — DONE except previews
+
+The icon, the About box, and `build.ps1` carrying the GUI. See the commit for
+the DIB details (negative height, mask required).
+
+**Still TODO: live previews.** Every effect module is Win32-free, so the GUI can
+build and step effects natively — a real render, not a screen capture. Rebuild a
+preview only when its effect NAME changes; apply params in place, mirroring
+`SimPool::reapply` (`wallpaper.rs:164`).
+
+### Not verified on screen
+
+Scripted clicks kept landing on neighbouring controls (a 56x20 swatch is a small
+target, and twice the click hit a resize edge and maximised the window instead).
+**The colour picker window and the About box open on a real click but were never
+caught in a screenshot.** Worth a human clicking both once.
+
+## Old TODO list
 
 3. **Editing** — faders (Sunken trough + Raised thumb), the colour picker,
    effect cycling, save/revert. **slopkit has NO fader or meter widget**:
