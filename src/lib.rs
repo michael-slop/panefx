@@ -41,6 +41,7 @@ pub mod starfield;
 pub mod tunnel;
 pub mod waves;
 pub mod gui_prefs;
+pub mod setup;
 pub mod win98;
 pub mod wizardtorch;
 pub mod raalien_art;

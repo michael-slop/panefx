@@ -21,6 +21,21 @@ path = "src/bin/panefx-ctl.rs"
 name = "panefx-gui"
 path = "src/bin/panefx-gui.rs"
 
+# The beta installer. A real .exe rather than the .ps1 it replaces, because a
+# .ps1 cannot be relied on to run from a double-click: no file association, a
+# Restricted execution policy, and Mark of the Web on anything extracted from a
+# downloaded zip each block it SILENTLY.
+[[bin]]
+name = "panefx-setup"
+path = "src/bin/panefx-setup.rs"
+
+# The tester-facing diagnostic. An .exe for the same reason as the installer:
+# someone whose panefx is broken should not also have to fight the tool that
+# diagnoses it.
+[[bin]]
+name = "panefx-report"
+path = "src/bin/panefx-report.rs"
+
 [dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
@@ -64,6 +79,15 @@ features = [
   # daemon's OWN windows -- one of those matching would mean the GUI never
   # starts. Still NO new crates: one feature flag.
   "Win32_System_Threading",
+  # Registering the bundled font for the user (panefx-setup): AddFontResourceW
+  # makes it work for THIS session, and the HKCU\...\Fonts value is what makes
+  # it survive a reboot. Both are needed -- one without the other means the
+  # font works until logout, or not until the next logon.
+  "Win32_System_Registry",
+  # RegCreateKeyExW takes a SECURITY_ATTRIBUTES pointer, so it is gated behind
+  # Win32_Security even though we pass None. Read from the crate source, not
+  # guessed.
+  "Win32_Security",
   # System-tray icon. Shell_NotifyIconW lives here -- again NO new crates, the
   # windows crate is already a dependency.
   "Win32_UI_Shell",

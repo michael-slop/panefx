@@ -39,7 +39,10 @@
 
 param(
     [switch]$Install,
-    [switch]$Test
+    [switch]$Test,
+    # Build the beta tester zip onto the Desktop. Uses a SEPARATE target dir
+    # and a portable CPU target -- see the -Beta block at the end for why.
+    [switch]$Beta
 )
 
 $ErrorActionPreference = 'Stop'
@@ -123,6 +126,66 @@ $guiExe = Join-Path $PSScriptRoot 'target\release\panefx-gui.exe'
 Write-Host ('built: panefx {0:N0} KB, panefx-ctl {1:N0} KB, panefx-gui {2:N0} KB' -f `
     ((Get-Item $exe).Length / 1KB), ((Get-Item $ctlExe).Length / 1KB),
     ((Get-Item $guiExe).Length / 1KB))
+
+# --- the beta tester package ----------------------------------------------
+if ($Beta) {
+    Write-Host ""
+    Write-Host "building the beta package ..." -ForegroundColor Cyan
+
+    # x86-64-v2, NOT the repo default of target-cpu=native.
+    #
+    # Measured, not assumed: a native build on this machine contains 728
+    # AVX-512 instructions (vmovdqu64, vextracti32x4). Those crash any CPU
+    # without AVX-512 with STATUS_ILLEGAL_INSTRUCTION and NO error message --
+    # the program simply vanishes. A separate CARGO_TARGET_DIR keeps these
+    # out of the normal build's cache, so a later `build.ps1 -Install` cannot
+    # accidentally install the slower portable binaries here.
+    $old = $env:RUSTFLAGS, $env:CARGO_TARGET_DIR
+    $env:RUSTFLAGS = "-C target-cpu=x86-64-v2"
+    $env:CARGO_TARGET_DIR = "target-portable"
+    try {
+        & $cargoExe @cargoArgs build --release
+        if ($LASTEXITCODE -ne 0) { throw "portable build failed" }
+    } finally {
+        $env:RUSTFLAGS, $env:CARGO_TARGET_DIR = $old
+    }
+
+    # Prove it: any AVX-512 here would crash a tester's machine.
+    $bad = 0
+    foreach ($b in 'panefx.exe','panefx-gui.exe','panefx-ctl.exe','panefx-setup.exe','panefx-report.exe') {
+        $n = (objdump -d --no-show-raw-insn "target-portable\release\$b" 2>$null |
+              Select-String -Pattern 'vmovdqu64|vextracti32x4|vpternlog|%zmm' |
+              Measure-Object).Count
+        if ($n -gt 0) { Write-Host "  $b contains $n AVX-512 instructions" -ForegroundColor Red; $bad++ }
+    }
+    if ($bad) { throw "portable build is not portable -- refusing to package" }
+    Write-Host "  verified: no AVX-512 in any shipped binary" -ForegroundColor Green
+
+    $stage = Join-Path $env:TEMP 'panefx-beta-stage'
+    Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+    # These three keep their real names: they land on PATH and `panefx` is what
+    # the docs tell people to type.
+    foreach ($b in 'panefx.exe','panefx-gui.exe','panefx-ctl.exe') {
+        Copy-Item "target-portable\release\$b" $stage -Force
+    }
+    # The two tester-facing ones get obvious names -- a folder of six .exe
+    # files should make it clear which two you are meant to double-click.
+    Copy-Item "target-portable\release\panefx-setup.exe"  "$stage\INSTALL.exe" -Force
+    Copy-Item "target-portable\release\panefx-report.exe" "$stage\REPORT.exe"  -Force
+    Copy-Item "dist\README-BETA.txt" $stage -Force
+    Copy-Item "assets\BigBlueTerm437NerdFontMono-Regular.ttf" $stage -Force
+    Copy-Item "LICENSE" $stage -Force -ErrorAction SilentlyContinue
+
+    $zip = Join-Path ([Environment]::GetFolderPath('Desktop')) 'panefx-beta.zip'
+    Remove-Item $zip -Force -ErrorAction SilentlyContinue
+    Compress-Archive -Path "$stage\*" -DestinationPath $zip -CompressionLevel Optimal
+    Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
+
+    $i = Get-Item $zip
+    Write-Host ("  {0}  ({1:N2} MB)" -f $i.FullName, ($i.Length / 1MB)) -ForegroundColor Green
+}
 
 if (-not $Install) {
     if ($wasRunning) {

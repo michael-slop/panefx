@@ -11,20 +11,25 @@ run on, and the point of you having it is to find the ones where it does not.
   START HERE
 ----------------------------------------------------------------
 
-  1. Right-click  Setup-panefx.ps1  ->  "Run with PowerShell"
+  1. Extract the WHOLE zip to a folder. Do not run anything from
+     inside the zip window -- the installer needs the other files
+     next to it.
 
-     It checks what your machine needs, tells you what is missing, and asks
-     before installing anything. Nothing is downloaded unless you say yes.
+  2. Double-click  INSTALL.exe
 
-  2. When it finishes, panefx is running. Look for the FX icon in your
-     system tray (bottom-right, possibly under the "^" arrow).
+     It checks what your machine has, tells you what is missing and
+     what each missing thing costs you, and asks before installing
+     anything. Nothing is downloaded unless you say yes.
 
-  3. Click that icon to open the control panel.
+  3. When it finishes, panefx is running. Look for the FX icon in
+     your system tray (bottom-right, possibly under the "^" arrow).
 
-If Windows says "running scripts is disabled on this system", open PowerShell
-and run this once, then try again:
+  4. Click that icon to open the control panel.
 
-     Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+Windows may show a blue "Windows protected your PC" box, because these
+programs are not code-signed. Click "More info" then "Run anyway". If you
+would rather not, that is a completely reasonable place to stop -- tell me
+and I will find another way to get it to you.
 
 
 ----------------------------------------------------------------
@@ -32,16 +37,17 @@ and run this once, then try again:
 ----------------------------------------------------------------
 
   Windows 10 or 11        required
-  GlazeWM                 required ONLY for the effects behind windows.
-                          panefx reads window positions from GlazeWM; with
-                          no GlazeWM those do nothing. Desktop wallpaper
-                          effects work fine without it.
-  BigBlueTerm437 font     ships in this folder; setup installs it. Without
-                          it Windows silently substitutes Arial and every
-                          effect renders in the wrong typeface.
+  GlazeWM                 needed ONLY for the effects behind windows.
+                          panefx reads window positions from GlazeWM;
+                          with no GlazeWM those do nothing. The desktop
+                          wallpaper effects work fine without it.
+  BigBlueTerm437 font     ships in this folder; the installer sets it
+                          up. Without it Windows silently substitutes
+                          another typeface and every effect looks wrong
+                          -- with no error message anywhere.
   Alacritty               optional, only for the terminal effect.
 
-Setup checks all of these and offers to install whatever is missing.
+INSTALL.exe checks all four and offers to install what is missing.
 
 
 ----------------------------------------------------------------
@@ -55,10 +61,10 @@ Setup checks all of these and offers to install whatever is missing.
 
 In the control panel:
 
-  wallpaper tab   pick a monitor on the left, then an effect. Effects STACK
-                  in layers -- set a base effect, then "add a layer above"
-                  to put something on top of it (flames underneath, a
-                  spinning skull over them).
+  wallpaper tab   pick a monitor on the left, then an effect. Effects
+                  STACK in layers -- set a base effect, then "add a layer
+                  above" to put something on top of it (flames
+                  underneath, a spinning skull over them).
   TUI-fx tab      the effect drawn behind terminal windows. Needs GlazeWM.
   logs tab        what the daemon has been doing.
   copy to...      apply one monitor's setup to the others.
@@ -71,13 +77,13 @@ Buttons are Windows 98 style: raised when idle, pushed in when selected.
   WHEN SOMETHING GOES WRONG   <-- the part I actually need
 ----------------------------------------------------------------
 
-  Right-click  panefx-report.ps1  ->  "Run with PowerShell"
+  Double-click  REPORT.exe
 
 It writes a file to your Desktop called  panefx-report-<date>.txt
 
 Send me that file. It contains what panefx thinks is happening, its recent
-log, your display layout, and your config. It is a plain text file -- open
-it and read it first if you like.
+log, your display layout and refresh rates, and your settings. It is plain
+text -- open it and read it first if you like.
 
 It does NOT send anything anywhere. It writes one local file and stops.
 
@@ -96,15 +102,17 @@ hard to describe and obvious to see.
 ----------------------------------------------------------------
 
   - The effect behind windows needs GlazeWM running. Not installed, or
-    installed but not started, means nothing appears there. This is
-    expected, not a bug.
+    installed but not started, means nothing appears there. Expected,
+    not a bug.
   - Multi-monitor setups are where the interesting bugs live. Mixed
     refresh rates, rotated screens and mixed resolutions especially --
     please try those if you have them.
-  - If the wallpaper is torn, flickering, or black, that is worth a report
-    even if it fixes itself.
-  - A crash leaves no dialog: the window just vanishes. If that happens,
-    run the report anyway -- the daemon's log usually survives it.
+  - If the wallpaper is torn, flickering, or black, that is worth a
+    report even if it fixes itself.
+  - A crash leaves no dialog: the window just vanishes. Run REPORT.exe
+    anyway -- the daemon's log usually survives it.
+  - The control panel has no live preview yet. You see an effect by
+    applying it.
 
 
 ----------------------------------------------------------------
@@ -112,9 +120,10 @@ hard to describe and obvious to see.
 ----------------------------------------------------------------
 
   1. Right-click the tray icon -> Exit
-  2. Delete  %USERPROFILE%\bin\panefx.exe, panefx-gui.exe, panefx-ctl.exe
-  3. Settings live in  %USERPROFILE%\.config\panefx\  -- delete that folder
-     to remove them.
+  2. Delete these three files from  %USERPROFILE%\bin\
+       panefx.exe   panefx-gui.exe   panefx-ctl.exe
+  3. Settings live in  %USERPROFILE%\.config\panefx\  -- delete that
+     folder to remove them.
 
 Nothing is installed to Program Files, nothing runs as administrator, and
 nothing is added to your startup unless GlazeWM was already launching it.
