@@ -691,6 +691,19 @@ fn handle_command(
         effects: animation::EFFECTS.iter().map(|s| s.to_string()).collect(),
         params: sim.params(),
         config: ConfigView::of(cfg),
+        panes: panefx::panel::PANES
+            .lock()
+            .map(|l| {
+                l.iter()
+                    .map(|p| control::PaneView {
+                        handle: p.handle,
+                        visible: p.visible,
+                        width: p.width,
+                        height: p.height,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
         wallpaper: wall
             .monitors()
             .iter()
@@ -1071,6 +1084,19 @@ fn reconcile(
 
     *sim_cols = max_cols;
     *sim_rows = max_rows;
+
+    // Publish what we are managing, so the state is visible from outside the
+    // process. Without this, "one of my two terminals has no effect" cannot be
+    // told apart from "panefx never made a panel for it".
+    if let Ok(mut list) = panefx::panel::PANES.lock() {
+        list.clear();
+        list.extend(panels.iter().map(|(h, p)| panefx::panel::PaneState {
+            handle: *h,
+            visible: p.visible,
+            width: p.width,
+            height: p.height,
+        }));
+    }
 }
 
 #[cfg(test)]

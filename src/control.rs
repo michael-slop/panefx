@@ -102,6 +102,20 @@ fn default_log_lines() -> usize {
     200
 }
 
+/// What the daemon knows about ONE terminal backdrop.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PaneView {
+    /// The target window's handle, as GlazeWM reports it.
+    pub handle: isize,
+    /// Whether the panel is being drawn. A panel exists for every target
+    /// window, but one whose terminal is on another workspace or minimized is
+    /// hidden -- and an unexpectedly hidden panel is exactly the "one window
+    /// has no effect" symptom.
+    pub visible: bool,
+    pub width: i32,
+    pub height: i32,
+}
+
 #[derive(Debug, Serialize)]
 pub struct Snapshot {
     pub effect: String,
@@ -122,6 +136,15 @@ pub struct Snapshot {
     /// See `panel::PIN_CALLS` -- a steady climb is the panes fighting over the
     /// single bottom z-slot.
     pub pin_calls: u64,
+
+    /// One entry per terminal backdrop the daemon is managing.
+    ///
+    /// There were NO pane diagnostics at all, which made "only one of my two
+    /// Alacritty windows has an effect" impossible to diagnose from the
+    /// outside: the daemon knew whether it had made a panel and whether it
+    /// considered it visible, and reported neither.
+    #[serde(default)]
+    pub panes: Vec<PaneView>,
 
     /// The desktop's own params, for every effect any monitor is running.
     ///

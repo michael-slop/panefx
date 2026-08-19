@@ -265,6 +265,38 @@ fn section_daemon(out: &mut String) {
     let _ = writeln!(out, "  backdrops off   : {}", s["config"]["pane_off"]);
     let _ = writeln!(out);
 
+    // Terminal backdrops. Added because "only one of my two Alacritty windows
+    // has an effect" could not be investigated from outside the process: the
+    // daemon knew whether it had built a panel and whether it thought the panel
+    // was visible, and reported neither.
+    let _ = writeln!(out, "  -- terminal backdrops (panes) --");
+    match s["panes"].as_array() {
+        Some(list) if !list.is_empty() => {
+            for p in list {
+                let _ = writeln!(
+                    out,
+                    "    hwnd {:<10} visible {:<6} {}x{}",
+                    plain(&p["handle"]),
+                    plain(&p["visible"]),
+                    plain(&p["width"]),
+                    plain(&p["height"])
+                );
+            }
+            let _ = writeln!(out, "    ({} pane(s))", list.len());
+        }
+        _ => {
+            let _ = writeln!(
+                out,
+                "    none -- panefx is drawing behind no terminals at all."
+            );
+            let _ = writeln!(
+                out,
+                "    (needs GlazeWM running, and a target window: alacritty or neovide)"
+            );
+        }
+    }
+    let _ = writeln!(out);
+
     // Per-monitor geometry. `consistent` is the one to read first.
     let _ = writeln!(out, "  -- per monitor --");
     let before = s["wallpaper"].clone();

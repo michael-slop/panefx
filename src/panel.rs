@@ -44,6 +44,27 @@ pub const PANEL_CLASS: PCWSTR = w!("PaneFxClass");
 /// steady rate here is the panes displacing each other.
 pub static PIN_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// What the daemon is currently managing, one entry per terminal backdrop.
+///
+/// A `static` for the same reason `PIN_CALLS` is one: the control handler does
+/// not receive the panel map, and threading it through eight call sites to
+/// answer a diagnostic question is worse than publishing the answer here.
+///
+/// Why it exists at all: there were NO pane diagnostics, so "only one of my two
+/// Alacritty windows has an effect" could not be investigated from outside the
+/// process. The daemon knew whether it had built a panel and whether it thought
+/// the panel was visible, and reported neither.
+pub static PANES: std::sync::Mutex<Vec<PaneState>> = std::sync::Mutex::new(Vec::new());
+
+/// One managed backdrop, as the reconcile loop last saw it.
+#[derive(Debug, Clone, Copy)]
+pub struct PaneState {
+    pub handle: isize,
+    pub visible: bool,
+    pub width: i32,
+    pub height: i32,
+}
+
 /// GDI objects reused across frames.
 ///
 /// Before this existed, `draw_animation` created a memory DC, a full-window
