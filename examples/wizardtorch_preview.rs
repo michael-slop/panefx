@@ -24,10 +24,18 @@ fn coverage(ch: char) -> (f32, u8) {
 }
 
 fn main() {
-    let (cols, rows) = (80usize, 128usize);
+    // A LANDSCAPE grid on purpose: the whole point of the fit work is that a
+    // portrait drawing has to sit sensibly on a wide monitor.
+    let (cols, rows) = (160usize, 60usize);
     let (cw, ch) = (8usize, 12usize);
     let mut w = WizardTorch::new(cols, rows);
     w.set_frame_ms(100);
+    // Override from argv so all three fit modes can be eyeballed without an
+    // edit-rebuild cycle: `cargo run --example wizardtorch_preview -- cover`.
+    if let Some(fit) = std::env::args().nth(1) {
+        use panefx::animation::ParamValue;
+        assert!(w.set_param("fit", &ParamValue::Text { v: fit.clone() }), "bad fit {fit}");
+    }
 
     for frame in 0..4 {
         // 12 steps at 100ms = 1.2s between saved frames, which is long enough
@@ -71,6 +79,6 @@ fn main() {
         let mut out = format!("P6\n{iw} {ih}\n255\n").into_bytes();
         out.extend_from_slice(&buf);
         std::fs::write(&name, out).expect("write ppm");
-        println!("{name}  intensity {:.3}", w.intensity_for_preview());
+        println!("{name}");
     }
 }
