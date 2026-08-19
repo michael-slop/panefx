@@ -255,6 +255,18 @@ impl AsciiAnimation for Starfield {
         self.bg
     }
 
+    /// Chunky cells, like `waves`.
+    ///
+    /// Block graphics, not text: at the terminal's 10x15 these render as fine
+    /// noise on a big screen.
+    ///
+    /// Note this was ALSO tried as a performance fix and is not one -- going
+    /// from 10x15 to 15x23 cut the cell count 2.4x and moved CPU by under 1%.
+    /// The cost is draw calls, not cells; see `palette::quantise`.
+    fn preferred_cell(&self) -> Option<(i32, i32)> {
+        Some((15, 23))
+    }
+
     fn params(&self) -> Vec<Param> {
         vec![
             Param::int("speed", "speed (x1000)", self.speed_milli, 50, 5000),

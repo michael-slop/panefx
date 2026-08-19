@@ -125,3 +125,158 @@ mod tests {
         assert_eq!(color_for(99), GREEN_RAMP[GREEN_RAMP.len() - 1]);
     }
 }
+
+/// Fast sine by table lookup.
+///
+/// Kept for what it is -- a cheap sine -- and NOT for the reason it was added.
+/// It went in believing per-cell `sin` was why `plasma` and `tunnel` cost ~100%
+/// of a core; swapping it in moved that by under 1%. The real cost was draw
+/// calls (see `quantise`). This stays because it is free and correct, but do
+/// not expect it to buy performance.
+///
+/// 4096 entries is the accuracy/size trade: the error is under 0.001, which is
+/// far below one step of any glyph ramp here, and the table is 16KB -- small
+/// enough to stay in L1 across a frame.
+mod fasttrig {
+    pub const BITS: usize = 12;
+    pub const SIZE: usize = 1 << BITS;
+    pub const MASK: usize = SIZE - 1;
+
+    /// `sin(i / SIZE * TAU)` for each `i`.
+    pub static TABLE: std::sync::LazyLock<[f32; SIZE]> = std::sync::LazyLock::new(|| {
+        let mut t = [0.0f32; SIZE];
+        for (i, v) in t.iter_mut().enumerate() {
+            *v = (i as f32 / SIZE as f32 * std::f32::consts::TAU).sin();
+        }
+        t
+    });
+}
+
+/// Table-lookup sine. Argument in radians, any magnitude.
+#[inline]
+pub fn fsin(x: f32) -> f32 {
+    let idx = (x * (fasttrig::SIZE as f32 / std::f32::consts::TAU)) as isize;
+    fasttrig::TABLE[(idx as usize) & fasttrig::MASK]
+}
+
+/// Table-lookup cosine.
+#[inline]
+pub fn fcos(x: f32) -> f32 {
+    fsin(x + std::f32::consts::FRAC_PI_2)
+}
+
+#[cfg(test)]
+mod fasttrig_tests {
+    use super::*;
+
+    #[test]
+    fn the_table_matches_the_real_sine() {
+        // The whole point is that it is indistinguishable at ramp resolution.
+        // A ramp step here is at worst 1/4 (the block ramps), so 0.01 is two
+        // orders of margin.
+        let mut worst = 0.0f32;
+        for i in 0..2000 {
+            let x = (i as f32 / 2000.0) * 40.0 - 20.0;
+            worst = worst.max((fsin(x) - x.sin()).abs());
+        }
+        assert!(worst < 0.01, "worst sine error {worst}");
+    }
+
+    #[test]
+    fn it_handles_negative_and_large_arguments() {
+        // The index is masked, so it must wrap rather than panic or clamp --
+        // a plasma phase grows without bound and goes negative on some terms.
+        for x in [-1000.0f32, -0.5, 0.0, 12345.0] {
+            let v = fsin(x);
+            assert!(v.is_finite() && (-1.0..=1.0).contains(&v), "fsin({x}) = {v}");
+        }
+    }
+
+    #[test]
+    fn cosine_leads_sine_by_a_quarter_turn() {
+        for i in 0..100 {
+            let x = i as f32 * 0.1;
+            assert!((fcos(x) - x.cos()).abs() < 0.01, "fcos({x})");
+        }
+    }
+}
+
+/// Snap a colour to a coarse grid, so neighbouring cells share one.
+///
+/// **This is the single most expensive decision an effect makes.** The renderer
+/// issues one `ExtTextOutW` PER DISTINCT COLOUR PER ROW (see `render.rs`), so
+/// the draw-call bill is the number of distinct colours, not the number of lit
+/// cells. Measured on a 128x62 grid across pHub's four monitors:
+///
+/// | effect | lit | colours/row | draw calls | CPU |
+/// |---|---|---|---|---|
+/// | `waves`  | 46% |  6.0 |  370 |  35% |
+/// | `plasma` | 44% | 33.6 | 2081 | 100% |
+///
+/// Same lit fraction, 5.6x the draw calls, 3x the CPU. A smooth per-cell colour
+/// blend is what does it: every cell gets its own RGB and no two share a bucket.
+///
+/// `levels` is how many steps each channel is allowed. 8 is invisible on a
+/// wallpaper -- the ramp glyph already carries most of the shading -- and cuts
+/// the distinct colours per row to a handful.
+#[inline]
+pub fn quantise(c: Rgb, levels: u8) -> Rgb {
+    let l = levels.max(2) as u32;
+    let q = |v: u8| -> u8 {
+        // Round to the nearest of `l` levels, then map that level back across
+        // the FULL 0..255 range.
+        //
+        // Not `level * (255 / (l-1))`: integer division truncates the step, so
+        // at 8 levels the top bucket lands on 252 and white quietly turns grey.
+        // Multiplying first and dividing last keeps both ends exact.
+        let level = ((v as u32 * (l - 1) + 127) / 255).min(l - 1);
+        ((level * 255) / (l - 1)) as u8
+    };
+    Rgb(q(c.0), q(c.1), q(c.2))
+}
+
+#[cfg(test)]
+mod quantise_tests {
+    use super::*;
+
+    #[test]
+    fn it_collapses_near_colours_together() {
+        // The whole point: adjacent cells of a smooth gradient must land in the
+        // same bucket, or the renderer pays a draw call for each.
+        let a = quantise(Rgb(100, 100, 100), 8);
+        let b = quantise(Rgb(103, 101, 99), 8);
+        assert_eq!(a, b, "near colours must share a bucket");
+    }
+
+    #[test]
+    fn the_ends_of_the_range_are_preserved() {
+        // Black must stay black and white white, or every effect's background
+        // and highlights shift.
+        assert_eq!(quantise(Rgb(0, 0, 0), 8), Rgb(0, 0, 0));
+        assert_eq!(quantise(Rgb(255, 255, 255), 8), Rgb(255, 255, 255));
+    }
+
+    #[test]
+    fn more_levels_means_more_distinct_colours() {
+        let count = |levels: u8| {
+            let mut seen: Vec<Rgb> = Vec::new();
+            for v in 0..=255u8 {
+                let q = quantise(Rgb(v, 0, 0), levels);
+                if !seen.contains(&q) {
+                    seen.push(q);
+                }
+            }
+            seen.len()
+        };
+        assert!(count(16) > count(4), "{} !> {}", count(16), count(4));
+    }
+
+    #[test]
+    fn a_degenerate_level_count_does_not_divide_by_zero() {
+        // `levels` comes from a config knob, so 0 and 1 must be survivable.
+        for l in [0u8, 1, 2] {
+            let q = quantise(Rgb(128, 128, 128), l);
+            assert!(q.0 <= 255);
+        }
+    }
+}

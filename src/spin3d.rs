@@ -21,7 +21,7 @@
 //! a different renderer.
 
 use crate::animation::{AsciiAnimation, Param, ParamValue};
-use crate::palette::Rgb;
+use crate::palette::{quantise, Rgb};
 
 /// Luminance ramp, dimmest first. Sloane's original ramp.
 const RAMP: [char; 12] = ['.', ',', '-', '~', ':', ';', '=', '!', '*', '#', '$', '@'];
@@ -325,16 +325,31 @@ impl AsciiAnimation for Spin3d {
         let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * f) as u8;
         Some((
             RAMP[l],
-            Rgb(
-                mix(self.lo.0, self.hi.0),
-                mix(self.lo.1, self.hi.1),
-                mix(self.lo.2, self.hi.2),
+            quantise(
+                Rgb(
+                    mix(self.lo.0, self.hi.0),
+                    mix(self.lo.1, self.hi.1),
+                    mix(self.lo.2, self.hi.2),
+                ),
+                8,
             ),
         ))
     }
 
     fn background(&self) -> Rgb {
         self.bg
+    }
+
+    /// Chunky cells, like `waves`.
+    ///
+    /// Block graphics, not text: at the terminal's 10x15 these render as fine
+    /// noise on a big screen.
+    ///
+    /// Note this was ALSO tried as a performance fix and is not one -- going
+    /// from 10x15 to 15x23 cut the cell count 2.4x and moved CPU by under 1%.
+    /// The cost is draw calls, not cells; see `palette::quantise`.
+    fn preferred_cell(&self) -> Option<(i32, i32)> {
+        Some((15, 23))
     }
 
     fn params(&self) -> Vec<Param> {

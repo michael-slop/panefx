@@ -633,6 +633,26 @@ are not the same operation — see `panel::pin_behind_target`.
 
 ### Efficiency
 
+* **The bill is DRAW CALLS, not cells and not maths.** `render.rs` issues one
+  `ExtTextOutW` **per distinct colour per row**, so an effect that blends colour
+  smoothly per cell pays a draw call per cell. Measured on a 128x62 grid across
+  four monitors:
+
+  | effect | lit cells | colours/row | draw calls | CPU |
+  |---|---|---|---|---|
+  | `waves`  | 46% |  6.0 |  370 |  36% |
+  | `plasma` | 44% | 33.6 | 2081 | 101% |
+
+  Same lit fraction, 5.6x the calls, 3x the CPU. `palette::quantise` snaps
+  colours to a coarse grid; at 6 levels per channel plasma went 2081 -> 145
+  calls and 101% -> 25% of a core, invisibly.
+
+  **Three other things were tried first and are NOT the cause** -- recorded so
+  nobody spends the afternoon again: table-lookup trig (<1%), chunky
+  `preferred_cell` at 15x23 vs 10x15 (<1%, despite 2.4x fewer cells), and a
+  `darkcut` to leave dim cells unpainted (100% -> 93% lit changed nothing).
+
+
 * **A covered monitor's simulation is not stepped at all** — not
   stepped-and-skipped. A fully covered desktop costs a pass over a few booleans.
 * **Every monitor owns its simulation, seeded from its `DISPLAY<n>` index.**

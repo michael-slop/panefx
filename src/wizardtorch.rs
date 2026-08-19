@@ -35,12 +35,15 @@
 //! is a piece of art that moves, not a moving pattern that used to be art.
 
 use crate::animation::{AsciiAnimation, Param, ParamValue};
-use crate::palette::Rgb;
+use crate::palette::{fcos, fsin, quantise, Rgb};
 use crate::wizardtorch_art::{ART, COLS, ROWS};
 
 /// Shade ramp, dimmest first. The art's own blocks, so a sampled value
 /// re-quantises into the vocabulary it was drawn in.
 const RAMP: [char; 4] = ['\u{2591}', '\u{2592}', '\u{2593}', '\u{2588}'];
+
+/// Colour steps per channel. See `palette::quantise`.
+const COLOUR_LEVELS: u8 = 6;
 
 /// How the art is mapped onto a panel whose shape is not the art's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,11 +297,22 @@ impl AsciiAnimation for WizardTorch {
         // Amplitude in ART cells, so the ripple is the same size on the drawing
         // whatever grid it happens to be fitted to.
         let amp = 0.02 * COLS.min(ROWS) as f32 * swirl;
-        let dx = (phase + wa * std::f32::consts::TAU).sin() * amp;
-        let dy = (phase + wb * std::f32::consts::TAU).cos() * amp;
+        let dx = fsin(phase + wa * std::f32::consts::TAU) * amp;
+        let dy = fcos(phase + wb * std::f32::consts::TAU) * amp;
 
         let (ay, ax) = self.to_art(col as f32, row as f32);
-        let v = self.art_sample(ay + dy, ax + dx) / 4.0;
+        let (sy, sx) = (ay + dy, ax + dx);
+        // Cheap reject BEFORE the bilinear sample.
+        //
+        // At `contain` on a wide panel most cells fall in the letterbox, and
+        // `art_sample` is four bounds-checked byte lookups plus the blend --
+        // all of it discarded for a cell that was never going to be drawn.
+        // Measured at 26% of cells lit but ~100% of a core, against `waves` at
+        // 46% lit and 35%: the cost was the work done for the other 74%.
+        if sy < -1.0 || sx < -1.0 || sy >= ROWS as f32 || sx >= COLS as f32 {
+            return None;
+        }
+        let v = self.art_sample(sy, sx) / 4.0;
 
         if v <= self.darkcut_milli as f32 / 1000.0 {
             return None;
@@ -307,10 +321,13 @@ impl AsciiAnimation for WizardTorch {
         let shade = v.clamp(0.0, 1.0);
         Some((
             RAMP[idx],
-            Rgb(
-                (self.ink.0 as f32 * shade) as u8,
-                (self.ink.1 as f32 * shade) as u8,
-                (self.ink.2 as f32 * shade) as u8,
+            quantise(
+                Rgb(
+                    (self.ink.0 as f32 * shade) as u8,
+                    (self.ink.1 as f32 * shade) as u8,
+                    (self.ink.2 as f32 * shade) as u8,
+                ),
+                COLOUR_LEVELS,
             ),
         ))
     }
@@ -325,7 +342,7 @@ impl AsciiAnimation for WizardTorch {
     /// renders as fine noise on a big screen. `detail` is the knob for how much
     /// of the drawing is resolved; this sets a sane starting grain.
     fn preferred_cell(&self) -> Option<(i32, i32)> {
-        Some((12, 18))
+        Some((15, 23))
     }
 
     fn params(&self) -> Vec<Param> {

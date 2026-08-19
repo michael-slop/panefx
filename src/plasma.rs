@@ -26,10 +26,14 @@
 //! makes for the same reason.
 
 use crate::animation::{AsciiAnimation, Param, ParamValue};
-use crate::palette::Rgb;
+use crate::palette::{fsin, quantise, Rgb};
 
 /// Default ramp, sparsest first.
 const DEFAULT_RAMP: &str = " .:-=+*#%@";
+
+/// Colour steps per channel. See `palette::quantise` -- this is a draw-call
+/// budget, not a palette choice.
+const COLOUR_LEVELS: u8 = 6;
 
 pub struct Plasma {
     cols: usize,
@@ -45,6 +49,14 @@ pub struct Plasma {
     complexity: usize,
     /// Contrast applied to the normalised field, x1000.
     contrast_milli: i64,
+    /// Field values at or below this are not drawn at all, x1000.
+    ///
+    /// The single biggest cost lever a full-screen effect has. EVERY lit cell
+    /// is a GDI text call, so the bill is the number of cells drawn, not the
+    /// maths behind them -- measured across pHub's four monitors: `waves` lights
+    /// 46% of its cells and costs 35% of a core; plasma lit 100% and cost ~100%.
+    /// `waves` has had exactly this knob for the same reason.
+    darkcut_milli: i64,
 
     ramp: Vec<char>,
     /// The two ends of the colour sweep; each cell mixes between them.
@@ -64,6 +76,7 @@ impl Plasma {
             scale_milli: 1000,
             complexity: 3,
             contrast_milli: 1000,
+            darkcut_milli: 500,
             ramp: ramp_from(chars),
             lo: Rgb(0x1b, 0x2a, 0x6b),
             hi: Rgb(0xff, 0x9a, 0x3c),
@@ -97,17 +110,17 @@ impl Plasma {
         let y = (row as f32 - self.rows as f32 / 2.0) / short * 8.0 * scale * 2.0;
         let t = self.t * std::f32::consts::TAU;
 
-        let mut v = (x).sin() + (y * 0.5 + t).sin() + ((x + y) * 0.5 + t).sin();
+        let mut v = fsin(x) + fsin(y * 0.5 + t) + fsin((x + y) * 0.5 + t);
         // Radial term: breaks up the axis-aligned plaid the three above would
         // make on their own. Centred, so it reads as rings from the middle.
-        v += ((x * x + y * y).sqrt() - t * 2.0).sin();
+        v += fsin((x * x + y * y).sqrt() - t * 2.0);
         let mut terms = 4.0;
 
         // Extra octaves: same field at higher frequency and lower weight.
         for o in 1..self.complexity.clamp(1, 4) {
             let f = 1.0 + o as f32;
             let w = 1.0 / f;
-            v += ((x * f).sin() + (y * f * 0.5 + t * f).sin()) * w;
+            v += (fsin(x * f) + fsin(y * f * 0.5 + t * f)) * w;
             terms += 2.0 * w;
         }
 
@@ -155,6 +168,9 @@ impl AsciiAnimation for Plasma {
             return None;
         }
         let v = self.field(col, row);
+        if v <= self.darkcut_milli as f32 / 1000.0 {
+            return None;
+        }
         let idx = ((v * self.ramp.len() as f32) as usize).min(self.ramp.len() - 1);
         let ch = self.ramp[idx];
         if ch == ' ' {
@@ -164,12 +180,18 @@ impl AsciiAnimation for Plasma {
             return None;
         }
         let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * v) as u8;
+        // Quantised: the renderer bills one draw call per distinct colour per
+        // row, and a smooth blend gives every cell its own. See
+        // `palette::quantise` for the measurement.
         Some((
             ch,
-            Rgb(
-                mix(self.lo.0, self.hi.0),
-                mix(self.lo.1, self.hi.1),
-                mix(self.lo.2, self.hi.2),
+            quantise(
+                Rgb(
+                    mix(self.lo.0, self.hi.0),
+                    mix(self.lo.1, self.hi.1),
+                    mix(self.lo.2, self.hi.2),
+                ),
+                COLOUR_LEVELS,
             ),
         ))
     }
@@ -178,12 +200,25 @@ impl AsciiAnimation for Plasma {
         self.bg
     }
 
+    /// Chunky cells, like `waves`.
+    ///
+    /// Block graphics, not text: at the terminal's 10x15 these render as fine
+    /// noise on a big screen.
+    ///
+    /// Note this was ALSO tried as a performance fix and is not one -- going
+    /// from 10x15 to 15x23 cut the cell count 2.4x and moved CPU by under 1%.
+    /// The cost is draw calls, not cells; see `palette::quantise`.
+    fn preferred_cell(&self) -> Option<(i32, i32)> {
+        Some((15, 23))
+    }
+
     fn params(&self) -> Vec<Param> {
         vec![
             Param::int("speed", "speed (x1000)", self.speed_milli, 50, 5000),
             Param::int("scale", "feature scale (x1000)", self.scale_milli, 100, 5000),
             Param::int("complexity", "octaves", self.complexity as i64, 1, 4),
             Param::int("contrast", "contrast (x1000)", self.contrast_milli, 200, 3000),
+            Param::int("darkcut", "dark cutoff (x1000)", self.darkcut_milli, 0, 900),
             Param::text("chars", "ramp", &self.ramp.iter().collect::<String>()),
             Param::colour("lo", "low colour", self.lo),
             Param::colour("hi", "high colour", self.hi),
@@ -217,6 +252,13 @@ impl AsciiAnimation for Plasma {
             "contrast" => match v.as_int() {
                 Some(n) => {
                     self.contrast_milli = n.clamp(200, 3000);
+                    true
+                }
+                None => false,
+            },
+            "darkcut" => match v.as_int() {
+                Some(n) => {
+                    self.darkcut_milli = n.clamp(0, 900);
                     true
                 }
                 None => false,

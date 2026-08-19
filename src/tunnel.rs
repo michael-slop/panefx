@@ -23,9 +23,12 @@
 //! tunnel is a tall ellipse.
 
 use crate::animation::{AsciiAnimation, Param, ParamValue};
-use crate::palette::Rgb;
+use crate::palette::{quantise, Rgb};
 
 const DEFAULT_RAMP: &str = " .:-=+*#%@";
+
+/// Colour steps per channel. See `palette::quantise`.
+const COLOUR_LEVELS: u8 = 6;
 
 pub struct Tunnel {
     cols: usize,
@@ -43,16 +46,33 @@ pub struct Tunnel {
     rings_milli: i64,
     /// How fast brightness falls with depth, x1000.
     fog_milli: i64,
+    /// Brightness at or below this is not drawn at all, x1000.
+    ///
+    /// See the note on `plasma::darkcut_milli`: every lit cell is a GDI text
+    /// call, so leaving the dark half of the checkerboard unpainted is what
+    /// brings a full-screen effect down to `waves`-like cost. It also deepens
+    /// the tunnel, because the far end genuinely goes to black.
+    darkcut_milli: i64,
 
     ramp: Vec<char>,
     near: Rgb,
     far: Rgb,
     bg: Rgb,
+
+    /// Per-cell `(depth, angle)`, precomputed.
+    ///
+    /// Both come from `sqrt` and `atan2` of the cell's offset from the centre,
+    /// and NEITHER depends on time -- only on the grid. Computing them per frame
+    /// cost ~100% of a core across four monitors (measured); computing them once
+    /// per resize costs nothing per frame.
+    ///
+    /// `None` for the centre cell, where the radius is zero.
+    polar: Vec<Option<(f32, f32)>>,
 }
 
 impl Tunnel {
     pub fn new(cols: usize, rows: usize, chars: Option<&str>) -> Self {
-        Tunnel {
+        let mut t = Tunnel {
             cols,
             rows,
             t: 0.0,
@@ -62,6 +82,7 @@ impl Tunnel {
             slices: 12,
             rings_milli: 1000,
             fog_milli: 1000,
+            darkcut_milli: 420,
             ramp: match chars {
                 Some(s) if !s.trim().is_empty() => s.chars().collect(),
                 _ => DEFAULT_RAMP.chars().collect(),
@@ -69,6 +90,32 @@ impl Tunnel {
             near: Rgb(0x8a, 0xe6, 0xff),
             far: Rgb(0x10, 0x18, 0x4a),
             bg: Rgb(0, 0, 0),
+            polar: Vec::new(),
+        };
+        t.rebuild_polar();
+        t
+    }
+
+    /// Precompute the polar map for the current grid.
+    fn rebuild_polar(&mut self) {
+        let (cx, cy) = (self.cols as f32 / 2.0, self.rows as f32 / 2.0);
+        let short = self.cols.min(self.rows).max(1) as f32;
+        self.polar = Vec::with_capacity(self.cols * self.rows);
+        for row in 0..self.rows {
+            for col in 0..self.cols {
+                let dx = col as f32 - cx;
+                // Doubled: cells are twice as tall as wide, so this makes the
+                // tunnel mouth circular rather than a tall ellipse.
+                let dy = (row as f32 - cy) * 2.0;
+                let r = (dx * dx + dy * dy).sqrt();
+                if r < 0.5 {
+                    self.polar.push(None);
+                    continue;
+                }
+                let depth = (short * 0.5) / r;
+                let a = dy.atan2(dx) / std::f32::consts::TAU;
+                self.polar.push(Some((depth, a)));
+            }
         }
     }
 
@@ -81,21 +128,7 @@ impl Tunnel {
     /// Returns `None` at the exact centre, where the radius is zero and the
     /// depth would be infinite.
     fn sample(&self, col: usize, row: usize) -> Option<(f32, f32)> {
-        let (cx, cy) = (self.cols as f32 / 2.0, self.rows as f32 / 2.0);
-        let dx = col as f32 - cx;
-        // Doubled: cells are twice as tall as wide, so this makes the tunnel
-        // mouth circular rather than a tall ellipse.
-        let dy = (row as f32 - cy) * 2.0;
-        let r = (dx * dx + dy * dy).sqrt();
-        if r < 0.5 {
-            return None;
-        }
-        // Normalise by the short axis so the tunnel is the same size whatever
-        // the panel's shape.
-        let short = self.cols.min(self.rows).max(1) as f32;
-        let depth = (short * 0.5) / r;
-
-        let a = dy.atan2(dx) / std::f32::consts::TAU; // -0.5..0.5
+        let (depth, a) = (*self.polar.get(row * self.cols + col)?)?;
         let rings = (self.rings_milli as f32 / 1000.0).max(0.05);
         let spin = self.spin_milli as f32 / 1000.0;
 
@@ -119,8 +152,12 @@ impl AsciiAnimation for Tunnel {
     }
 
     fn resize(&mut self, cols: usize, rows: usize) {
+        if cols == self.cols && rows == self.rows {
+            return;
+        }
         self.cols = cols;
         self.rows = rows;
+        self.rebuild_polar();
     }
 
     fn dimensions(&self) -> (usize, usize) {
@@ -141,6 +178,9 @@ impl AsciiAnimation for Tunnel {
             return None;
         }
         let (b, _depth) = self.sample(col, row)?;
+        if b <= self.darkcut_milli as f32 / 1000.0 {
+            return None;
+        }
         let idx = ((b * self.ramp.len() as f32) as usize).min(self.ramp.len() - 1);
         let ch = self.ramp[idx];
         if ch == ' ' {
@@ -149,16 +189,31 @@ impl AsciiAnimation for Tunnel {
         let mix = |a: u8, c: u8| (c as f32 + (a as f32 - c as f32) * b) as u8;
         Some((
             ch,
-            Rgb(
-                mix(self.near.0, self.far.0),
-                mix(self.near.1, self.far.1),
-                mix(self.near.2, self.far.2),
+            quantise(
+                Rgb(
+                    mix(self.near.0, self.far.0),
+                    mix(self.near.1, self.far.1),
+                    mix(self.near.2, self.far.2),
+                ),
+                COLOUR_LEVELS,
             ),
         ))
     }
 
     fn background(&self) -> Rgb {
         self.bg
+    }
+
+    /// Chunky cells, like `waves`.
+    ///
+    /// Block graphics, not text: at the terminal's 10x15 these render as fine
+    /// noise on a big screen.
+    ///
+    /// Note this was ALSO tried as a performance fix and is not one -- going
+    /// from 10x15 to 15x23 cut the cell count 2.4x and moved CPU by under 1%.
+    /// The cost is draw calls, not cells; see `palette::quantise`.
+    fn preferred_cell(&self) -> Option<(i32, i32)> {
+        Some((15, 23))
     }
 
     fn params(&self) -> Vec<Param> {
@@ -168,6 +223,7 @@ impl AsciiAnimation for Tunnel {
             Param::int("slices", "slices around", self.slices, 2, 48),
             Param::int("rings", "ring density (x1000)", self.rings_milli, 100, 4000),
             Param::int("fog", "depth fade (x1000)", self.fog_milli, 0, 3000),
+            Param::int("darkcut", "dark cutoff (x1000)", self.darkcut_milli, 0, 900),
             Param::text("chars", "ramp", &self.ramp.iter().collect::<String>()),
             Param::colour("near", "near colour", self.near),
             Param::colour("far", "far colour", self.far),
@@ -208,6 +264,13 @@ impl AsciiAnimation for Tunnel {
             "fog" => match v.as_int() {
                 Some(n) => {
                     self.fog_milli = n.clamp(0, 3000);
+                    true
+                }
+                None => false,
+            },
+            "darkcut" => match v.as_int() {
+                Some(n) => {
+                    self.darkcut_milli = n.clamp(0, 900);
                     true
                 }
                 None => false,
