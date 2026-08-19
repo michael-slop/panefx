@@ -31,6 +31,8 @@ pub mod fire;
 pub mod flames;
 pub mod palette;
 pub mod rain;
+pub mod fishloop_art;
+pub mod frameplay;
 pub mod plasma;
 pub mod spin3d;
 pub mod starfield;

@@ -223,6 +223,8 @@ pub const EFFECTS: &[&str] = &[
     "sphere",
     "cube",
     "galaxy",
+    // Stored frame sequences, played rather than computed -- see `frameplay`.
+    "fishloop",
 ];
 
 /// Construct an effect by name. Unknown names fall back to the first entry in
@@ -251,6 +253,23 @@ pub fn build(
             let mut w = crate::wizardtorch::WizardTorch::new(cols, rows);
             w.set_frame_ms(cfg.frame_time().as_millis() as u64);
             Box::new(w)
+        }
+        "fishloop" => {
+            let mut f = crate::frameplay::FramePlay::new(
+                "fishloop",
+                crate::frameplay::Reel {
+                    cols: crate::fishloop_art::COLS,
+                    rows: crate::fishloop_art::ROWS,
+                    fps: crate::fishloop_art::FPS,
+                    bg: crate::fishloop_art::BG,
+                    palette: &crate::fishloop_art::PALETTE,
+                    frames: &crate::fishloop_art::FRAMES,
+                },
+                cols,
+                rows,
+            );
+            f.set_frame_ms(cfg.frame_time().as_millis() as u64);
+            Box::new(f)
         }
         "plasma" => {
             let mut p = crate::plasma::Plasma::new(cols, rows, cfg.chars_override.as_deref());
@@ -295,8 +314,14 @@ pub fn build(
 pub enum Scope {
     /// The backdrop behind terminal windows.
     Pane,
-    /// The desktop wallpaper.
-    Wallpaper,
+    /// The desktop wallpaper, for ONE monitor.
+    ///
+    /// Carries the `DISPLAY<n>` index because wallpaper params resolve
+    /// per-monitor: the shared `[wallpaper.<effect>]` block with that monitor's
+    /// `[wallpaper.<n>.<effect>]` overrides laid on top. Without the index every
+    /// screen running an effect read the same values, so tuning one tuned all
+    /// of them.
+    Wallpaper(usize),
 }
 
 /// Apply any `[effect]` params persisted in config.toml to a freshly built
@@ -311,15 +336,22 @@ pub fn apply_saved_params(
     scope: Scope,
 ) {
     let name = sim.name().to_lowercase();
-    let map = match scope {
-        Scope::Pane => &cfg.effect_params,
-        Scope::Wallpaper => &cfg.wallpaper_effect_params,
-    };
     // No saved entry means this effect has never been tuned in this scope, so
     // the effect's own constructor defaults stand. That is how the desktop
     // starts from the effect's defaults rather than a copy of the pane's.
-    let Some(saved) = map.get(&name) else {
-        return;
+    let merged;
+    let saved = match scope {
+        Scope::Pane => match cfg.effect_params.get(&name) {
+            Some(m) => m,
+            None => return,
+        },
+        Scope::Wallpaper(monitor) => {
+            merged = cfg.wallpaper_params_for(monitor, &name);
+            if merged.is_empty() {
+                return;
+            }
+            &merged
+        }
     };
     // Collect first: `params()` borrows, `set_param` needs &mut.
     let saved: Vec<(String, String)> = saved.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -336,7 +368,7 @@ pub fn apply_saved_params(
             // different sections and the message must say which one is wrong.
             let sec = match scope {
                 Scope::Pane => name.clone(),
-                Scope::Wallpaper => format!("wallpaper.{name}"),
+                Scope::Wallpaper(m) => format!("wallpaper.{m}.{name}"),
             };
             eprintln!("[panefx] config [{sec}]: effect ignored '{k}'");
         }

@@ -122,7 +122,7 @@ impl SimPool {
             key.cols,
             key.rows,
             seed_for(key.monitor),
-            animation::Scope::Wallpaper,
+            animation::Scope::Wallpaper(key.monitor),
         );
         self.sims.insert(key.clone(), PooledSim { sim, dirty: true });
     }
@@ -164,10 +164,12 @@ impl SimPool {
     pub fn reapply(&mut self, effect: &str, cfg: &Config) {
         for (k, p) in self.sims.iter_mut() {
             if k.effect == effect {
+                // Each sim re-reads with ITS OWN monitor index, so two screens
+                // on the same effect can hold different values.
                 animation::apply_saved_params(
                     p.sim.as_mut(),
                     cfg,
-                    animation::Scope::Wallpaper,
+                    animation::Scope::Wallpaper(k.monitor),
                 );
                 p.dirty = true;
             }

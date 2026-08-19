@@ -65,6 +65,11 @@ pub enum Command {
     /// different things depending on which row happened to be highlighted.
     #[serde(rename = "wallpaper_param")]
     WallpaperParam {
+        /// Which screen to tune. `None` means EVERY screen running `effect`,
+        /// which is the old behaviour and still what "set it once for all of
+        /// them" should do.
+        #[serde(default)]
+        monitor: Option<usize>,
         effect: String,
         key: String,
         val: ParamValue,
@@ -193,6 +198,8 @@ pub struct ConfigView {
     pub rotate_secs: u64,
     /// Window opacity, 10-100%. See `opacity.rs`.
     pub opacity: u8,
+    /// Terminal backdrops switched off entirely. The wallpaper is unaffected.
+    pub pane_off: bool,
     pub wallpaper_fps: u64,
     /// What the wallpaper can ACTUALLY achieve: it is ticked from the daemon
     /// loop, so `fps` caps it. Reported separately so the TUI never shows a
@@ -217,6 +224,7 @@ impl ConfigView {
             rotation: cfg.rotation.clone(),
             rotate_secs: cfg.rotate_every.map(|d| d.as_secs()).unwrap_or(0),
             opacity: cfg.opacity,
+            pane_off: cfg.pane_off,
             wallpaper_fps: cfg.wallpaper_fps,
             wallpaper_fps_effective: cfg.wallpaper_fps.min(cfg.fps).max(1),
             wallpaper_detail: cfg.wallpaper_detail,

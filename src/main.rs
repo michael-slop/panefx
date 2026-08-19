@@ -603,19 +603,23 @@ fn handle_command(
         // an empty param block for an effect named in the row above would look
         // broken. The probe path is uniform.
         wallpaper_params: {
+            // Keyed by MONITOR, not by effect.
+            //
+            // Keyed by effect, two screens running `waves` shared one entry, so
+            // the TUI could only ever show -- and therefore only ever edit --
+            // one set of knobs for both. Params resolve per-monitor now (the
+            // shared block plus that screen's overrides), so the snapshot has
+            // to carry one entry per screen or the TUI cannot show the
+            // difference it is editing.
             let mut m = std::collections::BTreeMap::new();
             for surf in wall.monitors().iter().filter(|s| s.is_on()) {
-                m.entry(surf.effect.clone()).or_insert_with(|| {
-                    let mut probe = animation::build(&surf.effect, 1, 1, 0, cfg);
-                    // Scope::Wallpaper, or the TUI shows built-in defaults while
-                    // the desktop shows the tuned values.
-                    animation::apply_saved_params(
-                        probe.as_mut(),
-                        cfg,
-                        animation::Scope::Wallpaper,
-                    );
-                    probe.params()
-                });
+                let mut probe = animation::build(&surf.effect, 1, 1, 0, cfg);
+                animation::apply_saved_params(
+                    probe.as_mut(),
+                    cfg,
+                    animation::Scope::Wallpaper(surf.monitor.index),
+                );
+                m.insert(surf.monitor.index.to_string(), probe.params());
             }
             m
         },
@@ -726,7 +730,12 @@ fn handle_command(
             Reply::with_logs(panefx::log::tail(lines.min(1000)))
         }
 
-        Command::WallpaperParam { effect, key, val } => {
+        Command::WallpaperParam {
+            monitor,
+            effect,
+            key,
+            val,
+        } => {
             let eff = effect.trim().to_lowercase();
             if !animation::EFFECTS.contains(&eff.as_str()) {
                 return Reply::err(format!("unknown effect '{effect}'"));
@@ -738,7 +747,14 @@ fn handle_command(
             if !probe.set_param(&key, &val) {
                 return Reply::err(format!("effect '{eff}' has no param '{key}'"));
             }
-            cfg.set_wallpaper_effect_param(&eff, &key, val.display());
+            match monitor {
+                // One screen: an override laid over the shared block.
+                Some(m) => cfg.set_wallpaper_monitor_param(m, &eff, &key, val.display()),
+                // Every screen: the shared block itself. A monitor that already
+                // has its own override for this key keeps it -- "set the
+                // default" must not silently wipe a deliberate exception.
+                None => cfg.set_wallpaper_effect_param(&eff, &key, val.display()),
+            }
             // Push it to every live surface running this effect, in place, so
             // the change is visible immediately without restarting the
             // animation.
@@ -785,6 +801,16 @@ fn reconcile(
     cell: (i32, i32),
 ) {
     let (cell_w, cell_h) = cell;
+    // Switched off: hide every panel and keep them hidden. Reusing the existing
+    // off-screen path rather than destroying the panels, so flipping back on is
+    // instant and does not rebuild a window per terminal.
+    if cfg.pane_off {
+        for panel in panels.values_mut() {
+            panel.hide();
+            let _ = panel.sink();
+        }
+        return;
+    }
     let terminals: Vec<&ipc::Window> = windows.iter().filter(|w| w.is_target()).collect();
 
     // Drop panels whose terminal is gone.

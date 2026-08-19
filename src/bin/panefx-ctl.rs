@@ -114,6 +114,13 @@ struct App {
     blink_on: bool,
     last_blink: std::time::Instant,
     editing: Option<String>,
+    /// Open RGB picker, if any: the colour being built and which channel is
+    /// selected.
+    ///
+    /// A separate mode from `editing` rather than a parse of the text buffer:
+    /// the picker steers with arrow keys, and sharing the buffer would make
+    /// every keystroke ambiguous between "type a hex digit" and "nudge red".
+    picker: Option<Picker>,
     /// True when the daemon has a working wallpaper layer.
     wallpaper_ok: bool,
     /// The last snapshot, kept so moving the cursor can rebuild the wallpaper
@@ -127,6 +134,12 @@ struct App {
     /// and without knowing the effect the wallpaper rows would send the pane's
     /// `param` command and silently retune the terminal backdrop instead.
     wallpaper_param_effect: String,
+    /// Which monitor the visible param rows belong to.
+    ///
+    /// `None` means "no monitor is highlighted" -- the highlight is down on the
+    /// fps/cell rows -- and edits then fall back to the shared block, which is
+    /// the old "set it for every screen" behaviour.
+    wallpaper_param_monitor: Option<usize>,
 }
 
 struct Conn {
@@ -173,9 +186,11 @@ impl App {
             blink_on: true,
             last_blink: std::time::Instant::now(),
             editing: None,
+            picker: None,
             wallpaper_ok: false,
             last_snap: serde_json::Value::Null,
             wallpaper_param_effect: String::new(),
+            wallpaper_param_monitor: None,
         };
         app.sel[0].select(Some(0));
         app.sel[1].select(Some(0));
@@ -257,8 +272,9 @@ impl App {
             return;
         }
         let sel = self.sel[View::Wallpaper.idx()].selected().unwrap_or(0);
-        let (rows, eff) = build_wallpaper_rows(&self.last_snap, sel);
+        let (rows, eff, mon) = build_wallpaper_rows(&self.last_snap, sel);
         self.wallpaper_param_effect = eff;
+        self.wallpaper_param_monitor = mon;
         let n = rows.len();
         self.rows[View::Wallpaper.idx()] = rows;
         // Clamp: the row count changes with the highlighted monitor's effect.
@@ -295,7 +311,13 @@ impl App {
             .unwrap_or_default();
 
         let cfg = snap.get("config").cloned().unwrap_or_default();
-        let ci = |k: &str| cfg.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
+        // Bools read as 0/1 so a flag can be an ordinary Config row and reuse
+        // the whole nudge/type/dispatch path rather than needing its own.
+        let ci = |k: &str| {
+            cfg.get(k)
+                .and_then(|v| v.as_i64().or_else(|| v.as_bool().map(|b| b as i64)))
+                .unwrap_or(0)
+        };
         let cs = |k: &str| {
             cfg.get(k)
                 .and_then(|v| v.as_str())
@@ -310,6 +332,18 @@ impl App {
             self.status = format!("'{}' exposes no tunable parameters", self.effect);
         }
         rows.extend(params.into_iter().map(Row::Param));
+        // The pane's own on/off, mirroring the wallpaper's per-monitor `off`.
+        //
+        // FIRST of the config rows because it governs everything below it: with
+        // the backdrops off, fps and opacity are settings for something that is
+        // not being drawn.
+        rows.push(Row::Config {
+            key: "pane_off",
+            label: "backdrops (1 = off)",
+            value: ci("pane_off"),
+            min: 0,
+            max: 1,
+        });
         rows.push(Row::Config {
             key: "fps",
             label: "fps",
@@ -380,8 +414,9 @@ impl App {
         self.wallpaper_ok = snap.get("wallpaper_error").is_none();
         self.last_snap = snap.clone();
         let wsel = self.sel[View::Wallpaper.idx()].selected().unwrap_or(0);
-        let (wrows, weff) = build_wallpaper_rows(snap, wsel);
+        let (wrows, weff, wmon) = build_wallpaper_rows(snap, wsel);
         self.wallpaper_param_effect = weff;
+        self.wallpaper_param_monitor = wmon;
         self.rows[View::Wallpaper.idx()] = wrows;
 
         // Clamp EVERY view's selection to its new row count.
@@ -438,6 +473,7 @@ impl App {
                     param_command(
                         self.view == View::Wallpaper,
                         &self.wallpaper_param_effect,
+                        self.wallpaper_param_monitor,
                         &p.key,
                         serde_json::json!({"kind":"int","v":nv}),
                     )
@@ -548,7 +584,7 @@ impl App {
                         }
                     },
                 };
-                param_command(wall, &eff, &p.key, val)
+                param_command(wall, &eff, self.wallpaper_param_monitor, &p.key, val)
             }
             Row::ConfigText { key, .. } => serde_json::json!({"cmd":"set","key":key,"val":text}),
             Row::Config { key, min, max, .. } => match text.trim().parse::<i64>() {
@@ -566,6 +602,62 @@ impl App {
             | Row::Log { .. } => return,
         };
         self.dispatch(msg);
+    }
+}
+
+/// An open RGB colour picker.
+///
+/// Terminals have no colour wheel, and a hex field alone means guessing what
+/// `#3a7f2c` looks like before pressing Enter. Three channels with a live
+/// swatch is the closest a cell grid gets to picking a colour by eye, and it is
+/// entirely arrow-key driven so it works over SSH with no mouse.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Picker {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    /// 0 = red, 1 = green, 2 = blue.
+    pub channel: usize,
+}
+
+impl Picker {
+    pub fn from_rgb(c: panefx::palette::Rgb) -> Self {
+        Picker { r: c.0, g: c.1, b: c.2, channel: 0 }
+    }
+
+    /// Move between channels, wrapping.
+    pub fn cycle_channel(&mut self, delta: isize) {
+        let n = 3isize;
+        self.channel = (((self.channel as isize + delta) % n + n) % n) as usize;
+    }
+
+    /// Nudge the selected channel, SATURATING at the ends.
+    ///
+    /// Saturating, never wrapping: nudging red past 255 back to 0 turns a
+    /// near-white into a near-black in one keypress, which is never what the
+    /// hand meant.
+    pub fn nudge(&mut self, delta: i16) {
+        let v = match self.channel {
+            0 => &mut self.r,
+            1 => &mut self.g,
+            _ => &mut self.b,
+        };
+        *v = (*v as i16 + delta).clamp(0, 255) as u8;
+    }
+
+    pub fn hex(&self) -> String {
+        format!("#{:02x}{:02x}{:02x}", self.r, self.g, self.b)
+    }
+
+    /// A bar for one channel, `width` cells wide.
+    pub fn bar(value: u8, width: usize) -> String {
+        let w = width.max(1);
+        let filled = (value as usize * w) / 255;
+        let mut s = String::with_capacity(w);
+        for i in 0..w {
+            s.push(if i < filled { '\u{2588}' } else { '\u{2591}' });
+        }
+        s
     }
 }
 
@@ -594,11 +686,15 @@ fn wallpaper_cycle_from(effects: &[String]) -> Vec<String> {
 fn param_command(
     wallpaper: bool,
     effect: &str,
+    monitor: Option<usize>,
     key: &str,
     val: serde_json::Value,
 ) -> serde_json::Value {
     if wallpaper {
-        serde_json::json!({"cmd":"wallpaper_param","effect":effect,"key":key,"val":val})
+        // `monitor: null` is meaningful, not a placeholder: it means the SHARED
+        // block, i.e. every screen running this effect. Sent explicitly so the
+        // daemon never has to guess which was intended.
+        serde_json::json!({"cmd":"wallpaper_param","monitor":monitor,"effect":effect,"key":key,"val":val})
     } else {
         serde_json::json!({"cmd":"param","key":key,"val":val})
     }
@@ -610,30 +706,45 @@ fn param_command(
 /// names them. Falls back to the first monitor that is on, because the highlight
 /// spends half its life on the fps/cell rows at the bottom and the param block
 /// must not vanish when it does. `None` when every monitor is off.
-fn wallpaper_param_effect(monitors: &[serde_json::Value], sel: usize) -> Option<String> {
+fn wallpaper_param_effect(
+    monitors: &[serde_json::Value],
+    sel: usize,
+) -> Option<(String, Option<usize>)> {
     let effect_of = |m: &serde_json::Value| {
         m.get("effect")
             .and_then(|v| v.as_str())
             .filter(|e| *e != "off")
             .map(String::from)
     };
+    let index_of = |m: &serde_json::Value| m.get("index").and_then(|v| v.as_u64()).map(|n| n as usize);
     // The highlight is on a monitor row when sel < monitors.len(): the monitor
     // rows are always FIRST and fixed-length, which is what keeps the selection
     // stable as the param rows below change length.
     if let Some(m) = monitors.get(sel) {
         if let Some(e) = effect_of(m) {
-            return Some(e);
+            // A highlighted monitor means edits target THAT SCREEN.
+            return Some((e, index_of(m)));
         }
     }
-    monitors.iter().find_map(effect_of)
+    // Highlight is elsewhere (the fps/cell rows). Show the first live effect,
+    // and target the SHARED block -- there is no one screen being pointed at,
+    // and silently editing whichever happened to be first would be worse.
+    monitors.iter().find_map(effect_of).map(|e| (e, None))
 }
 
 /// Build the Wallpaper tab's rows, and report which effect the param rows are
 /// for so dispatch can route them to the wallpaper rather than the pane.
-fn build_wallpaper_rows(snap: &serde_json::Value, sel: usize) -> (Vec<Row>, String) {
+fn build_wallpaper_rows(
+    snap: &serde_json::Value,
+    sel: usize,
+) -> (Vec<Row>, String, Option<usize>) {
     let mut rows: Vec<Row> = Vec::new();
     let cfg = snap.get("config").cloned().unwrap_or_default();
-    let ci = |k: &str| cfg.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
+    let ci = |k: &str| {
+        cfg.get(k)
+            .and_then(|v| v.as_i64().or_else(|| v.as_bool().map(|b| b as i64)))
+            .unwrap_or(0)
+    };
 
     let monitors = snap
         .get("wallpaper")
@@ -657,12 +768,12 @@ fn build_wallpaper_rows(snap: &serde_json::Value, sel: usize) -> (Vec<Row>, Stri
         rows.push(Row::Note(
             "Terminal and Neovide backdrops are unaffected.".into(),
         ));
-        return (rows, String::new());
+        return (rows, String::new(), None);
     }
 
     if monitors.is_empty() {
         rows.push(Row::Note("no monitors detected".into()));
-        return (rows, String::new());
+        return (rows, String::new(), None);
     }
 
     for m in &monitors {
@@ -693,23 +804,33 @@ fn build_wallpaper_rows(snap: &serde_json::Value, sel: usize) -> (Vec<Row>, Stri
     // that read naturally as a trailing block. Keeping the monitor rows first
     // and fixed-length also keeps the selection stable while these change
     // length underneath it.
-    let param_effect = wallpaper_param_effect(&monitors, sel).unwrap_or_default();
+    let (param_effect, param_monitor) = match wallpaper_param_effect(&monitors, sel) {
+        Some((e, m)) => (e, m),
+        None => (String::new(), None),
+    };
     if param_effect.is_empty() {
         rows.push(Row::Note(
             "every monitor is off — turn one on to tune its look".into(),
         ));
     } else {
+        // Keyed by monitor now, not by effect -- see the note in `main.rs`.
+        // Falls back to the first entry when the highlight is off the monitor
+        // rows, so the block never vanishes mid-scroll.
         let params: Vec<Param> = snap
             .get("wallpaper_params")
-            .and_then(|m| m.get(&param_effect))
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .and_then(|m| match param_monitor {
+                Some(i) => m.get(&i.to_string()).cloned(),
+                None => m.as_object().and_then(|o| o.values().next().cloned()),
+            })
+            .and_then(|v| serde_json::from_value(v).ok())
             .unwrap_or_default();
         if params.is_empty() {
             rows.push(Row::Note(format!("'{param_effect}' has no tunable knobs")));
         } else {
-            rows.push(Row::Note(format!(
-                "{param_effect} — desktop only; shared by every monitor running it"
-            )));
+            rows.push(Row::Note(match param_monitor {
+                Some(i) => format!("{param_effect} — DISPLAY{i} only"),
+                None => format!("{param_effect} — every monitor running it"),
+            }));
             rows.extend(params.into_iter().map(Row::Param));
         }
     }
@@ -754,7 +875,7 @@ fn build_wallpaper_rows(snap: &serde_json::Value, sel: usize) -> (Vec<Row>, Stri
         min: 1,
         max: 64,
     });
-    (rows, param_effect)
+    (rows, param_effect, param_monitor)
 }
 
 fn row_label(r: &Row) -> String {
@@ -970,6 +1091,49 @@ fn run<B: Backend>(term: &mut Terminal<B>, app: &mut App) -> anyhow::Result<()> 
             continue;
         }
 
+        // Picker mode captures everything except Esc/Enter, like text entry.
+        if let Some(mut pk) = app.picker {
+            match k.code {
+                KeyCode::Esc => app.picker = None,
+                KeyCode::Enter => {
+                    app.picker = None;
+                    app.commit_edit(pk.hex());
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    pk.cycle_channel(-1);
+                    app.picker = Some(pk);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    pk.cycle_channel(1);
+                    app.picker = Some(pk);
+                }
+                KeyCode::Right | KeyCode::Char('l') => {
+                    pk.nudge(1);
+                    app.picker = Some(pk);
+                }
+                KeyCode::Left | KeyCode::Char('h') => {
+                    pk.nudge(-1);
+                    app.picker = Some(pk);
+                }
+                // Capitals move in tens, matching the row nudge keys.
+                KeyCode::Char('L') => {
+                    pk.nudge(16);
+                    app.picker = Some(pk);
+                }
+                KeyCode::Char('H') => {
+                    pk.nudge(-16);
+                    app.picker = Some(pk);
+                }
+                // Drop to typing a hex code, for a colour taken from elsewhere.
+                KeyCode::Char('#') => {
+                    app.picker = None;
+                    app.editing = Some(String::new());
+                }
+                _ => {}
+            }
+            continue;
+        }
+
         // Text-entry mode captures everything except Esc/Enter.
         if let Some(buf) = app.editing.clone() {
             match k.code {
@@ -1024,6 +1188,19 @@ fn run<B: Backend>(term: &mut Terminal<B>, app: &mut App) -> anyhow::Result<()> 
                 match row {
                     Some(Row::WallpaperApplyAll) => app.apply_to_all(),
                     Some(Row::WallpaperMonitor { .. }) | Some(Row::Note(_)) | None => {}
+                    // A colour opens the PICKER, not a text field: a hex code
+                    // alone means guessing what it looks like before
+                    // committing. `#` inside the picker still drops to typing.
+                    Some(Row::Param(ref p))
+                        if matches!(p.value, ParamValue::Colour { .. }) =>
+                    {
+                        let cur = panefx::palette::Rgb::parse_hex(&row_value(
+                            &Row::Param(p.clone()),
+                            &app.effect,
+                        ))
+                        .unwrap_or(panefx::palette::Rgb(128, 128, 128));
+                        app.picker = Some(Picker::from_rgb(cur));
+                    }
                     Some(r) => {
                         let cur = row_value(&r, &app.effect);
                         // Start from the current value so a small tweak is easy.
@@ -1167,6 +1344,54 @@ fn draw(f: &mut Frame, app: &App) {
                 ]));
             }
             let editing = i == sel && app.editing.is_some();
+            // The open picker replaces the row's value with three live bars.
+            // Rendered INLINE rather than as a popup: a popup would cover the
+            // wallpaper being tuned, and the whole point of picking a colour
+            // here is watching the screen behind it change.
+            if i == sel {
+                if let Some(pk) = app.picker {
+                    let mark = |c: usize| if pk.channel == c { '>' } else { ' ' };
+                    let mut spans = vec![Span::styled(
+                        "  colour ",
+                        Style::default().fg(Color::DarkGray),
+                    )];
+                    for (ci, (name, v, col)) in [
+                        ("R", pk.r, Color::LightRed),
+                        ("G", pk.g, Color::LightGreen),
+                        ("B", pk.b, Color::LightBlue),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        spans.push(Span::styled(
+                            format!("{}{name} ", mark(ci)),
+                            if pk.channel == ci {
+                                Style::default()
+                                    .fg(Color::White)
+                                    .add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default().fg(Color::DarkGray)
+                            },
+                        ));
+                        spans.push(Span::styled(
+                            Picker::bar(v, 12),
+                            Style::default().fg(col),
+                        ));
+                        spans.push(Span::raw(format!(" {v:>3} ")));
+                    }
+                    // The swatch itself, in the colour being built -- the one
+                    // thing a hex field cannot show.
+                    spans.push(Span::styled(
+                        "  \u{2588}\u{2588}\u{2588} ",
+                        Style::default().fg(Color::Rgb(pk.r, pk.g, pk.b)),
+                    ));
+                    spans.push(Span::styled(
+                        format!("{}  (# to type)", pk.hex()),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                    return ListItem::new(Line::from(spans));
+                }
+            }
             let value = if editing {
                 format!("{}_", app.editing.clone().unwrap_or_default())
             } else {
@@ -1302,7 +1527,7 @@ mod view_tests {
         // An empty list would read as "panefx is broken" when the terminal
         // backdrops are working perfectly. It must say why, and say what is
         // unaffected.
-        let (rows, _) = build_wallpaper_rows(&snapshot_without_layer()["snapshot"], 0);
+        let (rows, _, _) = build_wallpaper_rows(&snapshot_without_layer()["snapshot"], 0);
         assert!(!rows.is_empty(), "never show an empty wallpaper tab");
         let text: String = rows.iter().map(|r| row_value(r, "waves")).collect::<Vec<_>>().join(" ");
         assert!(text.contains("unavailable"));
@@ -1317,7 +1542,7 @@ mod view_tests {
 
     #[test]
     fn monitors_render_with_effect_and_frozen_state() {
-        let (rows, _) = build_wallpaper_rows(&snapshot_with_monitors()["snapshot"], 0);
+        let (rows, _, _) = build_wallpaper_rows(&snapshot_with_monitors()["snapshot"], 0);
         let mons: Vec<&Row> = rows.iter()
             .filter(|r| matches!(r, Row::WallpaperMonitor { .. })).collect();
         assert_eq!(mons.len(), 2);
@@ -1353,9 +1578,12 @@ mod view_tests {
                 {"index":1,"label":"1440x2560 portrait","effect":"waves","occluded":false},
                 {"index":3,"label":"1920x1080 (primary)","effect":"flames","occluded":false}
             ],
+            // Keyed by MONITOR index, not effect -- two screens on one effect
+            // each get their own entry, which is what makes them separately
+            // editable. See `main.rs`.
             "wallpaper_params":{
-                "waves":[{"key":"ink","label":"ink colour","value":{"kind":"colour","r":0,"g":0,"b":255},"min":0,"max":0}],
-                "flames":[{"key":"seed","label":"flame height","value":{"kind":"int","v":65},"min":1,"max":200}]
+                "1":[{"key":"ink","label":"ink colour","value":{"kind":"colour","r":0,"g":0,"b":255},"min":0,"max":0}],
+                "3":[{"key":"seed","label":"flame height","value":{"kind":"int","v":65},"min":1,"max":200}]
             }
         }})
     }
@@ -1365,10 +1593,15 @@ mod view_tests {
         let snap = snapshot_two_effects();
         let s = &snap["snapshot"];
         // Row 0 is DISPLAY1 (waves), row 1 is DISPLAY3 (flames).
-        let (_, eff0) = build_wallpaper_rows(s, 0);
+        let (_, eff0, mon0) = build_wallpaper_rows(s, 0);
         assert_eq!(eff0, "waves");
-        let (_, eff1) = build_wallpaper_rows(s, 1);
+        let (_, eff1, mon1) = build_wallpaper_rows(s, 1);
         assert_eq!(eff1, "flames", "params must follow the highlighted monitor");
+        // AND the monitor must follow too, or every screen edits the same
+        // stored block -- the bug this whole per-monitor pass exists to fix.
+        assert_eq!(mon0, Some(1), "row 0 must target DISPLAY1");
+        assert_eq!(mon1, Some(3), "row 1 must target DISPLAY3");
+        assert_ne!(mon0, mon1, "two monitor rows must not edit the same target");
     }
 
     #[test]
@@ -1376,16 +1609,23 @@ mod view_tests {
         // The cursor spends half its life on the fps/cell rows; the param block
         // must not vanish when it does.
         let snap = snapshot_two_effects();
-        let (_, eff) = build_wallpaper_rows(&snap["snapshot"], 99);
+        let (_, eff, mon) = build_wallpaper_rows(&snap["snapshot"], 99);
         assert_eq!(eff, "waves");
+        // No monitor row is highlighted, so edits target the SHARED block --
+        // silently editing whichever screen happened to be first would be
+        // worse than editing all of them on purpose.
+        assert_eq!(mon, None, "an unhighlighted list must not target one screen");
     }
 
     #[test]
     fn an_off_monitor_falls_back_rather_than_showing_nothing() {
         let mut snap = snapshot_two_effects();
         snap["snapshot"]["wallpaper"][0]["effect"] = serde_json::json!("off");
-        let (_, eff) = build_wallpaper_rows(&snap["snapshot"], 0);
+        let (_, eff, mon) = build_wallpaper_rows(&snap["snapshot"], 0);
         assert_eq!(eff, "flames", "an off monitor falls through to one that is on");
+        // Fallen back to another screen's effect, so the edit must NOT be
+        // aimed at the highlighted (off) monitor.
+        assert_eq!(mon, None);
     }
 
     #[test]
@@ -1393,8 +1633,9 @@ mod view_tests {
         let mut snap = snapshot_two_effects();
         snap["snapshot"]["wallpaper"][0]["effect"] = serde_json::json!("off");
         snap["snapshot"]["wallpaper"][1]["effect"] = serde_json::json!("off");
-        let (rows, eff) = build_wallpaper_rows(&snap["snapshot"], 0);
+        let (rows, eff, mon) = build_wallpaper_rows(&snap["snapshot"], 0);
         assert!(eff.is_empty());
+        assert_eq!(mon, None);
         assert!(!rows.iter().any(|r| matches!(r, Row::Param(_))), "no knobs to show");
         let text: String = rows.iter().map(|r| row_value(r, "")).collect::<Vec<_>>().join(" ");
         assert!(text.contains("turn one on"), "must explain, not just go blank");
@@ -1406,7 +1647,7 @@ mod view_tests {
         // fixed-length, so the cursor does not jump when the param block below
         // changes size.
         let snap = snapshot_two_effects();
-        let (rows, _) = build_wallpaper_rows(&snap["snapshot"], 0);
+        let (rows, _, _) = build_wallpaper_rows(&snap["snapshot"], 0);
         let apply = rows.iter().position(|r| matches!(r, Row::WallpaperApplyAll)).unwrap();
         let param = rows.iter().position(|r| matches!(r, Row::Param(_))).unwrap();
         let fps = rows
@@ -1420,18 +1661,98 @@ mod view_tests {
     }
 
     #[test]
+    fn the_picker_moves_between_channels_and_wraps() {
+        let mut pk = Picker::from_rgb(panefx::palette::Rgb(10, 20, 30));
+        assert_eq!(pk.channel, 0);
+        pk.cycle_channel(1);
+        assert_eq!(pk.channel, 1);
+        // Wrapping both ways: three channels is short enough that stepping off
+        // either end and stopping would be a papercut on every use.
+        pk.cycle_channel(2);
+        assert_eq!(pk.channel, 0);
+        pk.cycle_channel(-1);
+        assert_eq!(pk.channel, 2);
+    }
+
+    #[test]
+    fn the_picker_saturates_rather_than_wrapping() {
+        // THE trap this avoids: wrapping red from 255 back to 0 turns a
+        // near-white into a near-black in ONE keypress, which is never what the
+        // hand meant.
+        let mut pk = Picker::from_rgb(panefx::palette::Rgb(254, 1, 128));
+        pk.channel = 0;
+        pk.nudge(16);
+        assert_eq!(pk.r, 255, "red must stop at the top");
+        pk.channel = 1;
+        pk.nudge(-16);
+        assert_eq!(pk.g, 0, "green must stop at the bottom");
+    }
+
+    #[test]
+    fn the_picker_only_moves_the_selected_channel() {
+        let mut pk = Picker::from_rgb(panefx::palette::Rgb(100, 100, 100));
+        pk.channel = 1;
+        pk.nudge(20);
+        assert_eq!((pk.r, pk.g, pk.b), (100, 120, 100));
+    }
+
+    #[test]
+    fn the_picker_round_trips_through_hex() {
+        // The picker's output is committed as text, so it has to survive the
+        // same parse the typed path uses -- otherwise picking a colour and
+        // typing one disagree.
+        let pk = Picker::from_rgb(panefx::palette::Rgb(0x3a, 0x7f, 0x2c));
+        assert_eq!(pk.hex(), "#3a7f2c");
+        let back = panefx::palette::Rgb::parse_hex(&pk.hex()).expect("must reparse");
+        assert_eq!(back, panefx::palette::Rgb(0x3a, 0x7f, 0x2c));
+    }
+
+    #[test]
+    fn the_channel_bars_track_their_value() {
+        // The bar IS the feedback -- if it does not track the number, the
+        // picker is just a hex field with extra steps.
+        assert_eq!(Picker::bar(0, 8).chars().filter(|c| *c == '\u{2588}').count(), 0);
+        assert_eq!(Picker::bar(255, 8).chars().filter(|c| *c == '\u{2588}').count(), 8);
+        let half = Picker::bar(128, 8).chars().filter(|c| *c == '\u{2588}').count();
+        assert!((3..=5).contains(&half), "half-value bar was {half}/8");
+        // Always full width, so the columns beside it stay aligned.
+        assert_eq!(Picker::bar(70, 12).chars().count(), 12);
+    }
+
+    #[test]
+    fn a_zero_width_bar_does_not_panic() {
+        // Width comes from a layout calculation, so 0 has to be survivable.
+        assert_eq!(Picker::bar(200, 0).chars().count(), 1);
+    }
+
+    #[test]
+    fn a_wallpaper_param_carries_the_monitor_it_targets() {
+        // THE per-monitor fix, as a tripwire. Params are stored per effect with
+        // per-monitor overrides, so the command MUST say which screen it means.
+        // Without it every screen running an effect shared one set of knobs and
+        // tuning one tuned all of them.
+        let v = serde_json::json!({"kind":"int","v":400});
+        let one = param_command(true, "waves", Some(3), "darkcut", v.clone());
+        assert_eq!(one["monitor"], 3);
+        // `null` is MEANINGFUL: the shared block, i.e. every screen. It must be
+        // sent explicitly rather than omitted, so the daemon never guesses.
+        let all = param_command(true, "waves", None, "darkcut", v);
+        assert!(all["monitor"].is_null(), "the shared case must be explicit");
+    }
+
+    #[test]
     fn a_wallpaper_param_never_retunes_the_pane() {
         // THE trap. `Row::Param` is shared between tabs, so a missing tab check
         // sends the pane's `param` command from the Wallpaper tab -- retuning
         // the terminal backdrop while the desktop sits unchanged, with no error
         // anywhere. Sabotage-checked: reverting the fork fails this test.
         let v = serde_json::json!({"kind":"int","v":400});
-        let wall = param_command(true, "waves", "darkcut", v.clone());
+        let wall = param_command(true, "waves", Some(2), "darkcut", v.clone());
         assert_eq!(wall["cmd"], "wallpaper_param");
         assert_eq!(wall["effect"], "waves", "the effect must be explicit");
         assert_eq!(wall["key"], "darkcut");
 
-        let pane = param_command(false, "waves", "darkcut", v);
+        let pane = param_command(false, "waves", None, "darkcut", v);
         assert_eq!(pane["cmd"], "param");
         assert!(pane.get("effect").is_none(), "the pane has one current effect");
     }
@@ -1441,8 +1762,8 @@ mod view_tests {
         // Guards against a refactor that "unifies" them and reintroduces the bug.
         let v = serde_json::json!({"kind":"int","v":1});
         assert_ne!(
-            param_command(true, "waves", "k", v.clone())["cmd"],
-            param_command(false, "waves", "k", v)["cmd"]
+            param_command(true, "waves", None, "k", v.clone())["cmd"],
+            param_command(false, "waves", None, "k", v)["cmd"]
         );
     }
 }

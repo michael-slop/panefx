@@ -96,7 +96,37 @@ pub struct Config {
     pub wallpaper_effect_params:
         std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
 
+    /// PER-MONITOR wallpaper params, keyed `monitor -> effect -> key -> value`.
+    ///
+    /// Overrides `wallpaper_effect_params` for one screen. Written as
+    /// `[wallpaper.3.waves]` -- the monitor's `DISPLAY<n>` index, then the
+    /// effect.
+    ///
+    /// Exists because the shared block above cannot express "the portrait
+    /// screen wants a bigger cell and a different ink": every monitor running
+    /// `waves` read the same values, so tuning one tuned all of them, and the
+    /// only way to get two different looks was to run two different effects.
+    ///
+    /// A monitor with no entry falls back to the shared block, which is what
+    /// keeps existing configs working and keeps "set it once for every screen"
+    /// a single edit.
+    pub wallpaper_monitor_params: std::collections::BTreeMap<
+        usize,
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    >,
+
     // ---- desktop wallpaper -------------------------------------------------
+    /// Turn the TERMINAL backdrops off entirely, keeping the wallpaper.
+    ///
+    /// The wallpaper has had an `off` per monitor since it shipped; the pane
+    /// had no way to be switched off at all, so the only way to stop it was to
+    /// kill the daemon -- which also took the wallpaper with it.
+    ///
+    /// A flag rather than an `"off"` entry in `EFFECTS`: that list decides
+    /// which `[section]`s are read as per-effect params, and a fake member
+    /// would make `[off]` a silent param sink.
+    pub pane_off: bool,
+
     /// Frame rate for the desktop wallpaper, independent of `fps`.
     ///
     /// Lower by default: the wallpaper is glanced at rather than watched, and
@@ -152,7 +182,9 @@ impl Default for Config {
             // on first run after this became panefx's job.
             opacity: 60,
             effect_params: Default::default(),
+            pane_off: false,
             wallpaper_effect_params: Default::default(),
+            wallpaper_monitor_params: Default::default(),
             // Half the terminal rate. The desktop is scenery.
             wallpaper_fps: 5,
             // EMPTY = wallpapers off. A new feature must not change what the
@@ -227,6 +259,26 @@ pub fn parse_wallpaper_section(sec: &str) -> Option<String> {
     crate::animation::EFFECTS
         .contains(&eff)
         .then(|| eff.to_string())
+}
+
+/// `[wallpaper.3.waves]` -> `Some((3, "waves"))`. Anything else -> `None`.
+///
+/// Deliberately as strict as [`parse_wallpaper_section`]: both halves must be
+/// valid -- a real `DISPLAY<n>` number and a REAL effect name -- or the section
+/// stays decorative and its keys go on setting the top-level fields, which is
+/// the old behaviour. A typo must not become a silent param sink that nothing
+/// ever reads.
+pub fn parse_wallpaper_monitor_section(sec: &str) -> Option<(usize, String)> {
+    let rest = sec.strip_prefix("wallpaper.")?;
+    let (num, eff) = rest.split_once('.')?;
+    let idx: usize = num.parse().ok()?;
+    // Monitor 0 does not exist -- `DISPLAY<n>` is 1-based.
+    if idx == 0 {
+        return None;
+    }
+    crate::animation::EFFECTS
+        .contains(&eff)
+        .then(|| (idx, eff.to_string()))
 }
 
 fn env_str(key: &str) -> Option<String> {
@@ -375,6 +427,18 @@ impl Config {
             // top-level match -- where `chars` would be hijacked by waves' ramp
             // and `fps` by whatever integer happened to be there.
             if let Some(sec) = section.as_deref() {
+                // `[wallpaper.<n>.<effect>]` -> ONE MONITOR's override. Checked
+                // before the shared form because `wallpaper.3.waves` also
+                // starts with `wallpaper.`.
+                if let Some((mon, eff)) = parse_wallpaper_monitor_section(sec) {
+                    self.wallpaper_monitor_params
+                        .entry(mon)
+                        .or_default()
+                        .entry(eff)
+                        .or_default()
+                        .insert(k, v.to_string());
+                    continue;
+                }
                 if let Some(eff) = parse_wallpaper_section(sec) {
                     self.wallpaper_effect_params
                         .entry(eff)
@@ -441,6 +505,7 @@ impl Config {
                         }
                     }
                 }
+                "pane_off" => self.pane_off = v.eq_ignore_ascii_case("true"),
                 "wallpaper_fps" => {
                     if let Ok(n) = v.parse::<u64>() {
                         if n > 0 && n <= 120 {
@@ -618,6 +683,8 @@ impl Config {
         s.push_str("# window on every damage rect, and heavy terminal output -- a long\n");
         s.push_str("# table, a build log -- tears and flashes the display.\n");
         s.push_str(&format!("opacity = {}\n", self.opacity));
+        s.push_str(&format!("pane_off = {}
+", self.pane_off));
 
         s.push_str("\n# --- desktop wallpaper ----------------------------------------------\n");
         s.push_str("# Drawn into Explorer's WorkerW layer, BEHIND the desktop icons.\n");
@@ -711,6 +778,40 @@ impl Config {
             }
         }
 
+        // Per-monitor overrides, written AFTER the shared blocks so the file
+        // reads the way the values are resolved: shared first, then what one
+        // screen does differently.
+        if self
+            .wallpaper_monitor_params
+            .values()
+            .any(|e| e.values().any(|m| !m.is_empty()))
+        {
+            s.push_str("
+# --- per-monitor overrides ------------------------------------------
+");
+            s.push_str("# Laid over the shared blocks above for ONE screen, by DISPLAY number.
+");
+        }
+        for (mon, effects) in &self.wallpaper_monitor_params {
+            for (effect, params) in effects {
+                if params.is_empty() {
+                    continue;
+                }
+                s.push_str(&format!("
+[wallpaper.{mon}.{effect}]
+"));
+                for (k, v) in params {
+                    if v.parse::<i64>().is_ok() {
+                        s.push_str(&format!("{k} = {v}
+"));
+                    } else {
+                        s.push_str(&format!("{k} = \"{v}\"
+"));
+                    }
+                }
+            }
+        }
+
         s
     }
 
@@ -742,6 +843,50 @@ impl Config {
             .entry(effect.to_lowercase())
             .or_default()
             .insert(key.to_string(), value);
+    }
+
+    /// Set one wallpaper param for ONE monitor, overriding the shared block.
+    pub fn set_wallpaper_monitor_param(
+        &mut self,
+        monitor: usize,
+        effect: &str,
+        key: &str,
+        value: String,
+    ) {
+        self.wallpaper_monitor_params
+            .entry(monitor)
+            .or_default()
+            .entry(effect.to_lowercase())
+            .or_default()
+            .insert(key.to_string(), value);
+    }
+
+    /// The params for `effect` on `monitor`: the shared block, with any
+    /// per-monitor entries laid over the top.
+    ///
+    /// Merged rather than either-or, so tuning one knob on one screen does not
+    /// silently discard every shared value for that effect.
+    pub fn wallpaper_params_for(
+        &self,
+        monitor: usize,
+        effect: &str,
+    ) -> std::collections::BTreeMap<String, String> {
+        let effect = effect.to_lowercase();
+        let mut out = self
+            .wallpaper_effect_params
+            .get(&effect)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(over) = self
+            .wallpaper_monitor_params
+            .get(&monitor)
+            .and_then(|m| m.get(&effect))
+        {
+            for (k, v) in over {
+                out.insert(k.clone(), v.clone());
+            }
+        }
+        out
     }
 
     /// Set one top-level field from a JSON value, for the control channel.
@@ -803,6 +948,19 @@ impl Config {
                 self.opacity = as_i64().unwrap() as u8;
             })
             .is_some(),
+            // Accepts a bool, "true"/"false", or 0/1 -- the TUI sends it as an
+            // int because it is rendered as an ordinary numeric row.
+            "pane_off" => match v
+                .as_bool()
+                .or_else(|| as_i64().map(|n| n != 0))
+                .or_else(|| as_str().map(|s| s.eq_ignore_ascii_case("true")))
+            {
+                Some(b) => {
+                    self.pane_off = b;
+                    true
+                }
+                None => false,
+            },
             "wallpaper_fps" => matches!(as_i64(), Some(n) if n > 0 && n <= 120).then(|| {
                 self.wallpaper_fps = as_i64().unwrap() as u64;
             }).is_some(),
@@ -1206,6 +1364,119 @@ ink = \"#0000ff\"");
         assert!(c.wallpaper_effect_params.is_empty(), "pane tuning leaked");
         c.set_wallpaper_effect_param("waves", "ink", "#0000ff".into());
         assert_eq!(c.effect_params["waves"]["ink"], "#ff0000", "wallpaper tuning leaked");
+    }
+
+    #[test]
+    fn a_monitor_override_lies_over_the_shared_block() {
+        // THE per-monitor feature. Before it, every screen running an effect
+        // read one set of values, so tuning one tuned all of them and the only
+        // way to get two looks was to run two different effects.
+        let mut c = Config::default();
+        c.set_wallpaper_effect_param("waves", "ink", "#0000ff".into());
+        c.set_wallpaper_effect_param("waves", "speed", "1000".into());
+        c.set_wallpaper_monitor_param(3, "waves", "ink", "#ff0000".into());
+
+        // Monitor 3 sees its own ink but still inherits the shared speed --
+        // MERGED, not either-or. Replacing wholesale would silently drop every
+        // shared value the moment one knob was tuned on one screen.
+        let m3 = c.wallpaper_params_for(3, "waves");
+        assert_eq!(m3.get("ink").map(String::as_str), Some("#ff0000"));
+        assert_eq!(m3.get("speed").map(String::as_str), Some("1000"));
+
+        // Every other screen is untouched.
+        let m1 = c.wallpaper_params_for(1, "waves");
+        assert_eq!(m1.get("ink").map(String::as_str), Some("#0000ff"));
+    }
+
+    #[test]
+    fn a_monitor_with_no_override_falls_back_entirely() {
+        // What keeps existing configs working: a file written before
+        // per-monitor params has no overrides at all, and every screen must
+        // still read the shared block.
+        let mut c = Config::default();
+        c.set_wallpaper_effect_param("flames", "seed", "65".into());
+        assert_eq!(
+            c.wallpaper_params_for(2, "flames").get("seed").map(String::as_str),
+            Some("65")
+        );
+    }
+
+    #[test]
+    fn an_effect_nobody_tuned_resolves_empty() {
+        // Empty means "leave the effect's own constructor defaults alone" --
+        // see `apply_saved_params`. It must not invent entries.
+        let c = Config::default();
+        assert!(c.wallpaper_params_for(1, "waves").is_empty());
+    }
+
+    #[test]
+    fn per_monitor_sections_round_trip_through_toml() {
+        // The values are useless if they do not survive a save/load.
+        let mut c = Config::default();
+        c.set_wallpaper_effect_param("waves", "ink", "#0000ff".into());
+        c.set_wallpaper_monitor_param(3, "waves", "ink", "#ff0000".into());
+        c.set_wallpaper_monitor_param(3, "waves", "speed", "2500".into());
+
+        let mut back = Config::default();
+        back.apply_toml(&c.to_toml());
+        assert_eq!(back.wallpaper_monitor_params, c.wallpaper_monitor_params);
+        assert_eq!(
+            back.wallpaper_params_for(3, "waves").get("ink").map(String::as_str),
+            Some("#ff0000")
+        );
+    }
+
+    #[test]
+    fn parse_wallpaper_monitor_section_is_strict() {
+        // As strict as the shared form: BOTH halves must be valid or the
+        // section stays decorative. A typo becoming a silent param sink that
+        // nothing ever reads is the failure being avoided.
+        assert_eq!(
+            parse_wallpaper_monitor_section("wallpaper.3.waves"),
+            Some((3, "waves".to_string()))
+        );
+        // Monitor 0 does not exist -- DISPLAY<n> is 1-based.
+        assert_eq!(parse_wallpaper_monitor_section("wallpaper.0.waves"), None);
+        // Not a real effect.
+        assert_eq!(parse_wallpaper_monitor_section("wallpaper.3.nonsense"), None);
+        // Not a number.
+        assert_eq!(parse_wallpaper_monitor_section("wallpaper.x.waves"), None);
+        // The shared form must NOT match this one.
+        assert_eq!(parse_wallpaper_monitor_section("wallpaper.waves"), None);
+    }
+
+    #[test]
+    fn the_shared_and_per_monitor_forms_do_not_collide() {
+        // `wallpaper.3.waves` also starts with `wallpaper.`, so the two parsers
+        // must not both claim it -- whichever ran second would win silently.
+        let mut c = Config::default();
+        c.apply_toml("[wallpaper.waves]\nink = \"#0000ff\"\n[wallpaper.3.waves]\nink = \"#ff0000\"");
+        assert_eq!(
+            c.wallpaper_effect_params["waves"]["ink"], "#0000ff",
+            "the shared block took the per-monitor value"
+        );
+        assert_eq!(
+            c.wallpaper_monitor_params[&3]["waves"]["ink"], "#ff0000",
+            "the per-monitor block was not recorded"
+        );
+    }
+
+    #[test]
+    fn pane_off_round_trips_and_accepts_an_int() {
+        // The TUI renders it as an ordinary numeric row, so 0/1 has to work as
+        // well as a bool -- otherwise the switch silently does nothing.
+        let mut c = Config::default();
+        assert!(!c.pane_off, "backdrops must default to ON");
+        assert!(c.set_field("pane_off", &serde_json::json!(1)));
+        assert!(c.pane_off);
+        assert!(c.set_field("pane_off", &serde_json::json!(0)));
+        assert!(!c.pane_off);
+        assert!(c.set_field("pane_off", &serde_json::json!(true)));
+        assert!(c.pane_off);
+
+        let mut back = Config::default();
+        back.apply_toml(&c.to_toml());
+        assert!(back.pane_off, "pane_off did not survive a save/load");
     }
 
     #[test]
