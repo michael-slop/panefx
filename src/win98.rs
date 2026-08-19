@@ -164,6 +164,31 @@ pub enum Bevel {
     Thin,
 }
 
+/// Which bevel a toggling button wears, given whether it is ON.
+///
+/// Win98 buttons show state as DEPTH: raised when idle, pushed in when
+/// selected. Trivial, and defined here anyway because it was got backwards --
+/// the tab strip drew the selected tab raised while the monitor buttons drew it
+/// sunken, so the two halves of the same window disagreed about which way "on"
+/// looked. One function, one answer, and a test that pins it.
+pub fn toggle_bevel(on: bool) -> Bevel {
+    if on {
+        Bevel::Sunken
+    } else {
+        Bevel::Raised
+    }
+}
+
+/// The face colour matching `toggle_bevel`: a pushed-in button shows the
+/// recessed field colour, an idle one the standard button face.
+pub fn toggle_face(on: bool, p: &Palette) -> Color32 {
+    if on {
+        p.field_bg
+    } else {
+        p.button_face
+    }
+}
+
 /// The double ring: 1px outer + 1px inner on each side.
 pub const BEVEL_THICKNESS: f32 = 2.0;
 
@@ -610,5 +635,25 @@ mod tests {
         assert!(ATTRIBUTION.contains("CC BY-SA 4.0"));
         assert!(ATTRIBUTION.contains("VileR"));
         assert!(ATTRIBUTION.contains("Nerd Fonts"));
+    }
+}
+
+#[cfg(test)]
+mod toggle_tests {
+    use super::*;
+
+    #[test]
+    fn selected_buttons_are_pushed_in_and_idle_ones_stand_proud() {
+        // The bug this pins: the tab strip had these the wrong way round,
+        // while the monitor buttons had them right. Both now call this.
+        assert_eq!(toggle_bevel(true), Bevel::Sunken, "selected = pushed in");
+        assert_eq!(toggle_bevel(false), Bevel::Raised, "idle = standing proud");
+    }
+
+    #[test]
+    fn the_face_colour_follows_the_bevel() {
+        let p = Palette::LIGHT;
+        assert_eq!(toggle_face(true, &p), p.field_bg);
+        assert_eq!(toggle_face(false, &p), p.button_face);
     }
 }

@@ -60,6 +60,10 @@ features = [
   # Process names, so a leftover WS_EX_LAYERED is only stripped from windows
   # belonging to a process panefx actually targets.
   "Win32_System_Diagnostics_ToolHelp",
+  # GetCurrentProcessId, so "is a panefx-gui already open?" can skip the
+  # daemon's OWN windows -- one of those matching would mean the GUI never
+  # starts. Still NO new crates: one feature flag.
+  "Win32_System_Threading",
   # System-tray icon. Shell_NotifyIconW lives here -- again NO new crates, the
   # windows crate is already a dependency.
   "Win32_UI_Shell",

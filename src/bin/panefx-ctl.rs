@@ -997,11 +997,13 @@ const HELP: &str = "\
 panefx — animated ASCII backdrops behind windows, and on the desktop
 
 USAGE:
-    panefx              open this control TUI
+    panefx              open the GUI control panel
+    panefx --tui        open THIS control TUI -- the one that works over SSH
     panefx --daemon     run the background daemon
     panefx --help       this text
 
-    panefx-ctl          the TUI directly (what `panefx` hands off to)
+    panefx-ctl          this TUI directly
+    panefx-gui          the GUI directly
 
 KEYS
     Tab            switch between the Effects and Wallpaper tabs

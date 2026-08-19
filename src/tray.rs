@@ -93,9 +93,10 @@ fn build_icon() -> Option<HICON> {
 /// application use, so this cannot collide with a system message.
 const WM_TRAYICON: u32 = WM_APP + 1;
 
-const ID_OPEN_TUI: usize = 1;
+const ID_OPEN_GUI: usize = 1;
 const ID_RELOAD: usize = 2;
 const ID_EXIT: usize = 3;
+const ID_OPEN_TUI: usize = 4;
 
 /// What the user picked from the tray menu.
 ///
@@ -104,6 +105,11 @@ const ID_EXIT: usize = 3;
 /// "report what was clicked" makes it testable and keeps Win32 out of the loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayAction {
+    /// Open the GUI control panel. The default: it is what a left click gets,
+    /// because it is the one most people want.
+    OpenGui,
+    /// Open the control TUI. Kept because it is the only one of the two that
+    /// works over SSH.
     OpenTui,
     Reload,
     Exit,
@@ -116,6 +122,7 @@ pub enum TrayAction {
 /// until it matters.
 pub fn action_for(id: usize) -> Option<TrayAction> {
     match id {
+        ID_OPEN_GUI => Some(TrayAction::OpenGui),
         ID_OPEN_TUI => Some(TrayAction::OpenTui),
         ID_RELOAD => Some(TrayAction::Reload),
         ID_EXIT => Some(TrayAction::Exit),
@@ -145,11 +152,11 @@ unsafe extern "system" fn tray_proc(
         WM_TRAYICON => {
             let event = (lparam.0 & 0xFFFF) as u32;
             match event {
-                // Left click goes straight to the TUI: the common case should
+                // Left click goes straight to the GUI: the common case should
                 // not need a menu.
                 WM_LBUTTONUP => {
                     if let Ok(mut p) = PENDING.lock() {
-                        *p = Some(TrayAction::OpenTui);
+                        *p = Some(TrayAction::OpenGui);
                     }
                 }
                 WM_RBUTTONUP => show_menu(hwnd),
@@ -176,10 +183,13 @@ unsafe extern "system" fn tray_proc(
 
 unsafe fn show_menu(hwnd: HWND) {
     let Ok(menu) = CreatePopupMenu() else { return };
-    let open = windows::core::w!("Open panefx TUI");
+    let gui = windows::core::w!("Open panefx");
+    let tui = windows::core::w!("Open panefx TUI (terminal)");
     let reload = windows::core::w!("Reload panefx");
     let exit = windows::core::w!("Exit");
-    let _ = AppendMenuW(menu, MF_STRING, ID_OPEN_TUI, open);
+    let _ = AppendMenuW(menu, MF_STRING, ID_OPEN_GUI, gui);
+    let _ = AppendMenuW(menu, MF_STRING, ID_OPEN_TUI, tui);
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     let _ = AppendMenuW(menu, MF_STRING, ID_RELOAD, reload);
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, exit);
@@ -287,6 +297,7 @@ mod tests {
     fn every_menu_id_maps_to_its_own_action() {
         // A wrong mapping here means "Exit" quietly reloads, or "Reload" quits
         // — both silent, and both discovered at the worst moment.
+        assert_eq!(action_for(ID_OPEN_GUI), Some(TrayAction::OpenGui));
         assert_eq!(action_for(ID_OPEN_TUI), Some(TrayAction::OpenTui));
         assert_eq!(action_for(ID_RELOAD), Some(TrayAction::Reload));
         assert_eq!(action_for(ID_EXIT), Some(TrayAction::Exit));

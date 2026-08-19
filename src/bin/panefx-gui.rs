@@ -18,11 +18,23 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use eframe::egui::{self, Color32, Rect, Vec2};
+use panefx::gui_prefs::GuiPrefs;
 use panefx::win98::{self, Bevel, Palette};
 
 const WINDOW_TITLE: &str = "panefx";
 
 fn main() -> eframe::Result<()> {
+    // Single instance. Two GUIs both writing config.toml is a real way to lose
+    // settings -- the second to save wins and the first never knows.
+    //
+    // The check lives HERE rather than only in the `panefx` launcher because
+    // this binary is also started directly: from the tray, from a shortcut, or
+    // by someone running panefx-gui.exe. Guarding only the launcher leaves
+    // every one of those paths able to open a duplicate.
+    if panefx::desktop::focus_existing_gui() {
+        return Ok(());
+    }
+
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([900.0, 620.0])
@@ -42,8 +54,15 @@ fn main() -> eframe::Result<()> {
         WINDOW_TITLE,
         opts,
         Box::new(|cc| {
-            win98::apply_theme(&cc.egui_ctx, &Palette::LIGHT);
-            Ok(Box::new(App::new()))
+            let app = App::new();
+            // Apply the RESTORED theme, not a hardcoded one: loading the
+            // preference and then ignoring it is the obvious way for this to
+            // look like it never saved.
+            win98::apply_theme(
+                &cc.egui_ctx,
+                if app.dark { &Palette::DARK } else { &Palette::LIGHT },
+            );
+            Ok(Box::new(app))
         }),
     )
 }
@@ -140,6 +159,23 @@ impl Tab {
             Tab::Logs => "logs",
         }
     }
+
+    /// (see App::remember)
+    /// Stable key for the preferences file.
+    ///
+    /// Deliberately not `label()`: those are display strings, and renaming a
+    /// tab in the UI must not silently reset everyone's saved tab.
+    fn key(self) -> &'static str {
+        match self {
+            Tab::Panes => "panes",
+            Tab::Wallpaper => "wallpaper",
+            Tab::Logs => "logs",
+        }
+    }
+
+    fn from_key(k: &str) -> Option<Tab> {
+        Tab::ALL.into_iter().find(|t| t.key() == k)
+    }
 }
 
 struct App {
@@ -181,20 +217,36 @@ struct App {
 }
 
 impl App {
+    /// Persist the GUI's own preferences.
+    ///
+    /// One function rather than a write at each call site: theme, tab and
+    /// monitor are saved together, so adding a preference cannot leave one of
+    /// three places forgetting to record it.
+    fn remember(&self) {
+        GuiPrefs {
+            dark: self.dark,
+            selected_monitor: self.selected_monitor,
+            tab: self.tab.key().to_string(),
+        }
+        .save();
+    }
+
     fn new() -> Self {
         let port = std::env::var("PANEFX_PORT")
             .ok()
             .and_then(|p| p.parse().ok())
             .unwrap_or(panefx::control::DEFAULT_PORT);
+        // Whatever the user left set last time.
+        let prefs = GuiPrefs::load();
         let mut app = App {
             daemon: Daemon::Down("connecting…".into()),
             port,
-            tab: Tab::Wallpaper,
+            tab: Tab::from_key(&prefs.tab).unwrap_or(Tab::Wallpaper),
             snap: serde_json::Value::Null,
-            selected_monitor: 0,
+            selected_monitor: prefs.selected_monitor,
             dirty: false,
             status: String::new(),
-            dark: false,
+            dark: prefs.dark,
             open_picker: None,
             picker_rgb: [128, 128, 128],
             picker_effect: String::new(),
@@ -402,14 +454,16 @@ impl App {
                     Vec2::new(96.0, 24.0),
                     egui::Sense::click(),
                 );
-                // The selected tab is RAISED and the others sunken -- a Win98
-                // tab strip reads as depth, not as a highlight colour.
+                // A button is RAISED when idle and PUSHED IN when selected --
+                // depth, not a highlight colour. This is the same convention
+                // the monitor buttons on the wallpaper tab use, and buttons
+                // that disagree about which way is "on" read as broken.
                 win98::bevel(
                     ui.painter(),
                     rect,
-                    if on { Bevel::Raised } else { Bevel::Thin },
+                    win98::toggle_bevel(on),
                     p,
-                    Some(if on { p.button_face } else { p.panel_bg }),
+                    Some(win98::toggle_face(on, p)),
                 );
                 ui.painter().text(
                     rect.center(),
@@ -420,6 +474,7 @@ impl App {
                 );
                 if resp.clicked() {
                     self.tab = t;
+                    self.remember();
                     if t == Tab::Logs {
                         self.send(serde_json::json!({"cmd":"logs","lines":300}));
                     }
@@ -432,6 +487,7 @@ impl App {
                     ui.ctx(),
                     if self.dark { &Palette::DARK } else { &Palette::LIGHT },
                 );
+                self.remember();
             }
             if ui.button("about").clicked() {
                 self.about = !self.about;
@@ -590,9 +646,9 @@ impl App {
             win98::bevel(
                 ui.painter(),
                 rect,
-                if on { Bevel::Sunken } else { Bevel::Raised },
+                win98::toggle_bevel(on),
                 p,
-                Some(if on { p.field_bg } else { p.button_face }),
+                Some(win98::toggle_face(on, p)),
             );
             let f = |s: f32| egui::FontId::new(s, egui::FontFamily::Monospace);
             ui.painter().text(
@@ -633,6 +689,7 @@ impl App {
             }
             if resp.clicked() {
                 self.selected_monitor = i;
+                self.remember();
             }
             ui.add_space(4.0);
         }

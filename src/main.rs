@@ -53,10 +53,15 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const OPACITY_DEBOUNCE: Duration = Duration::from_millis(150);
 
 /// What the user asked for on the command line.
+#[derive(Debug, PartialEq, Eq)]
 enum Mode {
     /// Run the background daemon. What GlazeWM launches.
     Daemon,
     /// Hand off to the control TUI. What a person typing `panefx` wants.
+    /// The GUI control panel: what a bare `panefx` opens.
+    Gui,
+    /// The control TUI. Still first-class -- it is the only one of the two that
+    /// works over SSH, which is how the laptop drives this machine.
     Tui,
     Help,
     /// An unrecognised flag — say so rather than guessing.
@@ -65,11 +70,64 @@ enum Mode {
 
 fn parse_args() -> Mode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
-        None => Mode::Tui,
+    mode_for(args.first().map(String::as_str))
+}
+
+/// The first argument -> what to run. Split out of `parse_args` so it is
+/// testable: `parse_args` reads the real process argv, which a test cannot set.
+///
+/// Worth pinning because the routing is easy to get subtly wrong and the
+/// failure is silent -- a bare `panefx` opening the TUI instead of the GUI
+/// looks like the GUI is broken rather than mis-routed.
+fn mode_for(first: Option<&str>) -> Mode {
+    match first {
+        None => Mode::Gui,
         Some("-d") | Some("--daemon") => Mode::Daemon,
+        Some("-t") | Some("--tui") => Mode::Tui,
+        Some("-g") | Some("--gui") => Mode::Gui,
         Some("-h") | Some("--help") => Mode::Help,
         Some(other) => Mode::Unknown(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_panefx_opens_the_gui() {
+        // The whole point of the change: no arguments means the GUI.
+        assert_eq!(mode_for(None), Mode::Gui);
+    }
+
+    #[test]
+    fn tui_is_still_reachable() {
+        // It is the only one of the two that works over SSH, so losing this
+        // would cost the laptop its control path entirely.
+        assert_eq!(mode_for(Some("--tui")), Mode::Tui);
+        assert_eq!(mode_for(Some("-t")), Mode::Tui);
+    }
+
+    #[test]
+    fn daemon_flag_still_wins() {
+        // GlazeWM's autostart passes --daemon. If this ever routed to a UI,
+        // every login would open a window instead of starting the daemon.
+        assert_eq!(mode_for(Some("--daemon")), Mode::Daemon);
+        assert_eq!(mode_for(Some("-d")), Mode::Daemon);
+    }
+
+    #[test]
+    fn explicit_gui_flag_works() {
+        assert_eq!(mode_for(Some("--gui")), Mode::Gui);
+        assert_eq!(mode_for(Some("-g")), Mode::Gui);
+    }
+
+    #[test]
+    fn unknown_flags_are_reported_not_guessed() {
+        assert_eq!(
+            mode_for(Some("--wallpaper")),
+            Mode::Unknown("--wallpaper".to_string())
+        );
     }
 }
 
@@ -77,7 +135,9 @@ const HELP: &str = "\
 panefx — animated ASCII backdrops behind windows, and on the desktop
 
 USAGE:
-    panefx              open the control TUI (same as `panefx-ctl`)
+    panefx              open the GUI control panel (same as `panefx-gui`)
+    panefx --tui        open the control TUI (same as `panefx-ctl`) -- the
+                        one that works over SSH
     panefx --daemon     run the background daemon
     panefx --help       this text
 
@@ -98,28 +158,31 @@ WM rather than an independent service.
 /// Running the real console binary avoids all of it: `panefx-ctl` owns its
 /// terminal the way any console program does. `build.ps1` installs both to the
 /// same directory, so resolving a sibling is reliable.
-fn launch_tui() -> anyhow::Result<()> {
+fn launch_sibling(name: &str, pass_args: bool) -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
-    let ctl = exe
+    let target = exe
         .parent()
-        .map(|d| d.join("panefx-ctl.exe"))
+        .map(|d| d.join(name))
         .filter(|p| p.exists())
         // Fall back to PATH: someone may have copied only one binary, and a
         // clear "not found" beats a confusing "no such file".
-        .unwrap_or_else(|| std::path::PathBuf::from("panefx-ctl.exe"));
+        .unwrap_or_else(|| std::path::PathBuf::from(name));
 
-    let status = std::process::Command::new(&ctl)
-        .args(std::env::args().skip(1))
-        .status();
+    let mut cmd = std::process::Command::new(&target);
+    // Forward our flags only to the TUI. The GUI accepts none of them, and
+    // handing it `--gui` would make it reject its own launch.
+    if pass_args {
+        cmd.args(std::env::args().skip(1));
+    }
 
-    match status {
+    match cmd.status() {
         Ok(s) => std::process::exit(s.code().unwrap_or(0)),
         Err(e) => {
             panefx::log_warn!(
-                "panefx: cannot start the control TUI ({}): {e}\n\
-                 Expected panefx-ctl.exe next to {}.\n\
+                "panefx: cannot start {name} ({}): {e}
+                 Expected {name} next to {}.
                  Run `panefx --daemon` for the background daemon.",
-                ctl.display(),
+                target.display(),
                 exe.display()
             );
             std::process::exit(1);
@@ -129,11 +192,21 @@ fn launch_tui() -> anyhow::Result<()> {
 
 fn main() -> anyhow::Result<()> {
     match parse_args() {
-        Mode::Tui => return launch_tui(),
+        Mode::Gui => {
+            // Already open? Raise it instead of starting a second one. Two
+            // GUIs both writing config.toml is a real way to lose settings --
+            // the second to save wins and the first never knows -- and a
+            // second window is never what the user meant by running `panefx`.
+            if panefx::desktop::focus_existing_gui() {
+                return Ok(());
+            }
+            return launch_sibling("panefx-gui.exe", false);
+        }
+        Mode::Tui => return launch_sibling("panefx-ctl.exe", true),
         Mode::Help => {
             // No console on this binary, so printing here goes nowhere useful.
             // Hand `--help` to the console binary, which can actually show it.
-            return launch_tui();
+            return launch_sibling("panefx-ctl.exe", true);
         }
         Mode::Unknown(flag) => {
             panefx::log_warn!("panefx: unknown option '{flag}'\n\n{HELP}");
@@ -278,24 +351,43 @@ fn main() -> anyhow::Result<()> {
         // --- tray clicks ---
         if let Some(action) = tray::take_action() {
             match action {
-                tray::TrayAction::OpenTui => {
-                    // Spawn the console binary; the daemon has no console of its
-                    // own to host a TUI in.
+                tray::TrayAction::OpenGui | tray::TrayAction::OpenTui => {
+                    let want_gui = action == tray::TrayAction::OpenGui;
+                    let name = if want_gui {
+                        "panefx-gui.exe"
+                    } else {
+                        "panefx-ctl.exe"
+                    };
+                    // Already open? Raise it instead of starting a second one.
+                    // Two GUIs writing the same config is a real way to lose
+                    // settings, and a second window is never what the click
+                    // meant.
+                    // No duplicate check here: `panefx-gui` guards ITSELF on
+                    // startup and exits early if one is already open, which
+                    // covers this path and every other way it gets launched.
                     let exe = std::env::current_exe().ok();
-                    let ctl = exe
+                    let sibling = exe
                         .as_ref()
                         .and_then(|e| e.parent())
-                        .map(|d| d.join("panefx-ctl.exe"));
-                    if let Some(ctl) = ctl {
-                        // CREATE_NEW_CONSOLE: without it the TUI inherits the
-                        // daemon's (nonexistent) console and dies immediately.
+                        .map(|d| d.join(name));
+                    if let Some(sibling) = sibling {
                         use std::os::windows::process::CommandExt;
+                        // CREATE_NEW_CONSOLE for the TUI: without it the TUI
+                        // inherits the daemon's (nonexistent) console and dies
+                        // immediately. The GUI is a windows-subsystem binary
+                        // and wants no console at all.
                         const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
-                        if let Err(e) = std::process::Command::new(&ctl)
-                            .creation_flags(CREATE_NEW_CONSOLE)
+                        const DETACHED_PROCESS: u32 = 0x0000_0008;
+                        let flags = if want_gui {
+                            DETACHED_PROCESS
+                        } else {
+                            CREATE_NEW_CONSOLE
+                        };
+                        if let Err(e) = std::process::Command::new(&sibling)
+                            .creation_flags(flags)
                             .spawn()
                         {
-                            panefx::log_warn!("[panefx] could not open the TUI: {e}");
+                            panefx::log_warn!("[panefx] could not open {name}: {e}");
                         }
                     }
                 }
@@ -914,21 +1006,28 @@ fn reconcile(
 mod cli_tests {
     use super::*;
 
+    /// Calls the REAL routing function rather than mirroring it.
+    ///
+    /// This used to be a hand-copied `match` with the same shape as
+    /// `parse_args`. That is worse than no test: when the default changed from
+    /// TUI to GUI the copy kept asserting the old answer and kept passing,
+    /// because it was only ever testing itself.
     fn mode_of(args: &[&str]) -> &'static str {
-        // Mirrors `parse_args` against an explicit list, since that reads the
-        // real argv. The mapping is the contract worth pinning: which spellings
-        // start a DAEMON, and which open the TUI.
-        match args.first().copied() {
-            None => "tui",
-            Some("-d") | Some("--daemon") => "daemon",
-            Some("-h") | Some("--help") => "help",
-            Some(_) => "unknown",
+        match mode_for(args.first().copied()) {
+            Mode::Gui => "gui",
+            Mode::Tui => "tui",
+            Mode::Daemon => "daemon",
+            Mode::Help => "help",
+            Mode::Unknown(_) => "unknown",
         }
     }
 
     #[test]
-    fn bare_panefx_opens_the_tui() {
-        assert_eq!(mode_of(&[]), "tui");
+    fn bare_panefx_opens_the_gui() {
+        // Changed deliberately: a bare `panefx` used to open the TUI, and now
+        // opens the GUI. The TUI is still reachable with --tui.
+        assert_eq!(mode_of(&[]), "gui");
+        assert_eq!(mode_of(&["--tui"]), "tui");
     }
 
     #[test]

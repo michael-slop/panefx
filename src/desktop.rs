@@ -655,3 +655,102 @@ mod tests {
         assert_eq!(m.label(), "1440x2560 portrait");
     }
 }
+
+/// Raise an already-running `panefx-gui` window, if there is one. Returns true
+/// when one was found and focused, meaning the caller should NOT start another.
+///
+/// Matching is by owning PROCESS NAME, not window title or class: the GUI is
+/// undecorated (it paints its own Win98 title bar), so its caption is chrome
+/// panefx draws rather than something Windows guarantees, and eframe's window
+/// class is a generic name shared with any other glow app.
+///
+/// Why bother at all: two GUIs both writing `config.toml` is a real way to lose
+/// settings — the second to save wins and the first never knows. A second
+/// window is also never what a tray click meant.
+#[cfg(windows)]
+pub fn focus_existing_gui() -> bool {
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowThreadProcessId, IsWindowVisible, SetForegroundWindow, ShowWindow,
+        SW_RESTORE,
+    };
+
+    static FOUND: std::sync::Mutex<Option<isize>> = std::sync::Mutex::new(None);
+
+    unsafe extern "system" fn cb(hwnd: HWND, _l: LPARAM) -> BOOL {
+        unsafe {
+            if !IsWindowVisible(hwnd).as_bool() {
+                return BOOL(1);
+            }
+            let mut pid = 0u32;
+            let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            // Skip our own windows: the daemon owns the backdrop panels, and
+            // one of those matching would make the GUI never start.
+            if pid == 0 || pid == GetCurrentProcessId() {
+                return BOOL(1);
+            }
+            if process_name(pid).as_deref() == Some("panefx-gui") {
+                if let Ok(mut f) = FOUND.lock() {
+                    *f = Some(hwnd.0 as isize);
+                }
+                return BOOL(0); // stop enumerating
+            }
+            BOOL(1)
+        }
+    }
+
+    if let Ok(mut f) = FOUND.lock() {
+        *f = None;
+    }
+    unsafe {
+        let _ = EnumWindows(Some(cb), LPARAM(0));
+    }
+    let hwnd = FOUND.lock().ok().and_then(|f| *f);
+    match hwnd {
+        Some(h) => unsafe {
+            let h = HWND(h as *mut std::ffi::c_void);
+            // Restore first: a minimised window accepts focus but stays in the
+            // taskbar, which looks exactly like the click did nothing.
+            let _ = ShowWindow(h, SW_RESTORE);
+            let _ = SetForegroundWindow(h);
+            true
+        },
+        None => false,
+    }
+}
+
+#[cfg(not(windows))]
+pub fn focus_existing_gui() -> bool {
+    false
+}
+
+/// Lower-case stem of the executable owning `pid` (`"panefx-gui"`), or None.
+#[cfg(windows)]
+fn process_name(pid: u32) -> Option<String> {
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
+        let mut e = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut ok = Process32FirstW(snap, &mut e).is_ok();
+        while ok {
+            if e.th32ProcessID == pid {
+                let name = String::from_utf16_lossy(&e.szExeFile);
+                let name = name.trim_end_matches('\0').trim_end_matches(char::from(0));
+                return Some(
+                    name.trim_end_matches(".exe")
+                        .trim_end_matches(".EXE")
+                        .to_lowercase(),
+                );
+            }
+            ok = Process32NextW(snap, &mut e).is_ok();
+        }
+    }
+    None
+}
