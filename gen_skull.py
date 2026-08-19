@@ -38,6 +38,18 @@ im = Image.open(SPRITE).convert("RGBA")
 crop = im.crop((SX, SY, SX + SW, SY + SH))
 px = crop.load()
 
+# PAD the traced grid by the outline depth on every side.
+#
+# The crop is tight to the art -- bone runs to the bottom and right edges. With
+# no margin the outline has nowhere to go there, so the halo simply stopped:
+# measured, 42 bone cells sat against air-or-edge with no outline cell beyond
+# them. The skull was ringed on the top and left and bare underneath.
+#
+# Padding is done on the GRID rather than by widening the crop, because the
+# sprite has no spare pixels there either -- widening would pull in whatever
+# sits next to the skull in the source image.
+PAD = 3
+
 # --- classify -------------------------------------------------------------
 #
 # TWO passes, and the second is the point.
@@ -54,13 +66,15 @@ px = crop.load()
 BONE = 1
 AIR = 0
 
-bone = [[False] * SW for _ in range(SH)]
+GW, GH = SW + PAD * 2, SH + PAD * 2
+
+bone = [[False] * GW for _ in range(GH)]
 for y in range(SH):
     for x in range(SW):
         r, g, b, a = px[x, y]
         # Opaque AND bright is bone. Everything else -- transparent, or the
         # sprite's own dark edge -- is treated as empty and re-outlined below.
-        bone[y][x] = a >= 40 and (r + g + b) >= 384
+        bone[y + PAD][x + PAD] = a >= 40 and (r + g + b) >= 384
 
 def dist_to_bone(x, y, limit):
     """Chebyshev distance from (x, y) to the nearest bone cell, capped."""
@@ -70,7 +84,7 @@ def dist_to_bone(x, y, limit):
                 # Only the ring at exactly distance d.
                 if max(abs(yy - y), abs(xx - x)) != d:
                     continue
-                if 0 <= yy < SH and 0 <= xx < SW and bone[yy][xx]:
+                if 0 <= yy < GH and 0 <= xx < GW and bone[yy][xx]:
                     return d
     return None
 
@@ -85,9 +99,9 @@ DEPTH = len(OUTLINE)
 
 rows = []
 counts = {"bone": 0, "outline": 0, "air": 0}
-for y in range(SH):
+for y in range(GH):
     line = ""
-    for x in range(SW):
+    for x in range(GW):
         if bone[y][x]:
             line += "#"
             counts["bone"] += 1
@@ -127,8 +141,8 @@ out.append("//!")
 out.append("//! Outline cells must stay DARK at every angle and light level, or the")
 out.append("//! sockets fill in and the face stops reading as a face.")
 out.append("")
-out.append("pub const COLS: usize = {};".format(SW))
-out.append("pub const ROWS: usize = {};".format(SH))
+out.append("pub const COLS: usize = {};".format(GW))
+out.append("pub const ROWS: usize = {};".format(GH))
 out.append("")
 out.append("/// One row per line. See the module header for the alphabet.")
 out.append("pub const SKULL: [&str; ROWS] = [")
@@ -138,6 +152,6 @@ out.append("];")
 
 io.open(OUT, "w", encoding="utf-8", newline="\n").write("\n".join(out) + "\n")
 print("{}: {}x{}  bone={} outline={} air={}".format(
-    OUT, SW, SH, counts["bone"], counts["outline"], counts["air"]))
+    OUT, GW, GH, counts["bone"], counts["outline"], counts["air"]))
 for r in rows:
     print("   |" + r + "|")

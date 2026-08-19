@@ -35,7 +35,14 @@ use crate::palette::Rgb;
 use crate::skull_art::{COLS, ROWS, SKULL};
 
 /// Bone shading ramp, dimmest first. The site's ramp, kept identical.
-const BONE: [char; 8] = ['.', ':', '=', '+', '*', '#', '%', '@'];
+/// The skull is drawn in ONE glyph, deliberately.
+///
+/// It was an 8-step ramp shaded by the lighting angle. That made the skull's
+/// apparent colour shift as it spun, which is wrong for a solid white skull --
+/// the silhouette carries the design, and shading competes with the outline.
+/// `#` is the densest glyph that still reads as a filled block in
+/// BigBlueTerm437 without the visual noise of `@`.
+const BONE_GLYPH: char = '#';
 
 /// Two glyph columns per source pixel.
 ///
@@ -396,20 +403,18 @@ impl AsciiAnimation for SkullSpin {
                 ))
             }
             _ => {
-                // Brightest facing the viewer, dimmer toward the rim.
-                let mut light = 0.3 + 0.7 * c.abs();
-                light *= 0.8 + 0.2 * (((u as f32 - cx) / COLS as f32) * std::f32::consts::PI).cos();
-                let idx = ((light * BONE.len() as f32) as usize).min(BONE.len() - 1);
-                // The GLYPH carries the shading; the colour does not.
+                // FLAT. One glyph, one colour, at every angle.
                 //
-                // Scaling the bone colour by `light` as well looked right in
-                // the maths and wrong on screen: quantising a smooth gradient
-                // to six levels per channel banded the skull into vertical
-                // stripes -- rendered and looked at. The site varies only the
-                // glyph for the same reason, and bone is one colour anyway.
-                // Also unquantised, and for the same reason: the glyph carries
-                // the shading so every bone cell is one flat colour.
-                Some((BONE[idx], self.bone))
+                // This used to pick from an 8-glyph ramp by lighting angle, so
+                // the skull's density visibly changed as it turned -- read as
+                // the bone changing colour mid-spin, which is not what a solid
+                // white skull should do. The silhouette is the whole design;
+                // shading it only fights the outline for the eye.
+                //
+                // The outline still grades over its three cells: that is a
+                // fixed halo around the shape, not a light that moves with the
+                // spin.
+                Some((BONE_GLYPH, self.bone))
             }
         }
     }
@@ -751,5 +756,103 @@ mod tests {
     fn unknown_params_are_rejected() {
         let mut s = built();
         assert!(!s.set_param("nope", &ParamValue::Int { v: 1 }));
+    }
+
+    /// The bone must be ONE glyph and ONE colour at every angle of the spin.
+    ///
+    /// It used to pick from an 8-glyph ramp by lighting angle, so the skull's
+    /// apparent shade shifted as it turned. Sampled across a full rotation
+    /// rather than at one angle, because a single frame cannot show a change
+    /// that only appears when it moves.
+    ///
+    /// Bone is told from outline by the SPRITE, not by the rendered glyph or
+    /// colour. Filtering on the glyph was wrong and silently defeated an
+    /// earlier version of this test: the outline draws '*', '+' and '.', so a
+    /// bone cell that regressed to any of those was discarded as "outline" --
+    /// exactly the cells that prove the bug. Confirmed by reintroducing the
+    /// shading and watching the test still pass.
+    #[test]
+    fn the_bone_never_changes_shade_while_spinning() {
+        use std::collections::HashSet;
+        // A distinctive bone colour, so "which cells are bone" cannot be
+        // confused with the outline's shades of `dark`.
+        let mut s = SkullSpin::new(46, 26);
+        s.set_frame_ms(40);
+        s.bone = Rgb(255, 255, 255);
+        s.dark = Rgb(0, 60, 0);
+
+        let mut glyphs = HashSet::new();
+        let mut colours = HashSet::new();
+        for _ in 0..400 {
+            s.step();
+            for r in 0..26 {
+                for c in 0..46 {
+                    let Some((g, col)) = s.cell_at(c, r) else {
+                        continue;
+                    };
+                    // Outline cells are graded on purpose -- they are the only
+                    // ones drawn from `dark`. Everything else is bone, and a
+                    // bone cell that turned into an outline SHADE would show up
+                    // here as an extra colour rather than being filtered away.
+                    let is_outline_shade = col.1 > 0 && col.0 == 0 && col.2 == 0;
+                    if !is_outline_shade {
+                        glyphs.insert(g);
+                        colours.insert((col.0, col.1, col.2));
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            glyphs.len(),
+            1,
+            "bone should be one flat glyph at every angle, got {glyphs:?}"
+        );
+        assert_eq!(
+            colours.len(),
+            1,
+            "bone should be one flat colour at every angle, got {colours:?}"
+        );
+    }
+
+    /// Every bone cell must have outline beyond it -- the halo has to close.
+    ///
+    /// The crop was tight to the art, so bone ran to the bottom and right
+    /// edges of the traced grid and the outline simply stopped there: measured,
+    /// 42 bone cells sat against air-or-edge. The skull was ringed on the top
+    /// and left and bare underneath. `gen_skull.py` now pads the grid, and this
+    /// pins that the padding is enough.
+    #[test]
+    fn the_outline_closes_all_the_way_around_the_skull() {
+        let rows = crate::skull_art::ROWS;
+        let cols = crate::skull_art::COLS;
+        let mut gaps = Vec::new();
+        for y in 0..rows {
+            for x in 0..cols {
+                if crate::skull_art::SKULL[y].as_bytes()[x] != b'#' {
+                    continue;
+                }
+                // Every neighbour of a bone cell must be bone or outline --
+                // never air, and never off the edge of the grid.
+                for dy in -1i32..=1 {
+                    for dx in -1i32..=1 {
+                        let (ny, nx) = (y as i32 + dy, x as i32 + dx);
+                        if ny < 0 || nx < 0 || ny >= rows as i32 || nx >= cols as i32 {
+                            gaps.push((x, y));
+                            continue;
+                        }
+                        let b = crate::skull_art::SKULL[ny as usize].as_bytes()[nx as usize];
+                        if b == b' ' {
+                            gaps.push((x, y));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            gaps.is_empty(),
+            "{} bone cells have no outline beyond them, e.g. {:?}",
+            gaps.len(),
+            &gaps[..gaps.len().min(5)]
+        );
     }
 }
