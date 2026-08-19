@@ -536,6 +536,7 @@ fn handle_command(
                 label: m.monitor.label(),
                 effect: m.effect.clone(),
                 occluded: m.occluded,
+                layers: cfg.wallpaper_stack(m.monitor.index),
                 geometry: m.panel.as_ref().map(|p| {
                     let (sw, sh) = p
                         .surface

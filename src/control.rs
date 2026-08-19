@@ -144,6 +144,15 @@ pub struct WallpaperMonitorView {
     /// is answerable at a glance rather than looking like a bug.
     pub occluded: bool,
 
+    /// Every layer on this monitor, bottom first.
+    ///
+    /// `effect` above is `layers[0]` -- kept as its own field because it is what
+    /// the config key and the TUI have always meant by "this monitor's effect".
+    /// A client that knows nothing about layers still works; one that does can
+    /// show the whole stack.
+    #[serde(default)]
+    pub layers: Vec<String>,
+
     /// The monitor rect, the panel, the DIB and the composition surface --
     /// the four sizes that must agree.
     ///
