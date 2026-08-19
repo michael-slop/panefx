@@ -42,6 +42,16 @@ features = [
   # System-tray icon. Shell_NotifyIconW lives here -- again NO new crates, the
   # windows crate is already a dependency.
   "Win32_UI_Shell",
+  # Presenting the desktop wallpaper through DirectComposition. GDI leaves the
+  # alpha channel at 0, and the raised desktop composites with alpha, so a
+  # GDI-blitted wallpaper renders ADDITIVELY over Explorer's own background
+  # instead of replacing it. See src/compositor.rs. Still NO new crates: the
+  # windows crate is already here, this is five feature flags.
+  "Win32_Graphics_Direct3D",
+  "Win32_Graphics_Direct3D11",
+  "Win32_Graphics_Dxgi",
+  "Win32_Graphics_Dxgi_Common",
+  "Win32_Graphics_DirectComposition",
 ]
 
 [profile.release]

@@ -250,6 +250,11 @@ fn main() -> anyhow::Result<()> {
     // Set whenever something other than the sim changes what should be drawn:
     // an effect switch, a param change, a config change.
     let mut force_redraw = true;
+    // Was any panel on screen last frame? Drives the freeze below, and the
+    // false -> true edge has to force a redraw: a frozen sim reports no change,
+    // so the first frame back would otherwise be skipped and leave a stale
+    // backdrop until the effect happened to touch a cell.
+    let mut was_visible = false;
     let mut last_poll = Instant::now();
     let mut frame_start;
 
@@ -403,7 +408,25 @@ fn main() -> anyhow::Result<()> {
         }
 
         // --- advance and draw ---
-        if sim_cols > 0 && sim_rows > 0 {
+        //
+        // A single sim is shared by every panel (see the module header), so the
+        // freeze is all-or-nothing: step it only while SOMETHING can see it.
+        // With every terminal on another workspace there is no consumer at all,
+        // and advancing the simulation is pure waste -- the same reasoning, and
+        // the same guarantee, as the wallpaper's occlusion freeze in
+        // `wallpaper.rs` (the sim is not stepped at all, rather than stepped and
+        // skipped at draw time).
+        //
+        // This deliberately does NOT freeze while a terminal is on screen and
+        // busy. The backdrop animating behind a live terminal is the feature;
+        // gating on activity would mean it almost never ran.
+        let any_visible = panels.values().any(|p| p.visible);
+        if any_visible && !was_visible {
+            force_redraw = true;
+        }
+        was_visible = any_visible;
+
+        if any_visible && sim_cols > 0 && sim_rows > 0 {
             let resized = sim.dimensions() != (sim_cols, sim_rows);
             sim.resize(sim_cols, sim_rows);
             sim.step();

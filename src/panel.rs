@@ -20,11 +20,11 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetShellWindow, RegisterClassExW, SetWindowPos,
-    ShowWindow,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW, SetWindowPos, ShowWindow,
     HWND_BOTTOM, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
-    SW_SHOWNOACTIVATE, WM_DESTROY, WM_ERASEBKGND, WM_PAINT, WNDCLASSEXW, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_POPUP,
+    SW_SHOWNOACTIVATE, WINDOW_STYLE, WM_DESTROY, WM_ERASEBKGND, WM_PAINT, WNDCLASSEXW,
+    WS_CHILD, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_POPUP,
+    WS_VISIBLE,
 };
 
 use crate::animation::AsciiAnimation;
@@ -51,9 +51,19 @@ pub struct GdiCache {
     /// Memory DC. Valid for the panel's lifetime.
     pub mem_dc: HDC,
     /// Off-screen bitmap; must be rebuilt when the panel resizes.
+    ///
+    /// A 32-bit top-down **DIB section**, not a compatible bitmap, so the
+    /// finished pixels have a CPU address. A desktop surface has to hand them to
+    /// DirectComposition (see `compositor`), and a terminal panel blits from it
+    /// exactly as before at no extra cost.
     pub bitmap: HBITMAP,
     pub bmp_w: i32,
     pub bmp_h: i32,
+    /// First byte of the DIB's pixels, or null before the first frame.
+    pub bits: *mut u8,
+    /// Bytes per row. For a top-down 32bpp DIB this is `width * 4`, but it is
+    /// stored rather than recomputed so the upload path cannot drift from it.
+    pub stride: usize,
     /// Whatever was selected into `mem_dc` before our bitmap — must be
     /// restored before the DC is deleted or GDI leaks the original.
     pub old_bmp: HGDIOBJ,
@@ -85,40 +95,39 @@ pub struct GdiCache {
 /// positioned in SCREEN coordinates, re-pinned into the z-slot behind it on
 /// every reconcile because GlazeWM reasserts z-order on focus changes.
 ///
-/// `Desktop` is the wallpaper layer: a CHILD of Explorer's WorkerW, so its
-/// coordinates are parent-relative and its z-position is inherited and
-/// permanent. There is nothing to re-pin and nothing to fight.
+/// `Desktop` is the wallpaper layer: a CHILD of Explorer's `SHELLDLL_DefView`,
+/// so its coordinates are parent-relative (see `desktop::to_child`). Its z-slot
+/// is the BOTTOM of DefView's children — under `SysListView32`, so the icons
+/// stay visible and clickable — and it is re-asserted every tick because
+/// Explorer reorders and rebuilds its desktop children at will.
 #[derive(Clone, Copy)]
 pub enum Anchor {
     Window(HWND),
     Desktop {
+        /// `SHELLDLL_DefView` on the raised model, the WorkerW on the classic
+        /// one. Chosen in `desktop::find`, which records why.
         parent: HWND,
         /// True on the Windows 11 24H2+ "raised desktop" model.
-        ///
-        /// There the surface is a sibling of Progman's WorkerW and DefView
-        /// children rather than a child of the WorkerW, and Microsoft's guidance
-        /// is explicit that it must be `WS_EX_LAYERED` **at creation** with
-        /// alpha 255. Adding the style after the fact leaves the surface
-        /// mis-composited.
         raised: bool,
     },
 }
 
-/// Which z-order slot a desktop surface inserts after.
+/// The window style a desktop surface must be created with.
 ///
 /// Pulled out of the `unsafe` block on purpose: this one choice is the whole
-/// difference between a visible wallpaper and an invisible one, and inside the
-/// block no test could reach it. The bug it encodes was real — see
-/// `pin_behind_target`.
-pub fn desktop_insert_after(progman: HWND) -> HWND {
-    if progman.is_invalid() {
-        // No shell window to anchor to. The bottom is still the right fallback:
-        // wrong in the "hidden behind the background" direction rather than the
-        // "covering every application on screen" direction.
-        HWND_BOTTOM
-    } else {
-        progman
-    }
+/// difference between a wallpaper that sits behind the icons and one that
+/// covers them, and inside the block no test could reach it.
+///
+/// **`WS_CHILD`, never `WS_POPUP`.** A `WS_POPUP` given a parent is an OWNED
+/// window, not a child: it does not clip to the parent and does not take its
+/// z-position from the parent's child list, so it floats above every
+/// application. And a top-level popup cannot work at all here, whatever slot it
+/// is pinned to — `SHELLDLL_DefView` is a CHILD of Progman, so "just above
+/// Progman" is also just above the icons. That was the bug: measured on build
+/// 26200, a full-screen `PaneFxClass` popup sat directly above Progman and hid
+/// every icon on the desktop.
+pub fn desktop_window_style() -> WINDOW_STYLE {
+    WS_CHILD | WS_VISIBLE
 }
 
 pub struct Panel {
@@ -132,6 +141,13 @@ pub struct Panel {
     pub visible: bool,
     /// Built lazily on the first draw, then reused.
     pub gdi: Option<GdiCache>,
+    /// Present path for a desktop surface.
+    ///
+    /// `None` for terminal panels, which blit straight to their window DC. A
+    /// desktop surface cannot: GDI leaves alpha at 0 and the raised desktop
+    /// composites with alpha, so a blitted frame renders ADDITIVELY over
+    /// Explorer's background instead of replacing it. See `compositor`.
+    pub surface: Option<crate::compositor::Surface>,
 }
 
 unsafe extern "system" fn wnd_proc(
@@ -212,7 +228,7 @@ impl Panel {
 
     /// Create a panel against any anchor.
     ///
-    /// For `Anchor::Desktop`, `x`/`y` must ALREADY be WorkerW-relative — see
+    /// For `Anchor::Desktop`, `x`/`y` must ALREADY be parent-relative — see
     /// `desktop::to_child`. Passing screen coordinates puts the panel off the
     /// parent's edge whenever the virtual desktop starts at a negative origin.
     pub fn create_anchored(
@@ -225,35 +241,22 @@ impl Panel {
         unsafe {
             let hinstance = GetModuleHandleW(None)?;
 
-            // WS_CHILD for a desktop surface, never WS_POPUP.
-            //
-            // A WS_POPUP *with a parent* is an OWNED window, not a child: it
-            // does not clip to the parent and does not inherit z-position, so it
-            // floats above every application instead of sitting behind the
-            // desktop icons. One style bit, and the ugliest possible failure.
-            // BOTH kinds are top-level WS_POPUP windows with NO parent.
-            //
-            // The wallpaper surface used to be a WS_CHILD of Explorer's Progman,
-            // following Microsoft's guidance for the "raised desktop" model.
-            // That path fought us at every step: WS_EX_LAYERED was refused on a
-            // child, coordinates became parent-relative in a space that did not
-            // match the virtual desktop, and z-order had to be re-asserted
-            // against windows Explorer recreates at will. The surface existed,
-            // was correctly ordered, and drew 340 lit cells a frame -- into
-            // pixels nobody could see.
-            //
-            // The terminal panels have been a top-level popup pinned into a
-            // z-slot since day one, on two machines, without trouble. The
-            // wallpaper is the same problem with a different anchor, so it uses
-            // the same solution: screen coordinates, no parent, pinned to the
-            // BOTTOM of the z-order instead of behind a specific window.
-            let (style, parent) = (WS_POPUP, HWND::default());
-            let _ = &anchor;
+            // A terminal panel is a top-level popup pinned behind its terminal.
+            // A desktop surface is a CHILD of the icon host -- see
+            // `desktop_window_style` for why nothing else works.
+            let (style, parent) = match anchor {
+                Anchor::Window(_) => (WS_POPUP, HWND::default()),
+                Anchor::Desktop { parent, .. } => (desktop_window_style(), parent),
+            };
 
-            // Same ex-style for both: never focusable, never in the taskbar.
-            // No WS_EX_LAYERED -- that was only needed for the child-of-Progman
-            // approach, and Windows refused it there anyway.
-            let ex_style = WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
+            // Never focusable, never in the taskbar. A desktop surface adds
+            // WS_EX_NOREDIRECTIONBITMAP because it presents through
+            // DirectComposition and wants no redirection surface of its own.
+            // No WS_EX_LAYERED anywhere: Windows refuses it on a child window.
+            let mut ex_style = WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
+            if matches!(anchor, Anchor::Desktop { .. }) {
+                ex_style |= WS_EX_NOREDIRECTIONBITMAP;
+            }
 
             let hwnd = CreateWindowExW(
                 ex_style,
@@ -274,6 +277,22 @@ impl Panel {
             // away from whatever the user is typing into.
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
+            // A desktop surface is useless without its compositor, so failing to
+            // build one is a NAMED error rather than a silently GDI-only panel
+            // that would paint additively over the user's wallpaper.
+            let surface = match anchor {
+                Anchor::Desktop { .. } => {
+                    match crate::compositor::Surface::new(hwnd, width.max(1), height.max(1)) {
+                        Ok(s) => Some(s),
+                        Err(e) => {
+                            let _ = DestroyWindow(hwnd);
+                            anyhow::bail!("desktop compositor unavailable: {e}");
+                        }
+                    }
+                }
+                Anchor::Window(_) => None,
+            };
+
             Ok(Panel {
                 hwnd,
                 anchor,
@@ -281,6 +300,7 @@ impl Panel {
                 height: height.max(1),
                 visible: true,
                 gdi: None,
+                surface,
             })
         }
     }
@@ -316,6 +336,11 @@ impl Panel {
         }
 
         if resized {
+            if let Some(s) = self.surface.as_mut() {
+                if let Err(e) = s.resize(width, height) {
+                    crate::log_warn!("[panefx] desktop surface resize failed: {e}");
+                }
+            }
             unsafe {
                 let _ = InvalidateRect(self.hwnd, None, false);
             }
@@ -329,29 +354,26 @@ impl Panel {
     /// changes and can otherwise leave our panel in front of, or detached
     /// from, its terminal.
     pub fn pin_behind_target(&self) -> anyhow::Result<()> {
-        // On the RAISED desktop the surface is a sibling of Progman's WorkerW
-        // and DefView children, so its z-slot is not inherited and must be
-        // asserted: directly after SHELLDLL_DefView, i.e. behind the icons but
-        // above the WorkerW. Explorer recreates these children on theme and
-        // wallpaper changes, so this is re-asserted rather than done once.
-        // A desktop surface sits directly ABOVE Progman: behind every
-        // application window, but IN FRONT of the desktop background.
+        // A desktop surface goes to the BOTTOM OF ITS SIBLINGS.
         //
-        // NOT `HWND_BOTTOM`. That means the absolute bottom of the z-order,
-        // which is *below* Progman -- and Progman paints the desktop background
-        // over the top, so the surface renders into pixels nobody can see. It
-        // looked like it worked at first only because a freshly created window
-        // happened to land just above Progman; once this was re-asserted every
-        // tick, each frame pushed it back under and the wallpaper vanished.
+        // For a CHILD window `HWND_BOTTOM` means the bottom of the parent's
+        // child list -- NOT the bottom of the desktop. Inside
+        // `SHELLDLL_DefView` that puts us under `SysListView32`, so the icons
+        // draw over us and stay clickable, while Explorer's desktop background
+        // (painted below DefView entirely) stays behind us.
         //
-        // Inserting after Progman is the whole trick: one slot in front of the
-        // background, still behind everything else.
+        // Re-asserted every tick rather than set once: Explorer reorders and
+        // rebuilds its desktop children on theme changes, wallpaper changes and
+        // desktop refreshes.
+        //
+        // The old code inserted after Progman instead, which is the top-level
+        // slot immediately above the shell window -- and therefore above
+        // DefView and every icon in it. That is the bug this replaces.
         if matches!(self.anchor, Anchor::Desktop { .. }) {
             unsafe {
-                let insert_after = desktop_insert_after(GetShellWindow());
                 SetWindowPos(
                     self.hwnd,
-                    insert_after,
+                    HWND_BOTTOM,
                     0,
                     0,
                     0,
@@ -361,8 +383,6 @@ impl Panel {
             }
             return Ok(());
         }
-        // A classic-model desktop surface inherits its z-position from the
-        // WorkerW it is a child of, so there is nothing to re-pin.
         let Anchor::Window(target) = self.anchor else {
             return Ok(());
         };
@@ -426,6 +446,12 @@ impl Drop for Panel {
             // worse than the per-frame cost this cache removes. The originals
             // must be selected back into the DC first — deleting a DC while our
             // objects are still selected leaks whatever GDI had there before.
+            // Stop WM_PAINT reaching a DC we are about to delete.
+            crate::render::forget_for_repaint(self.hwnd);
+            // Release the swapchain, visual and target BEFORE the window they
+            // are attached to. Rust drops fields after this body runs, which
+            // would be after DestroyWindow.
+            self.surface = None;
             if let Some(g) = self.gdi.take() {
                 if !g.old_font.is_invalid() {
                     SelectObject(g.mem_dc, g.old_font);
@@ -463,26 +489,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_desktop_surface_inserts_after_progman_never_at_the_bottom() {
-        // THE BUG. `HWND_BOTTOM` is the absolute bottom of the z-order, which is
-        // *below* Progman -- and Progman paints the desktop background over the
-        // top, so the surface drew every frame into pixels nobody could see.
+    fn a_desktop_surface_is_a_child_never_a_popup() {
+        // THE BUG, as a tripwire. panefx shipped a top-level WS_POPUP pinned one
+        // slot above Progman. SHELLDLL_DefView -- the icon host -- is a CHILD of
+        // Progman, so "above Progman" is also above every desktop icon.
+        // Measured on build 26200: a full-screen PaneFxClass popup sat directly
+        // above Progman and hid the icons completely.
         //
-        // It looked fine at first only because a freshly created window happened
-        // to land just above Progman by luck. Once z-order was re-asserted every
-        // tick, each frame shoved it back under and the wallpaper vanished while
-        // the daemon reported perfect health: windows present, correct geometry,
-        // not occluded, no errors, 128s of CPU burned on invisible frames.
-        let progman = HWND(0x1_0BDE as *mut core::ffi::c_void);
-        let slot = desktop_insert_after(progman);
-        assert_eq!(slot, progman, "must insert directly after Progman");
-        assert_ne!(slot, HWND_BOTTOM, "HWND_BOTTOM hides the wallpaper");
+        // There is no top-level slot that works: above Progman covers the icons,
+        // below Progman is under the desktop background. Only a child window in
+        // Explorer's own tree can sit between the two.
+        let style = desktop_window_style();
+        assert_eq!(style.0 & WS_POPUP.0, 0, "a desktop surface must not be WS_POPUP");
+        assert_eq!(style.0 & WS_CHILD.0, WS_CHILD.0, "it must be WS_CHILD");
+        assert_eq!(style.0 & WS_VISIBLE.0, WS_VISIBLE.0);
     }
 
     #[test]
-    fn without_a_shell_window_it_falls_back_to_the_bottom() {
-        // Failing toward "invisible" beats failing toward "covers everything you
-        // are working on".
-        assert_eq!(desktop_insert_after(HWND::default()), HWND_BOTTOM);
+    fn a_terminal_panel_is_still_a_top_level_popup() {
+        // The follower machinery is unchanged and must stay that way: a terminal
+        // panel is a top-level popup pinned behind its terminal, which has
+        // worked on two machines since day one.
+        assert_ne!(desktop_window_style().0 & WS_CHILD.0, 0);
+        assert_eq!(WS_POPUP.0 & WS_CHILD.0, 0, "the two styles are exclusive here");
     }
 }

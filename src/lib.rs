@@ -19,6 +19,7 @@
 pub mod log;
 
 pub mod animation;
+pub mod compositor;
 pub mod config;
 pub mod control;
 // Not `#[cfg(windows)]`: `config` needs the MIN/MAX percent constants to

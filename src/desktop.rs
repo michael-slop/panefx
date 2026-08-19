@@ -22,6 +22,35 @@
 //! to find, so the classic hunt returns nothing — which looks exactly like "the
 //! layer does not exist" while it is sitting right there.
 //!
+//! # Where the surface goes on the raised model: INSIDE DefView
+//!
+//! Measured on build 26200 (2400x1600 @ 150%), drawing a solid quad and sampling
+//! the screen. "icons on top" is `WindowFromPoint` returning `SysListView32`:
+//!
+//! | api   | parent  | z-slot         | visible | icons on top |
+//! |-------|---------|----------------|---------|--------------|
+//! | GDI   | WorkerW | bottom or top  | **no**  | yes          |
+//! | GDI   | Progman | bottom / after | **no**  | yes          |
+//! | GDI   | DefView | **bottom**     | **yes** | **yes**      |
+//! | GDI   | DefView | top            | yes     | NO (covered) |
+//! | DComp | WorkerW | bottom or top  | yes     | yes          |
+//!
+//! GDI content is genuinely not composited in the WorkerW — that part of the
+//! earlier investigation was right — but it IS composited inside
+//! `SHELLDLL_DefView`, because Explorer paints the desktop background BELOW
+//! DefView and the `SysListView32` above us is transparent. Sitting at the
+//! bottom of DefView children puts us above the background and below the icons,
+//! which is the whole goal, with the existing GDI renderer unchanged.
+//!
+//! That is why `parent` is the DefView and not Progman: a child of Progman is a
+//! SIBLING of DefView, and every sibling slot either hides under Explorer own
+//! background painting or covers the icons.
+//!
+//! The alternative — D3D11 + DirectComposition as a child of the WorkerW — also
+//! works, and is what a compositing wallpaper app does. It is not used because
+//! it costs a swapchain, a device, device-loss recovery and a per-frame upload
+//! to buy nothing this program needs.
+//!
 //! That misreading cost real time during development: the classic search failing
 //! was reported as "Windows removed the wallpaper layer". It had not. Measured
 //! on this machine: `Progman` ex-style `0x200080` (raised), child WorkerW
@@ -33,10 +62,13 @@
 //!   Measured here: `FindWindowW("Progman")` returns 0 while `GetShellWindow()`
 //!   returns a valid handle. Every false "Progman not found" came from the
 //!   former.
-//! * **The layer is never the window owning `SHELLDLL_DefView`.** That one holds
-//!   the icons; drawing into it covers them, which looks like success for about
-//!   two seconds. `pick_wallpaper_layer` encodes that rule and is unit-tested
-//!   without Explorer running.
+//! * **On the CLASSIC model the layer is never the window owning
+//!   `SHELLDLL_DefView`.** That one holds the icons, and a top-level sibling
+//!   drawing over it covers them — which looks like success for about two
+//!   seconds. `pick_wallpaper_layer` encodes that rule and is unit-tested
+//!   without Explorer running. This is a statement about TOP-LEVEL windows on
+//!   the classic model; on the raised model we deliberately become a CHILD of
+//!   DefView, which is a different relationship with the opposite result.
 //!
 //! # Failure must stay survivable
 //!
@@ -74,17 +106,25 @@ pub struct Workerw {
     /// desktop starts at a negative x, so passing a raw screen coordinate to a
     /// child of this window puts the panel hundreds of pixels off its edge.
     pub origin: (i32, i32),
-    /// The window our surface should be a CHILD of.
+    /// The window our surface must be a CHILD of.
     ///
     /// Differs by desktop model, which is the whole reason this field exists:
     ///   * classic  — the WorkerW itself; it sits behind the icons already.
-    ///   * raised   — **Progman**. The surface has to land between Progman's
-    ///     WorkerW child and the `SHELLDLL_DefView` child that holds the icons,
-    ///     so it is a sibling of both rather than a child of the WorkerW.
+    ///   * raised   — **`SHELLDLL_DefView`**. Measured: the only parent in which
+    ///     a GDI child is composited at all, and at the BOTTOM of its children
+    ///     it lands above Explorer background painting and below
+    ///     `SysListView32`, so the icons stay visible and clickable. See the
+    ///     table in this module header.
     pub parent: HWND,
     /// True on the 24H2+ "raised desktop" model. Changes both the parent above
     /// and how z-order is asserted after `SetParent`.
     pub raised: bool,
+    /// The class `parent` had when we attached.
+    ///
+    /// Recorded rather than assumed because the raised model prefers the
+    /// WorkerW but falls back to the DefView, so there is no single right
+    /// answer to check against later.
+    pub parent_class: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,6 +185,34 @@ pub fn pick_wallpaper_layer(candidates: &[Candidate]) -> Result<isize, DesktopEr
         .find(|c| c.has_defview)
         .ok_or(DesktopError::NoDefViewHost)?;
     host.next_workerw.ok_or(DesktopError::NoSiblingWorkerw)
+}
+
+/// Which windows the raised model uses, given what was found under Progman.
+///
+/// Returns `(hwnd, parent)`: the layer to report, and the window our surface
+/// must be a CHILD of.
+///
+/// Pulled out of `find` as plain data so the decision is testable without
+/// Explorer — the same reason `pick_wallpaper_layer` exists. The rule it
+/// encodes, measured on build 26200:
+///
+///   * `parent` is **always the DefView**. A GDI child of the WorkerW or of
+///     Progman is not composited at all, in any z-slot.
+///   * a missing DefView is fatal; a missing **WorkerW is not**, because we do
+///     not draw into it. Treating the WorkerW as required was why a perfectly
+///     usable desktop got reported as having no wallpaper layer.
+pub fn pick_raised_layer(
+    defview: Option<isize>,
+    workerw: Option<isize>,
+) -> Result<(isize, isize), DesktopError> {
+    // The DefView must exist: no icon host means no desktop to sit in front of,
+    // and it is our fallback parent.
+    let dv = defview.ok_or(DesktopError::NoDefViewHost)?;
+    // Prefer the WorkerW. It is Explorer's own wallpaper layer and sits BELOW
+    // the DefView, so the icons are above us structurally rather than by a
+    // z-slot we have to keep re-asserting against a sibling.
+    let parent = workerw.unwrap_or(dv);
+    Ok((parent, parent))
 }
 
 /// Collector for `EnumWindows`, which can only carry a raw pointer.
@@ -245,23 +313,39 @@ pub fn find() -> Result<Workerw, DesktopError> {
         // it is simply somewhere else. This is the case on Windows 11 24H2 and
         // later, which is to say: the common one now.
         if is_raised_desktop(progman) {
-            let child = FindWindowExW(progman, None, w!("WorkerW"), None);
-            if let Ok(w) = child {
-                if !w.is_invalid() {
-                    let mut rect = RECT::default();
-                    let _ = GetWindowRect(w, &mut rect);
-                    return Ok(Workerw {
-                        hwnd: w,
-                        origin: (rect.left, rect.top),
-                        // Children of Progman are parented to Progman itself,
-                        // not to the WorkerW: the surface must sit BETWEEN the
-                        // WorkerW and the icon layer.
-                        parent: progman,
-                        raised: true,
-                    });
-                }
-            }
-            return Err(DesktopError::NoSiblingWorkerw);
+            // The DefView is what we parent into -- see the measured table in
+            // the module header. Its ABSENCE is the fatal case now, not the
+            // WorkerW: we can draw perfectly well with no WorkerW at all.
+            let found = |cls| {
+                FindWindowExW(progman, None, cls, None)
+                    .ok()
+                    .filter(|h: &HWND| !h.is_invalid())
+                    .map(|h| h.0 as isize)
+            };
+            let dv = found(w!("SHELLDLL_DefView"));
+            let ww = found(w!("WorkerW"));
+            let (hwnd_raw, parent_raw) = pick_raised_layer(dv, ww)?;
+            let parent = HWND(parent_raw as *mut _);
+            let parent_class = if ww == Some(parent_raw) {
+                "WorkerW"
+            } else {
+                "SHELLDLL_DefView"
+            };
+
+            // The origin MUST come from the window we actually parent into,
+            // because `to_child` subtracts it. Taking it from the WorkerW while
+            // parenting into the DefView offsets every surface by the difference
+            // between them.
+            let mut rect = RECT::default();
+            let _ = GetWindowRect(parent, &mut rect);
+
+            return Ok(Workerw {
+                hwnd: HWND(hwnd_raw as *mut _),
+                origin: (rect.left, rect.top),
+                parent,
+                raised: true,
+                parent_class,
+            });
         }
 
         // --- the classic model (Windows 10, and 11 up to 23H2) ---
@@ -284,25 +368,39 @@ pub fn find() -> Result<Workerw, DesktopError> {
             // surface is parented straight into it.
             parent: hwnd,
             raised: false,
+            parent_class: "WorkerW",
         })
     }
 }
 
-/// Is this still a live WorkerW?
+/// The class our surface parent must still have for the attachment to be live.
+///
+/// A named function so the rule is reachable from a test: on the raised model we
+/// are a child of the icon host, on the classic model a child of the WorkerW,
+/// and checking the wrong one means never noticing that Explorer rebuilt the
+/// desktop underneath us.
+pub fn expected_parent_class(w: &Workerw) -> &'static str {
+    w.parent_class
+}
+
+/// Is this attachment still live?
 ///
 /// `IsWindow` alone is not enough — Explorer can restart fast enough that a new
 /// window reuses the handle value — so the class name is checked too.
+///
+/// The class check is on **`parent`**, not `hwnd`: `parent` is the window our
+/// child window lives inside and therefore dies with. Explorer destroys and
+/// recreates the DefView on desktop refresh (F5), theme change, wallpaper change
+/// and the "show desktop icons" toggle — considerably more often than it touches
+/// the WorkerW — and our surface goes with it every time.
 pub fn is_alive(w: &Workerw) -> bool {
     unsafe {
-        // Both the layer and the window we parent into must still exist.
-        // Explorer restarting destroys both, and on the raised model they are
-        // different windows.
         if !IsWindow(w.hwnd).as_bool() || !IsWindow(w.parent).as_bool() {
             return false;
         }
         let mut buf = [0u16; 64];
-        let n = GetClassNameW(w.hwnd, &mut buf);
-        n > 0 && String::from_utf16_lossy(&buf[..n as usize]) == "WorkerW"
+        let n = GetClassNameW(w.parent, &mut buf);
+        n > 0 && String::from_utf16_lossy(&buf[..n as usize]) == expected_parent_class(w)
     }
 }
 
@@ -476,30 +574,55 @@ mod tests {
     }
 
     #[test]
-    fn the_raised_model_parents_into_progman_not_the_workerw() {
-        // On 24H2+ the surface is a SIBLING of Progman's WorkerW and DefView
-        // children, so it must be parented to Progman and z-ordered between
-        // them. Parenting into the WorkerW itself would put the effect BEHIND
-        // the wallpaper, where nothing can see it.
-        let progman = HWND(0x1000 as *mut _);
-        let workerw = HWND(0x2000 as *mut _);
-        let raised = Workerw {
-            hwnd: workerw,
-            origin: (0, 0),
-            parent: progman,
-            raised: true,
-        };
-        assert_eq!(raised.parent, progman, "raised model parents into Progman");
-        assert_ne!(raised.parent, raised.hwnd);
+    fn the_raised_model_parents_into_the_defview() {
+        // MEASURED, build 26200: a GDI child of the WorkerW or of Progman draws
+        // nothing at all (0/240 sampled red) in every z-slot. A GDI child of
+        // SHELLDLL_DefView at the bottom of its children draws (240/240) AND
+        // leaves SysListView32 owning the pixels, so the icons stay clickable.
+        //
+        // The previous version of this test asserted on a struct it had just
+        // built itself, so it could not fail. This one exercises the decision.
+        let (hwnd, parent) = pick_raised_layer(Some(0x3000), Some(0x2000)).unwrap();
+        assert_eq!(parent, 0x2000, "prefer the WorkerW: it sits BELOW the icons");
+        assert_eq!(hwnd, parent);
+    }
 
-        // Classic is the opposite: the WorkerW already sits behind the icons.
-        let classic = Workerw {
-            hwnd: workerw,
+    #[test]
+    fn a_missing_workerw_is_survivable_but_a_missing_defview_is_not() {
+        // We do not draw into the WorkerW any more, so its absence must not
+        // fail: reporting "no wallpaper layer" for a desktop that can host one
+        // perfectly well is the exact false negative this module was built to
+        // avoid. Falling back to the DefView keeps `hwnd` a real window.
+        let (hwnd, parent) = pick_raised_layer(Some(0x3000), None).unwrap();
+        assert_eq!(parent, 0x3000, "fall back to the DefView, never a null handle");
+        assert_eq!(hwnd, 0x3000);
+
+        // The DefView is the one we genuinely cannot work without.
+        assert_eq!(
+            pick_raised_layer(None, Some(0x2000)),
+            Err(DesktopError::NoDefViewHost)
+        );
+        assert_eq!(pick_raised_layer(None, None), Err(DesktopError::NoDefViewHost));
+    }
+
+    #[test]
+    fn liveness_watches_the_window_we_are_a_child_of() {
+        // Our surface dies with its PARENT. Checking the WorkerW class while
+        // parented into the DefView means never noticing that Explorer rebuilt
+        // the icon host: the surface is gone and the daemon reports health.
+        let w = Workerw {
+            hwnd: HWND(0x2000 as *mut _),
             origin: (0, 0),
-            parent: workerw,
-            raised: false,
+            parent: HWND(0x2000 as *mut _),
+            raised: true,
+            parent_class: "WorkerW",
         };
-        assert_eq!(classic.parent, classic.hwnd);
+        assert_eq!(expected_parent_class(&w), "WorkerW");
+        let fallback = Workerw {
+            parent_class: "SHELLDLL_DefView",
+            ..w
+        };
+        assert_eq!(expected_parent_class(&fallback), "SHELLDLL_DefView");
     }
 
     #[test]
@@ -512,6 +635,7 @@ mod tests {
             origin: (-1440, -1230),
             parent: HWND(std::ptr::null_mut()),
             raised: false,
+            parent_class: "WorkerW",
         };
         assert_eq!(to_child(&w, -1440, -1230), (0, 0));
         assert_eq!(to_child(&w, 0, 0), (1440, 1230));

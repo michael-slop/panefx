@@ -7,11 +7,15 @@
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreateSolidBrush,
+    BitBlt, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateSolidBrush,
     DeleteDC, DeleteObject, FillRect, GetDC, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
-    ExtTextOutW, ETO_OPTIONS, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DEFAULT_PITCH, FF_DONTCARE, FW_NORMAL, HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ,
-    OUT_TT_PRECIS, SRCCOPY, TRANSPARENT,
+    ExtTextOutW, ETO_OPTIONS, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY,
+    DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, FF_DONTCARE, FW_NORMAL, HBITMAP, HBRUSH, HDC,
+    HFONT, HGDIOBJ, OUT_TT_PRECIS, SRCCOPY, TRANSPARENT,
 };
+
+use std::cell::RefCell;
+use std::collections::HashMap;
 
 use crate::animation::AsciiAnimation;
 
@@ -70,12 +74,75 @@ pub fn verify_font(requested: &str) -> Option<String> {
 
 
 
-/// Repaint in response to `WM_PAINT` when we have no fresh frame to draw.
-/// The animation loop drives real frames; this just keeps the window from
-/// showing garbage if Windows asks for a repaint between frames.
-pub fn paint_cached(_hdc: HDC, _hwnd: HWND) {
-    // Intentionally empty: `draw_fire` paints the whole window every frame,
-    // so a stale-region repaint has nothing useful to add.
+thread_local! {
+    /// hwnd -> (memory DC, width, height) for the last frame drawn.
+    ///
+    /// Populated by `draw_animation`, read by `paint_cached`, dropped by
+    /// `Panel::drop`. A thread-local rather than a field because `WM_PAINT`
+    /// arrives in the window procedure, which has only the `HWND` — and the
+    /// `Panel` itself lives in a `Vec` that moves when it grows, so a raw
+    /// pointer to it would dangle. Both the daemon's draw loop and its message
+    /// pump run on the same thread (see `main.rs`), so this is never shared.
+    static REPAINT: RefCell<HashMap<isize, (isize, i32, i32)>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Record where `hwnd`'s last frame lives, so `WM_PAINT` can restore it.
+pub fn remember_for_repaint(hwnd: HWND, mem_dc: HDC, width: i32, height: i32) {
+    REPAINT.with(|r| {
+        r.borrow_mut()
+            .insert(hwnd.0 as isize, (mem_dc.0 as isize, width, height));
+    });
+}
+
+/// Forget `hwnd`. MUST be called before its memory DC is deleted, or a
+/// `WM_PAINT` arriving afterwards blits from a freed DC.
+pub fn forget_for_repaint(hwnd: HWND) {
+    REPAINT.with(|r| {
+        r.borrow_mut().remove(&(hwnd.0 as isize));
+    });
+}
+
+/// Repaint in response to `WM_PAINT` by re-blitting the last frame.
+///
+/// **This must not be empty, and it used to be.** The reasoning for the stub was
+/// "draw_animation paints the whole window every frame, so a stale-region
+/// repaint has nothing useful to add". That holds for a terminal panel running
+/// at 20-30fps. It does NOT hold for a desktop surface that is deliberately
+/// FROZEN while occluded: there is no next frame to repair the damage, so
+/// whatever Windows asked us to repaint stays unpainted, permanently.
+///
+/// Measured on build 26200 — a GDI child of `SHELLDLL_DefView`, painted once,
+/// covered for 12s, then uncovered:
+///
+/// | WM_PAINT handler | before | after |
+/// |---|---|---|
+/// | empty stub       | 240/240 | **237/240, still 237 after settling** |
+/// | this one         | 240/240 | 240/240 |
+///
+/// Small per cycle, permanent, and cumulative over a day of window switching.
+pub fn paint_cached(hdc: HDC, hwnd: HWND) {
+    let entry = REPAINT.with(|r| r.borrow().get(&(hwnd.0 as isize)).copied());
+    let Some((mem_dc, width, height)) = entry else {
+        // No frame drawn yet — nothing better to do than leave it alone.
+        return;
+    };
+    if width <= 0 || height <= 0 {
+        return;
+    }
+    unsafe {
+        let _ = BitBlt(
+            hdc,
+            0,
+            0,
+            width,
+            height,
+            HDC(mem_dc as *mut core::ffi::c_void),
+            0,
+            0,
+            SRCCOPY,
+        );
+    }
 }
 
 /// Draw an animation into `hwnd`, clipped to `width` x `height` pixels.
@@ -131,6 +198,8 @@ pub fn draw_animation(
                 bitmap: HBITMAP::default(),
                 bmp_w: 0,
                 bmp_h: 0,
+                bits: std::ptr::null_mut(),
+                stride: 0,
                 old_bmp: HGDIOBJ::default(),
                 font: HFONT::default(),
                 font_face: String::new(),
@@ -148,8 +217,32 @@ pub fn draw_animation(
         let mem_dc = g.mem_dc;
 
         // Bitmap: rebuild only on resize.
+        //
+        // A 32-bit top-down DIB SECTION rather than a compatible bitmap, so the
+        // finished frame has a CPU address to hand to DirectComposition. The
+        // negative height is what makes it top-down; with a positive height the
+        // rows arrive bottom-up and the wallpaper presents upside down.
         if g.bitmap.is_invalid() || g.bmp_w != width || g.bmp_h != height {
-            let new_bmp = CreateCompatibleBitmap(hdc, width, height);
+            let bi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: width,
+                    biHeight: -height,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+            let Ok(new_bmp) = CreateDIBSection(hdc, &bi, DIB_RGB_COLORS, &mut bits, None, 0)
+            else {
+                ReleaseDC(hwnd, hdc);
+                return;
+            };
+            g.bits = bits as *mut u8;
+            g.stride = (width as usize) * 4;
             let prev = SelectObject(mem_dc, new_bmp);
             // Keep the DC's ORIGINAL bitmap (from the first swap only), so it
             // can be restored at Drop. Later swaps return our own old bitmap,
@@ -357,13 +450,35 @@ pub fn draw_animation(
         }
 
         // --- present ---
-        let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
-
-        // Hand the scratch buffers back for next frame. The DC, bitmap, font
-        // and brush all STAY selected and alive — freed in `Panel::drop`.
+        //
+        // Two paths, and the difference is not cosmetic. A terminal panel blits
+        // to its own window DC. A desktop surface CANNOT: GDI never writes the
+        // alpha channel, the raised desktop composites with alpha, and a blitted
+        // frame therefore lands as `dst + src` -- a brightening filter over
+        // Explorer's wallpaper rather than a replacement. Measured on build
+        // 26200: a (100,100,100) fill over a (9,26,54) desktop pixel read back
+        // (109,126,154) via GDI and (100,100,100) via DirectComposition.
+        let bits = g.bits;
+        let stride = g.stride;
+        // Hand the scratch buffers back BEFORE touching `panel` again: `g` is a
+        // mutable borrow of it.
         g.run = run;
         g.dx = dx;
         g.row_cells = row_cells;
+        if let Some(surface) = panel.surface.as_ref() {
+            if let Err(e) = surface.present(bits, stride) {
+                crate::log_warn!("[panefx] wallpaper present failed: {e}");
+            }
+        } else {
+            let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
+        }
+
+        // Let WM_PAINT restore this frame if Windows asks. Matters for a frozen
+        // desktop surface, which by design has no next frame to repair damage.
+        remember_for_repaint(hwnd, mem_dc, width, height);
+
+        // The DC, bitmap, font and brush all STAY selected and alive — they are
+        // freed in `Panel::drop`.
         ReleaseDC(hwnd, hdc);
     }
 }

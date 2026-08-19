@@ -52,15 +52,25 @@ pub struct Config {
     /// `None` means the effect uses its own built-in set.
     pub chars_override: Option<String>,
 
-    /// How see-through panefx's target windows are, 10-100%.
+    /// How see-through panefx's target windows are, from
+    /// [`crate::opacity::MIN_PERCENT`] to [`crate::opacity::MAX_PERCENT`].
     ///
-    /// Applied with `SetLayeredWindowAttributes` (see `opacity.rs`) rather than
-    /// through each app's own setting, because neither Alacritty nor Neovide
-    /// can be driven live on Windows — and because one dial that works on every
-    /// window is the whole point.
+    /// Applied by writing each app's OWN opacity setting — see
+    /// [`crate::term_opacity`], which rewrites the `opacity` line in
+    /// `alacritty.toml` and lets `live_config_reload` pick it up (about two
+    /// seconds, no restart).
     ///
-    /// **The apps' own opacity must be 1.0**, or the two alphas multiply: an
-    /// Alacritty at 0.6 layered at 60% renders at ~36%.
+    /// This used to go through `SetLayeredWindowAttributes`, and the difference
+    /// is the reason it does not any more: a layered alpha fades every pixel of
+    /// the window, glyphs included, so the backdrop bled through the text and
+    /// made it hard to read. Each app's own setting is PER-PIXEL — the
+    /// background fades and the glyphs stay solid, which is the only version of
+    /// this feature worth having. `opacity.rs` keeps the history.
+    ///
+    /// Because there is exactly one alpha now, the apps' own values are what
+    /// panefx sets; nothing multiplies. `main.rs` calls
+    /// `term_opacity::clear_legacy_layered_styles()` at startup so a window
+    /// still carrying the old layered style does not stack a second alpha.
     pub opacity: u8,
     /// Per-effect params from `[rain]` / `[flames]` sections, kept as raw
     /// strings and applied through `AsciiAnimation::set_param` after the effect
@@ -261,10 +271,19 @@ impl Config {
             cfg.cell_h = v;
             cfg.cell_explicit = true;
         }
-        if let Some(v) = env_i32("PANEFX_OPACITY")
-            .filter(|v| *v >= crate::opacity::MIN_PERCENT as i32 && *v <= crate::opacity::MAX_PERCENT as i32)
-        {
-            cfg.opacity = v as u8;
+        // Clamped for the same reason as the TOML path above: the env var is a
+        // preference, and the nearest legal value honours it better than a
+        // silent fallback to the default.
+        if let Some(v) = env_i32("PANEFX_OPACITY") {
+            let lo = crate::opacity::MIN_PERCENT as i32;
+            let hi = crate::opacity::MAX_PERCENT as i32;
+            let clamped = v.clamp(lo, hi);
+            cfg.opacity = clamped as u8;
+            if v != clamped {
+                crate::log_warn!(
+                    "[panefx] PANEFX_OPACITY {v}% is outside {lo}-{hi}%; using {clamped}%"
+                );
+            }
         }
         if let Some(v) = env_u64("PANEFX_WALLPAPER_FPS").filter(|v| *v > 0 && *v <= 120) {
             cfg.wallpaper_fps = v;
@@ -398,10 +417,27 @@ impl Config {
 
             match k.as_str() {
                 "font" => self.font = v.to_string(),
+                // CLAMPED, not rejected. Every other key here drops an
+                // out-of-range value and keeps the code default, which is right
+                // when the value is nonsense. Opacity is different: the floor
+                // has moved up before (see `opacity::MIN_PERCENT`), so a config
+                // written by an older build holds a value that is now too low
+                // but still expresses a real preference -- "as see-through as
+                // you will let me". Dropping it would silently jump the user to
+                // the default instead of the nearest legal setting, and the only
+                // evidence would be a terminal that changed appearance at
+                // startup for no stated reason.
                 "opacity" => {
                     if let Ok(n) = v.parse::<u8>() {
-                        if (crate::opacity::MIN_PERCENT..=crate::opacity::MAX_PERCENT).contains(&n) {
-                            self.opacity = n;
+                        let lo = crate::opacity::MIN_PERCENT;
+                        let hi = crate::opacity::MAX_PERCENT;
+                        self.opacity = n.clamp(lo, hi);
+                        if n != self.opacity {
+                            crate::log_warn!(
+                                "[panefx] config opacity {n}% is outside {lo}-{hi}%; \
+                                 using {}%",
+                                self.opacity
+                            );
                         }
                     }
                 }
@@ -561,14 +597,26 @@ impl Config {
             s.push_str(&format!("chars = \"{c}\"\n"));
         }
 
-        s.push_str("\n# How see-through the target windows are, 10-100%.\n");
-        s.push_str("# panefx sets this itself with SetLayeredWindowAttributes, so it\n");
-        s.push_str("# applies to every window it draws behind -- Alacritty, Neovide, or\n");
-        s.push_str("# anything in PANEFX_TARGETS -- and takes effect instantly. Neither\n");
-        s.push_str("# app can be driven live any other way on Windows.\n");
+        s.push_str(&format!(
+            "\n# How see-through the target windows are, {}-{}%.\n",
+            crate::opacity::MIN_PERCENT,
+            crate::opacity::MAX_PERCENT
+        ));
+        s.push_str("# panefx applies this by writing the app's OWN opacity setting --\n");
+        s.push_str("# for Alacritty, the 'opacity' line in alacritty.toml, which\n");
+        s.push_str("# live_config_reload picks up in about two seconds. Do not set that\n");
+        s.push_str("# line by hand; the value HERE is the one that wins.\n");
         s.push_str("#\n");
-        s.push_str("# The apps' OWN opacity must stay at 1.0 or the two alphas MULTIPLY:\n");
-        s.push_str("# an Alacritty at 0.6 layered at 60% renders at about 36%.\n");
+        s.push_str("# It is per-pixel: the background fades and the glyphs stay solid.\n");
+        s.push_str("# A whole-window alpha was tried first and faded the text too.\n");
+        s.push_str("#\n");
+        s.push_str(&format!(
+            "# The floor is {}%, not 0. Below roughly a third, a borderless window\n",
+            crate::opacity::MIN_PERCENT
+        ));
+        s.push_str("# over an animated backdrop makes the compositor redraw the whole\n");
+        s.push_str("# window on every damage rect, and heavy terminal output -- a long\n");
+        s.push_str("# table, a build log -- tears and flashes the display.\n");
         s.push_str(&format!("opacity = {}\n", self.opacity));
 
         s.push_str("\n# --- desktop wallpaper ----------------------------------------------\n");
@@ -957,25 +1005,38 @@ mod tests {
     fn opacity_refuses_values_that_would_lose_the_window() {
         // 0% is not merely dark — Microsoft's docs note a fully transparent
         // window is also UNFOCUSABLE, so the user could not click it back.
+        //
+        // `set_field` is the INTERACTIVE path (the TUI slider) and still
+        // rejects rather than clamps: a key that silently snaps to a different
+        // number fights the person holding it down. The file and env paths
+        // clamp instead — see `an_out_of_range_opacity_in_toml_is_clamped`.
         let mut c = Config::default();
         let before = c.opacity;
         assert!(!c.set_field("opacity", &serde_json::json!(0)));
         assert!(!c.set_field("opacity", &serde_json::json!(5)));
         assert!(!c.set_field("opacity", &serde_json::json!(101)));
         assert_eq!(c.opacity, before, "a rejected value must not mutate");
-        assert!(c.set_field("opacity", &serde_json::json!(10)));
-        assert!(c.set_field("opacity", &serde_json::json!(100)));
+        assert!(c.set_field("opacity", &serde_json::json!(crate::opacity::MIN_PERCENT)));
+        assert!(c.set_field("opacity", &serde_json::json!(crate::opacity::MAX_PERCENT)));
     }
 
     #[test]
-    fn a_bad_opacity_in_toml_leaves_the_default() {
-        // The file layer clamps silently rather than refusing to load — a typo
-        // in the config must not leave panefx with no backdrop at all.
+    fn an_out_of_range_opacity_in_toml_is_clamped() {
+        // Clamped to the nearest legal value, NOT dropped for the default.
+        //
+        // This is the migration path. The floor has moved up (10% tore the
+        // display under heavy output — see `opacity::MIN_PERCENT`), so configs
+        // written by older builds hold values that are now illegal but still
+        // mean something: "as see-through as you allow". Falling back to the
+        // default would change the user's terminal at startup with no
+        // connection to anything they did.
         let mut c = Config::default();
+        c.apply_toml("opacity = 10");
+        assert_eq!(c.opacity, crate::opacity::MIN_PERCENT);
         c.apply_toml("opacity = 0");
-        assert_eq!(c.opacity, Config::default().opacity);
-        c.apply_toml("opacity = 500");
-        assert_eq!(c.opacity, Config::default().opacity);
+        assert_eq!(c.opacity, crate::opacity::MIN_PERCENT);
+        c.apply_toml("opacity = 250");
+        assert_eq!(c.opacity, crate::opacity::MAX_PERCENT);
     }
 
     #[test]
@@ -984,8 +1045,8 @@ mod tests {
         // claim unrelated keys.
         assert_eq!(parse_wallpaper_effect_key("opacity"), None);
         let mut c = Config::default();
-        c.apply_toml("opacity = 33\nwallpaper_fps = 7");
-        assert_eq!(c.opacity, 33);
+        c.apply_toml("opacity = 55\nwallpaper_fps = 7");
+        assert_eq!(c.opacity, 55);
         assert_eq!(c.wallpaper_fps, 7);
         assert!(c.wallpaper_effects.is_empty());
     }

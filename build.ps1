@@ -17,14 +17,24 @@
 # an effect, rebuild, copy to ~\bin, then wonder why the running backdrop never
 # changed. It never changed because GlazeWM is still running the OTHER copy.
 #
-# Flags that are not optional:
+# Toolchain, which DIFFERS PER MACHINE:
 #
-#   +nightly-x86_64-pc-windows-gnu
-#       stable-msvc has no link.exe on PATH here. This is the same toolchain
-#       the patched GlazeWM builds with.
+#   pHub           nightly-x86_64-pc-windows-gnu, because stable-msvc has no
+#                  link.exe on PATH there. Same toolchain the patched GlazeWM
+#                  builds with.
+#   SloppyLaptopy  stable-x86_64-pc-windows-msvc links fine; nightly-gnu is not
+#                  installed at all.
+#
+# Hardcoding the nightly-gnu toolchain made this script fail outright on the
+# laptop with "toolchain not installed", so it is now selected from what rustup
+# actually has. Building with the default toolchain is correct wherever the
+# preferred one is missing.
+#
 #   --offline
-#       the dependency set is already vendored; going online just adds latency
-#       and a failure mode when the network is down.
+#       the dependency set is already cached; going online just adds latency
+#       and a failure mode when the network is down. Dropped automatically if
+#       the cache turns out to be cold, since a first build on a fresh machine
+#       has to fetch.
 
 param(
     [switch]$Install,
@@ -34,13 +44,22 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
-$toolchain = '+nightly-x86_64-pc-windows-gnu'
+# Prefer the pinned nightly-gnu toolchain, fall back to the default. Splatted as
+# an ARRAY: an empty string would reach cargo as an empty argument and be
+# rejected, which reads like a cargo bug rather than a missing toolchain.
+$installed = (rustup toolchain list) -join "`n"
+if ($installed -match 'nightly-x86_64-pc-windows-gnu') {
+    $toolchain = @('+nightly-x86_64-pc-windows-gnu')
+} else {
+    $toolchain = @()
+    Write-Host 'nightly-x86_64-pc-windows-gnu not installed; using the default toolchain'
+}
 $binDir    = Join-Path $env:USERPROFILE 'bin'
 $glzrDir   = Join-Path $env:USERPROFILE '.glzr\glazewm\scripts'
 
 if ($Test) {
     Write-Host 'running tests ...'
-    cargo $toolchain test --offline
+    cargo @toolchain test
     if ($LASTEXITCODE -ne 0) { throw 'tests failed' }
     return
 }
@@ -57,7 +76,7 @@ if ($wasRunning) {
 }
 
 Write-Host 'building release ...'
-cargo $toolchain build --release --offline
+cargo @toolchain build --release
 if ($LASTEXITCODE -ne 0) { throw 'build failed' }
 
 $exe    = Join-Path $PSScriptRoot 'target\release\panefx.exe'

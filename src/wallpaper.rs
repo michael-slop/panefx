@@ -476,15 +476,16 @@ impl WallpaperSet {
         };
         self.pool.acquire(&key, cfg);
 
-        // SCREEN coordinates: the surface is a top-level popup, not a child of
-        // anything, so no origin conversion is needed. The WorkerW-relative
-        // maths only applied while we were parenting into Explorer.
-        let (x, y) = (s.monitor.x, s.monitor.y);
+        // PARENT-RELATIVE coordinates: the surface is a CHILD of Explorer's
+        // icon host, so a screen coordinate would land it off the parent's edge
+        // wherever the desktop does not start at (0,0) — which is any layout
+        // with a monitor left of or above the primary.
+        let (x, y) = desktop::to_child(&worker, s.monitor.x, s.monitor.y);
         match Panel::create_anchored(
             Anchor::Desktop {
-                // On the raised model this is Progman, not the WorkerW — the
-                // surface must be a SIBLING of the WorkerW and DefView, sitting
-                // between them.
+                // `SHELLDLL_DefView` on the raised model — the only parent in
+                // which a GDI child is composited at all. `desktop::find`
+                // records the measurements.
                 parent: worker.parent,
                 raised: worker.raised,
             },
@@ -494,10 +495,9 @@ impl WallpaperSet {
             s.monitor.height,
         ) {
             Ok(p) => {
-                // Assert the z-slot NOW: the surface is created as Progman's
-                // last child, i.e. BELOW the WorkerW that paints the desktop
-                // background — which would hide it completely. It has to sit
-                // between the WorkerW and SHELLDLL_DefView.
+                // Assert the z-slot NOW: a freshly created child lands at the
+                // TOP of its siblings, i.e. over SysListView32 and every icon.
+                // It has to go to the bottom of DefView's children.
                 if let Err(e) = p.pin_behind_target() {
                     crate::log_warn!("[panefx] wallpaper: z-order for {} failed: {e}", s.monitor.device);
                 }
@@ -632,10 +632,10 @@ impl WallpaperSet {
             let (Some(key), Some(panel)) = (s.sim.clone(), s.panel.as_mut()) else {
                 continue;
             };
-            // Explorer recreates its Progman children on theme and wallpaper
-            // changes, which drops our surface back below the WorkerW where
-            // nothing can see it. Cheap to re-assert; expensive to debug when
-            // the wallpaper silently vanishes an hour later.
+            // Explorer reorders and rebuilds its desktop children on theme
+            // changes, wallpaper changes and desktop refreshes, which can leave
+            // our surface above the icons again. Cheap to re-assert; expensive
+            // to debug when the icons silently vanish an hour later.
             let _ = panel.pin_behind_target();
             if !(self.pool.dirty(&key) || s.force_redraw) {
                 continue;
@@ -1147,6 +1147,7 @@ mod tests {
             origin: (0, 0),
             parent: windows::Win32::Foundation::HWND(std::ptr::null_mut()),
             raised: false,
+            parent_class: "WorkerW",
         });
         let mut s = surface_for(mon_at(1, 0, 1080));
         s.effect = "flames".into();
@@ -1169,6 +1170,7 @@ mod tests {
             origin: (0, 0),
             parent: windows::Win32::Foundation::HWND(std::ptr::null_mut()),
             raised: false,
+            parent_class: "WorkerW",
         });
         let err = set
             .set_effect(Some(9), "waves", &cfg)
