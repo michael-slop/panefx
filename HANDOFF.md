@@ -601,7 +601,18 @@ what correctly puts the surface under `SysListView32`; for a TOP-LEVEL window it
 sits above the desktop background but below nothing, hiding the icons. The two
 are not the same operation — see `panel::pin_behind_target`.
 
-### The three traps, each with a regression test
+### The four traps, each with a regression test
+
+0. **Sibling panes must not fight over the bottom z-slot.** One pane per
+   monitor, all children of ONE shared parent -- so only one can ever be the
+   LAST sibling. A guard that re-pins unless "I am last" makes every pane
+   displace the others once per tick, forever: measured 39.9 z-order
+   SetWindowPos/sec on four monitors, each a full-monitor DWM repaint -- the
+   multi-monitor flicker. A lone pane is always last, so a single-monitor
+   machine can NEVER reproduce this. The guard walks DOWN the sibling list and
+   re-pins only when something foreign is below us.
+   -> `a_sibling_pane_below_us_is_not_a_reason_to_re_pin`
+
 
 1. **GlazeWM reports MINIMIZED windows as `displayState: "shown"`** carrying
    their full pre-minimize rect (measured: a minimized terminal at 1115x628, a
