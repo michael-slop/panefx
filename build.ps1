@@ -6,7 +6,8 @@
 #
 # Why two install locations:
 #
-#   ~\bin\                        panefx.exe + panefx-ctl.exe, so you can type
+#   ~\bin\                        panefx.exe, panefx-ctl.exe + panefx-gui.exe,
+#                                 so you can type any of them
 #                                 `panefx-ctl` from any shell. Assumes this dir
 #                                 is on your PATH; change it if yours differs.
 #   ~\.glzr\glazewm\scripts\      panefx.exe only. GlazeWM's `startup_commands`
@@ -103,6 +104,14 @@ if ($wasRunning) {
     Stop-Process -Name panefx -Force
     Start-Sleep -Milliseconds 900
 }
+# The GUI locks its own exe for exactly the same reason, and gives exactly the
+# same misleading error. It is NOT restarted afterwards -- it is a window the
+# user opened, and a build script reopening windows is surprising.
+if (Get-Process -Name panefx-gui -ErrorAction SilentlyContinue) {
+    Write-Host 'stopping running GUI (it locks its own binary) ...'
+    Stop-Process -Name panefx-gui -Force
+    Start-Sleep -Milliseconds 600
+}
 
 Write-Host 'building release ...'
 & $cargoExe @cargoArgs build --release
@@ -110,8 +119,10 @@ if ($LASTEXITCODE -ne 0) { throw 'build failed' }
 
 $exe    = Join-Path $PSScriptRoot 'target\release\panefx.exe'
 $ctlExe = Join-Path $PSScriptRoot 'target\release\panefx-ctl.exe'
-Write-Host ('built: panefx {0:N0} KB, panefx-ctl {1:N0} KB' -f `
-    ((Get-Item $exe).Length / 1KB), ((Get-Item $ctlExe).Length / 1KB))
+$guiExe = Join-Path $PSScriptRoot 'target\release\panefx-gui.exe'
+Write-Host ('built: panefx {0:N0} KB, panefx-ctl {1:N0} KB, panefx-gui {2:N0} KB' -f `
+    ((Get-Item $exe).Length / 1KB), ((Get-Item $ctlExe).Length / 1KB),
+    ((Get-Item $guiExe).Length / 1KB))
 
 if (-not $Install) {
     if ($wasRunning) {
@@ -134,7 +145,10 @@ Copy-Item $exe    (Join-Path $glzrDir 'panefx.exe')     -Force
 # happens to sit there. That is exactly how a morning build survived a day of
 # fixes: hand-deploying to ~\panefx only, while GlazeWM relaunched from here.
 Copy-Item $ctlExe (Join-Path $glzrDir 'panefx-ctl.exe') -Force
-Write-Host "installed -> $binDir  (panefx, panefx-ctl)"
+# The GUI goes to ~\bin only. It is launched by hand, not by GlazeWM, so it
+# needs to be on PATH but has no reason to sit beside the daemon.
+Copy-Item $guiExe (Join-Path $binDir 'panefx-gui.exe') -Force
+Write-Host "installed -> $binDir  (panefx, panefx-ctl, panefx-gui)"
 Write-Host "installed -> $glzrDir  (panefx, panefx-ctl)"
 
 # Prove the copies match rather than trusting that Copy-Item did what it said.
@@ -149,7 +163,12 @@ $ctlHash = (Get-FileHash $ctlExe).Hash
 foreach ($t in @((Join-Path $binDir 'panefx-ctl.exe'), (Join-Path $glzrDir 'panefx-ctl.exe'))) {
     if ((Get-FileHash $t).Hash -ne $ctlHash) { throw "copy mismatch: $t" }
 }
-Write-Host 'verified: all four installed copies match the build'
+# And the GUI, for the same reason: a stale one shows up as a window missing
+# controls the daemon already supports.
+if ((Get-FileHash (Join-Path $binDir 'panefx-gui.exe')).Hash -ne (Get-FileHash $guiExe).Hash) {
+    throw "copy mismatch: panefx-gui.exe"
+}
+Write-Host 'verified: all five installed copies match the build'
 
 # --daemon is REQUIRED: without it panefx.exe hands off to the control TUI,
 # because typing `panefx` in a terminal should open the TUI. Omit the flag here

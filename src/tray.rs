@@ -19,12 +19,75 @@ use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, GetCursorPos,
-    LoadIconW, PostQuitMessage, RegisterClassExW, SetForegroundWindow, TrackPopupMenu,
-    IDI_APPLICATION, MF_SEPARATOR, MF_STRING, TPM_BOTTOMALIGN, TPM_RIGHTALIGN, WM_APP,
-    WM_COMMAND, WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSEXW, WS_OVERLAPPED,
+    AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
+    GetCursorPos, LoadIconW, PostQuitMessage, RegisterClassExW, SetForegroundWindow,
+    TrackPopupMenu, HICON, ICONINFO, IDI_APPLICATION, MF_SEPARATOR, MF_STRING, TPM_BOTTOMALIGN,
+    TPM_RIGHTALIGN, WM_APP, WM_COMMAND, WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSEXW,
+    WS_OVERLAPPED,
+};
+use windows::Win32::Graphics::Gdi::{
+    CreateBitmap, CreateDIBSection, DeleteObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    DIB_RGB_COLORS, HBITMAP,
 };
 
+
+/// Build the panefx icon from [`crate::icon_art`].
+///
+/// `CreateIconIndirect` from a 32-bit DIB rather than a `.ico` resource: the
+/// pixels are already in the binary as an array, so there is no resource script
+/// to add to the build and no image crate to depend on. Returns `None` on
+/// failure -- the caller falls back to the stock application icon, because an
+/// ugly tray icon is better than no tray icon.
+///
+/// The MASK bitmap is required even for a 32-bit colour bitmap with its own
+/// alpha. Passing a null mask gives `CreateIconIndirect` an invalid `ICONINFO`
+/// and it fails; an all-zero mask means "use the colour bitmap's alpha", which
+/// is what the art actually carries.
+fn build_icon() -> Option<HICON> {
+    unsafe {
+        let side = crate::icon_art::ICON_32_SIZE;
+        let bi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: side,
+                // NEGATIVE: the art is stored top-down, and a positive height
+                // would flip the icon upside down.
+                biHeight: -side,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let colour = CreateDIBSection(None, &bi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+        if bits.is_null() {
+            let _ = DeleteObject(colour);
+            return None;
+        }
+        std::ptr::copy_nonoverlapping(
+            crate::icon_art::ICON_32.as_ptr(),
+            bits as *mut u8,
+            crate::icon_art::ICON_32.len(),
+        );
+        // 1bpp all-zero mask: every pixel opaque, alpha comes from the colour
+        // bitmap.
+        let mask_bytes = vec![0u8; ((side as usize + 15) / 16 * 2) * side as usize];
+        let mask: HBITMAP = CreateBitmap(side, side, 1, 1, Some(mask_bytes.as_ptr() as *const _));
+        let info = ICONINFO {
+            fIcon: true.into(),
+            hbmMask: mask,
+            hbmColor: colour,
+            ..Default::default()
+        };
+        let icon = CreateIconIndirect(&info).ok();
+        // The bitmaps are copied into the icon, so they are ours to free.
+        let _ = DeleteObject(colour);
+        let _ = DeleteObject(mask);
+        icon
+    }
+}
 
 /// Our private message for tray callbacks. `WM_APP` upward is reserved for
 /// application use, so this cannot collide with a system message.
@@ -181,7 +244,12 @@ impl Tray {
                 uID: 1,
                 uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
                 uCallbackMessage: WM_TRAYICON,
-                hIcon: LoadIconW(None, IDI_APPLICATION)?,
+                // The panefx icon, or the stock one if it could not be built
+                // -- an ugly tray icon beats no tray icon.
+                hIcon: match build_icon() {
+                    Some(i) => i,
+                    None => LoadIconW(None, IDI_APPLICATION)?,
+                },
                 ..Default::default()
             };
             let tip = "panefx — click for the control TUI";

@@ -7,3 +7,5 @@ wt-*.ppm
 wt-*.png
 fx-*.ppm
 fx-*.png
+icon-preview-*.png
+icon-decoded.png

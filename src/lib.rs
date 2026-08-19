@@ -53,6 +53,7 @@ pub mod wzfire_art;
 #[cfg(windows)]
 pub mod desktop;
 #[cfg(windows)]
+pub mod icon_art;
 pub mod ipc;
 #[cfg(windows)]
 pub mod panel;

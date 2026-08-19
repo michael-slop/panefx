@@ -34,6 +34,7 @@ fn main() -> eframe::Result<()> {
             // invisible to alt-tab.
             .with_decorations(false)
             .with_resizable(true)
+            .with_icon(window_icon())
             .with_title(WINDOW_TITLE),
         ..Default::default()
     };
@@ -45,6 +46,24 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(App::new()))
         }),
     )
+}
+
+/// The panefx icon, for the taskbar and alt-tab.
+///
+/// The same art the daemon's tray icon uses, so both halves of panefx look like
+/// one program. Stored BGRA for Win32's `CreateIconIndirect`; egui wants RGBA,
+/// so the two colour channels swap here rather than the art being kept twice.
+fn window_icon() -> egui::IconData {
+    let src = &panefx::icon_art::ICON_32;
+    let mut rgba = Vec::with_capacity(src.len());
+    for px in src.chunks_exact(4) {
+        rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+    }
+    egui::IconData {
+        rgba,
+        width: panefx::icon_art::ICON_32_SIZE as u32,
+        height: panefx::icon_art::ICON_32_SIZE as u32,
+    }
 }
 
 // ---------------------------------------------------------------- connection
@@ -155,6 +174,7 @@ struct App {
     pending_close: bool,
     /// The copy-to-displays sheet is open for this monitor.
     copy_from: Option<usize>,
+    about: bool,
     /// Cached: probing the filesystem every frame would be silly.
     glazewm: bool,
     last_poll: std::time::Instant,
@@ -182,6 +202,7 @@ impl App {
             pending_apply: None,
             pending_close: false,
             copy_from: None,
+            about: false,
             glazewm: glazewm_path().is_some(),
             last_poll: std::time::Instant::now(),
         };
@@ -325,6 +346,7 @@ impl eframe::App for App {
         // These float above everything, so they are drawn last.
         self.colour_picker_window(&ctx, &p);
         self.copy_sheet(&ctx, &p);
+        self.about_window(&ctx, &p);
         // Its buttons cannot send commands from inside the window closure --
         // that borrows `self` -- so they leave an intent here and it is acted
         // on now.
@@ -410,6 +432,9 @@ impl App {
                     ui.ctx(),
                     if self.dark { &Palette::DARK } else { &Palette::LIGHT },
                 );
+            }
+            if ui.button("about").clicked() {
+                self.about = !self.about;
             }
         });
     }
@@ -785,6 +810,62 @@ impl App {
                 }
             });
 
+        }
+    }
+
+    /// The About box.
+    ///
+    /// Exists for a LICENCE OBLIGATION, not as decoration: BigBlueTerm437 is
+    /// CC BY-SA 4.0 and embedding it requires attribution. `win98::ATTRIBUTION`
+    /// carries the text and a test pins it, because it is exactly the kind of
+    /// string that gets tidied out of a dialog by someone shortening it.
+    fn about_window(&mut self, ctx: &egui::Context, p: &Palette) {
+        if !self.about {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("about panefx")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .frame(
+                egui::Frame::NONE
+                    .fill(p.button_face)
+                    .inner_margin(egui::Margin::same(12)),
+            )
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new("panefx")
+                        .size(20.0)
+                        .color(p.text),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "animated backdrops pinned behind windows, and on the desktop",
+                    )
+                    .color(p.muted),
+                );
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new("chrome").color(p.text));
+                ui.label(
+                    egui::RichText::new(
+                        "Windows 98 look carried from michaelslop.org through slopkit.",
+                    )
+                    .color(p.muted)
+                    .size(11.0),
+                );
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new("font").color(p.text));
+                for line in win98::ATTRIBUTION.lines() {
+                    ui.label(egui::RichText::new(line).color(p.muted).size(11.0));
+                }
+                ui.add_space(10.0);
+                if ui.button("  close  ").clicked() {
+                    self.about = false;
+                }
+            });
+        if !open {
+            self.about = false;
         }
     }
 
