@@ -207,7 +207,23 @@ pub trait AsciiAnimation {
 /// **To add a new background:** write a module implementing `AsciiAnimation`,
 /// add its name here and a line in `build`. Nothing else in the program needs
 /// to change — the supervisor, panel and renderer are all trait-only.
-pub const EFFECTS: &[&str] = &["flames", "rain", "waves", "fire", "wizardtorch"];
+pub const EFFECTS: &[&str] = &[
+    "flames",
+    "rain",
+    "waves",
+    "fire",
+    "wizardtorch",
+    "plasma",
+    "tunnel",
+    "starfield",
+    // One module, four surfaces -- see `spin3d::Shape`. Named separately here
+    // because "pick an effect" is the user-facing choice; that they share a
+    // renderer is an implementation detail.
+    "donut",
+    "sphere",
+    "cube",
+    "galaxy",
+];
 
 /// Construct an effect by name. Unknown names fall back to the first entry in
 /// `EFFECTS` rather than failing, so a typo in a config file degrades to a
@@ -235,6 +251,32 @@ pub fn build(
             let mut w = crate::wizardtorch::WizardTorch::new(cols, rows);
             w.set_frame_ms(cfg.frame_time().as_millis() as u64);
             Box::new(w)
+        }
+        "plasma" => {
+            let mut p = crate::plasma::Plasma::new(cols, rows, cfg.chars_override.as_deref());
+            p.set_frame_ms(cfg.frame_time().as_millis() as u64);
+            Box::new(p)
+        }
+        "tunnel" => {
+            let mut t = crate::tunnel::Tunnel::new(cols, rows, cfg.chars_override.as_deref());
+            t.set_frame_ms(cfg.frame_time().as_millis() as u64);
+            Box::new(t)
+        }
+        "starfield" => {
+            let mut s = crate::starfield::Starfield::new(cols, rows, seed);
+            s.set_frame_ms(cfg.frame_time().as_millis() as u64);
+            Box::new(s)
+        }
+        "donut" | "sphere" | "cube" | "galaxy" => {
+            let mut s = crate::spin3d::Spin3d::new(cols, rows);
+            s.set_frame_ms(cfg.frame_time().as_millis() as u64);
+            s.set_shape(match name.trim().to_lowercase().as_str() {
+                "sphere" => crate::spin3d::Shape::Sphere,
+                "cube" => crate::spin3d::Shape::Cube,
+                "galaxy" => crate::spin3d::Shape::Galaxy,
+                _ => crate::spin3d::Shape::Donut,
+            });
+            Box::new(s)
         }
         _ => Box::new(crate::flames::Flames::new(cols, rows, seed)),
     }

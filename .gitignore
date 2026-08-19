@@ -5,3 +5,5 @@
 # Preview frames from `cargo run --example wizardtorch_preview`.
 wt-*.ppm
 wt-*.png
+fx-*.ppm
+fx-*.png
