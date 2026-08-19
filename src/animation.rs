@@ -207,7 +207,7 @@ pub trait AsciiAnimation {
 /// **To add a new background:** write a module implementing `AsciiAnimation`,
 /// add its name here and a line in `build`. Nothing else in the program needs
 /// to change — the supervisor, panel and renderer are all trait-only.
-pub const EFFECTS: &[&str] = &["flames", "rain", "waves", "fire"];
+pub const EFFECTS: &[&str] = &["flames", "rain", "waves", "fire", "wizardtorch"];
 
 /// Construct an effect by name. Unknown names fall back to the first entry in
 /// `EFFECTS` rather than failing, so a typo in a config file degrades to a
@@ -231,6 +231,11 @@ pub fn build(
             Box::new(w)
         }
         "fire" => Box::new(crate::fire::Fire::new(cols, rows, seed)),
+        "wizardtorch" => {
+            let mut w = crate::wizardtorch::WizardTorch::new(cols, rows);
+            w.set_frame_ms(cfg.frame_time().as_millis() as u64);
+            Box::new(w)
+        }
         _ => Box::new(crate::flames::Flames::new(cols, rows, seed)),
     }
 }

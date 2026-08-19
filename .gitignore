@@ -1,3 +1,7 @@
 /target
 *.log
 /target-portable
+
+# Preview frames from `cargo run --example wizardtorch_preview`.
+wt-*.ppm
+wt-*.png
