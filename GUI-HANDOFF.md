@@ -253,3 +253,104 @@ skull merely being drawn second.
 
 Neither the TUI nor the GUI has UI for layers — the control command is the only
 way in today. The GUI's detail pane is where it should surface (step 3).
+
+## Update 2026-08-19 — the GUI is now the default, and there is a beta package
+
+### Launching
+
+`panefx` (bare) opens the **GUI**. It used to open the TUI, which meant the
+GUI was only reachable by knowing its filename.
+
+| command | opens |
+|---|---|
+| `panefx` | the GUI |
+| `panefx --tui` / `-t` | the TUI — **the only one that works over SSH** |
+| `panefx --gui` / `-g` | the GUI, explicitly |
+| `panefx --daemon` / `-d` | the daemon (unchanged; GlazeWM's autostart uses this) |
+
+The tray icon: left click opens the GUI, and the right-click menu lists
+"Open panefx" then "Open panefx TUI (terminal)".
+
+### Single instance
+
+`panefx-gui` guards ITSELF at startup (`desktop::focus_existing_gui`) rather
+than the guard living only in the launcher — it is also started from the tray,
+from shortcuts, and directly. Matching is by owning **process name**, not
+window title or class: the window is undecorated so its caption is chrome we
+draw, and eframe's class is generic.
+
+Why it matters: two GUIs both writing `config.toml` loses settings silently —
+the second to save wins and the first never knows.
+
+### GUI preferences — `src/gui_prefs.rs`
+
+Theme, tab and selected monitor persist to
+`%USERPROFILE%\.config\panefx\gui.toml`.
+
+**Deliberately NOT in `config.toml`.** That file is the daemon's state and the
+daemon rewrites it in full on every save; a GUI preference stored there would
+be wiped. A test pins that the two paths differ.
+
+`App::remember()` is the single writer, so adding a preference cannot leave one
+of three call sites forgetting to record it.
+
+### The bevel convention
+
+**Raised when idle, pushed in when selected.** The tab strip had this
+backwards while the monitor buttons had it right, so two halves of one window
+disagreed. Both now call `win98::toggle_bevel` / `toggle_face`, defined once
+and tested.
+
+### A test that was passing while the thing was broken
+
+`cli_tests::mode_of` was a hand-copied mirror of `parse_args`. When the default
+changed from TUI to GUI it kept asserting the old answer and kept passing,
+because it was only ever testing itself. It now calls the real `mode_for`, and
+a deliberate regression was confirmed to turn it red.
+
+Worth remembering as a shape: a test that re-implements the logic it tests
+cannot fail for the right reason.
+
+### The beta package — `dist/`
+
+`dist/` holds the tester-facing pieces; the zip is assembled from them:
+
+* **`Setup-panefx.ps1`** — checks Windows version, GlazeWM (required for pane
+  effects, not for wallpaper), Alacritty (optional) and the font, installs what
+  is missing, puts the binaries on PATH and starts the daemon. `-CheckOnly`
+  reports without changing anything; `-Yes` skips the prompts.
+* **`panefx-report.ps1`** — what testers send back. Processes, binary hashes,
+  GPU, **display modes** (resolution / refresh / rotation), per-monitor
+  geometry with the `consistent` flag, a sampled present rate, the daemon log,
+  and the config. Writes one file to the Desktop and sends nothing anywhere.
+* **`README-BETA.txt`**
+
+**The font check is the subtle one.** The GUI embeds BigBlueTerm437, but the
+**daemon asks GDI for it by name**. GDI does not fail on a missing font — it
+substitutes Arial and returns success, so every effect renders in the wrong
+typeface with no error anywhere. `GetTextFaceW` on a DC with the font selected
+is the only call that reports the truth. Verified both ways: a bogus font name
+resolves to "Arial", the real one to itself.
+
+### Building for distribution — NOT the normal build
+
+```powershell
+$env:RUSTFLAGS = "-C target-cpu=x86-64-v2"
+$env:CARGO_TARGET_DIR = "target-portable"
+cargo +nightly-x86_64-pc-windows-gnu build --release
+```
+
+The default `.cargo/config.toml` sets `target-cpu=native`, which on pHub means
+**AVX-512**. Measured, not assumed: the native build contains 728 AVX-512
+instructions (`vmovdqu64`, `vextracti32x4`), the portable build zero. A native
+binary dies on another CPU with `STATUS_ILLEGAL_INSTRUCTION` and no message.
+
+Also note pHub has **no MSVC at all** — see the memory note
+`phub-has-no-msvc-rust-is-gnu`. Builds need `+nightly-x86_64-pc-windows-gnu`
+and the WinLibs mingw64 `bin` on PATH.
+
+### Still open
+
+* **Live previews** (step 4 of the original plan) — the only unfinished item.
+* Params are stored per (monitor, effect), not per layer: two layers running
+  the same effect on one monitor share their knobs.
