@@ -228,6 +228,8 @@ pub const EFFECTS: &[&str] = &[
     "galaxy",
     // Stored frame sequences, played rather than computed -- see `frameplay`.
     "fishloop",
+    // The michael.slop mascot, spinning ghostty-style.
+    "skullspin",
 ];
 
 /// Construct an effect by name. Unknown names fall back to the first entry in
@@ -282,6 +284,11 @@ pub fn build(
             );
             f.set_frame_ms(cfg.frame_time().as_millis() as u64);
             Box::new(f)
+        }
+        "skullspin" => {
+            let mut s = crate::skullspin::SkullSpin::new(cols, rows);
+            s.set_frame_ms(cfg.frame_time().as_millis() as u64);
+            Box::new(s)
         }
         "plasma" => {
             let mut p = crate::plasma::Plasma::new(cols, rows, cfg.chars_override.as_deref());

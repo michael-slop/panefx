@@ -35,6 +35,8 @@ pub mod fishloop_art;
 pub mod frameplay;
 pub mod plasma;
 pub mod spin3d;
+pub mod skull_art;
+pub mod skullspin;
 pub mod starfield;
 pub mod tunnel;
 pub mod waves;
