@@ -230,6 +230,9 @@ pub const EFFECTS: &[&str] = &[
     "fishloop",
     // The michael.slop mascot, spinning ghostty-style.
     "skullspin",
+    // The warlock: a hooded skeleton in sunglasses. Rocks rather than spins --
+    // it faces right, so a full turn would show a back the sprite lacks.
+    "warlockspin",
 ];
 
 /// Construct an effect by name. Unknown names fall back to the first entry in
@@ -289,6 +292,11 @@ pub fn build(
             let mut s = crate::skullspin::SkullSpin::new(cols, rows);
             s.set_frame_ms(cfg.frame_time().as_millis() as u64);
             Box::new(s)
+        }
+        "warlockspin" => {
+            let mut w = crate::warlockspin::WarlockSpin::new(cols, rows);
+            w.set_frame_ms(cfg.frame_time().as_millis() as u64);
+            Box::new(w)
         }
         "plasma" => {
             let mut p = crate::plasma::Plasma::new(cols, rows, cfg.chars_override.as_deref());

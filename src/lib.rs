@@ -43,6 +43,8 @@ pub mod waves;
 pub mod gui_prefs;
 pub mod setup;
 pub mod theme_gen;
+pub mod warlock_art;
+pub mod warlockspin;
 pub mod win98;
 pub mod wizardtorch;
 pub mod raalien_art;
