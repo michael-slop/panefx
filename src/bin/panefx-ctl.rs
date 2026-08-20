@@ -358,8 +358,11 @@ impl App {
             key: "opacity",
             label: "bg opacity %",
             value: ci("opacity"),
-            min: 10,
-            max: 100,
+            // The daemon's own floor, not a guess. It REJECTS anything below
+            // it rather than clamping, so a row that went lower would move and
+            // change nothing.
+            min: panefx::opacity::MIN_PERCENT as i64,
+            max: panefx::opacity::MAX_PERCENT as i64,
         });
         rows.push(Row::Config {
             key: "cell_w",

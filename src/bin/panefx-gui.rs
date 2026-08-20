@@ -1216,7 +1216,13 @@ impl App {
         const ROWS: [(&str, &str, i64, i64, &str); 11] = [
             ("fps", "frame rate", 1, 120, "how often panefx redraws. The wallpaper cannot exceed this."),
             ("wallpaper_fps", "wallpaper fps", 1, 120, "the desktop layer's own rate, capped by the frame rate above."),
-            ("opacity", "bg opacity %", 10, 100, "background of the windows panefx draws behind. Text stays solid."),
+            // Range from the DAEMON's own constants, not a guess. It rejects
+            // anything below the floor rather than clamping, so a slider that
+            // went lower would move and change nothing -- which is exactly how
+            // this looked "locked at 35%".
+            ("opacity", "bg opacity %", panefx::opacity::MIN_PERCENT as i64,
+             panefx::opacity::MAX_PERCENT as i64,
+             "background of the windows panefx draws behind. Text stays solid. \n              Below the floor, DWM re-composites continuously and the display tears."),
             ("cell_w", "cell width", 1, 64, "the character cell. Effects that want their own size are overridden by this."),
             ("cell_h", "cell height", 1, 64, ""),
             ("pad_x", "pad x", 0, 100, ""),

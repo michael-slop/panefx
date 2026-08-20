@@ -1033,13 +1033,30 @@ impl Config {
                 }
                 _ => false,
             },
-            "opacity" => matches!(as_i64(), Some(n)
-                if n >= crate::opacity::MIN_PERCENT as i64
-                    && n <= crate::opacity::MAX_PERCENT as i64)
-            .then(|| {
-                self.opacity = as_i64().unwrap() as u8;
-            })
-            .is_some(),
+            // Clamped, and SAID OUT LOUD when it is.
+            //
+            // This used to reject an out-of-range value silently: the setting
+            // did not change and nothing anywhere explained why. Dragging the
+            // slider below the floor moved it and did nothing, which reads as
+            // "opacity is locked". The floor is real (see `opacity::MIN_PERCENT`
+            // -- below it DWM re-composites continuously and the display
+            // tears), so the answer is to honour the intent at the nearest
+            // legal value and say so, not to ignore the request.
+            "opacity" => match as_i64() {
+                Some(n) => {
+                    let lo = crate::opacity::MIN_PERCENT as i64;
+                    let hi = crate::opacity::MAX_PERCENT as i64;
+                    let clamped = n.clamp(lo, hi);
+                    if clamped != n {
+                        crate::log_warn!(
+                            "[panefx] opacity {n}% is outside {lo}-{hi}%; using {clamped}% -- below the floor the display tears"
+                        );
+                    }
+                    self.opacity = clamped as u8;
+                    true
+                }
+                None => false,
+            },
             // Accepts a bool, "true"/"false", or 0/1 -- the TUI sends it as an
             // int because it is rendered as an ordinary numeric row.
             "pane_off" => match v
@@ -1108,6 +1125,36 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    /// An out-of-range opacity must be CLAMPED and applied, never dropped.
+    ///
+    /// The bug: `set` rejected anything below the floor and returned false, so
+    /// the value silently stayed where it was. Every UI offered 10..100 while
+    /// the daemon accepted 35..100, so dragging the slider below 35 moved it
+    /// and changed nothing -- which reads as "opacity is locked at 35%".
+    #[test]
+    fn a_too_low_opacity_is_clamped_to_the_floor_not_ignored() {
+        let mut c = Config::default();
+        assert!(
+            c.set_field("opacity", &serde_json::json!(10)),
+            "a too-low opacity should be accepted and clamped, not refused"
+        );
+        assert_eq!(c.opacity, crate::opacity::MIN_PERCENT);
+    }
+
+    #[test]
+    fn a_too_high_opacity_is_clamped_to_the_ceiling() {
+        let mut c = Config::default();
+        assert!(c.set_field("opacity", &serde_json::json!(250)));
+        assert_eq!(c.opacity, crate::opacity::MAX_PERCENT);
+    }
+
+    #[test]
+    fn an_in_range_opacity_is_applied_exactly() {
+        let mut c = Config::default();
+        assert!(c.set_field("opacity", &serde_json::json!(70)));
+        assert_eq!(c.opacity, 70);
+    }
+
     use super::*;
 
     #[test]
@@ -1256,16 +1303,24 @@ mod tests {
         // 0% is not merely dark — Microsoft's docs note a fully transparent
         // window is also UNFOCUSABLE, so the user could not click it back.
         //
-        // `set_field` is the INTERACTIVE path (the TUI slider) and still
-        // rejects rather than clamps: a key that silently snaps to a different
-        // number fights the person holding it down. The file and env paths
-        // clamp instead — see `an_out_of_range_opacity_in_toml_is_clamped`.
+        // `set_field` used to REJECT an out-of-range opacity outright, on the
+        // reasoning that a key silently snapping to a different number fights
+        // the person holding it down. Sound in itself -- but it assumed no UI
+        // would ever OFFER a value the daemon would not take, and both of them
+        // did: the GUI slider and the TUI row both ran 10..100 against a floor
+        // of 35. Dragging below the floor moved the control and changed
+        // nothing, with no message anywhere. Reported as "opacity is locked at
+        // 35%".
+        //
+        // Both UIs now take their range from `opacity::MIN_PERCENT`, so the
+        // holding-a-key case cannot reach the floor from below at all. What is
+        // left is a caller asking for something out of range, and for that a
+        // clamp that LOGS beats a silent refusal.
         let mut c = Config::default();
-        let before = c.opacity;
-        assert!(!c.set_field("opacity", &serde_json::json!(0)));
-        assert!(!c.set_field("opacity", &serde_json::json!(5)));
-        assert!(!c.set_field("opacity", &serde_json::json!(101)));
-        assert_eq!(c.opacity, before, "a rejected value must not mutate");
+        assert!(c.set_field("opacity", &serde_json::json!(0)));
+        assert_eq!(c.opacity, crate::opacity::MIN_PERCENT);
+        assert!(c.set_field("opacity", &serde_json::json!(101)));
+        assert_eq!(c.opacity, crate::opacity::MAX_PERCENT);
         assert!(c.set_field("opacity", &serde_json::json!(crate::opacity::MIN_PERCENT)));
         assert!(c.set_field("opacity", &serde_json::json!(crate::opacity::MAX_PERCENT)));
     }
