@@ -1,10 +1,11 @@
-//! Render a strip of `skullspin` frames, so the spin, wink and jump can be
+//! Render a strip of `skullspin` frames, so the spin and the jump can be
 //! LOOKED at rather than assumed from a passing test.
 //!
 //! `cargo run --release --example skull_frames` writes `skull-strip.ppm`: a row
-//! of frames sampled across a few seconds. Frames are chosen to land on a wink
-//! and a jump rather than at fixed intervals, because on a fixed interval an
-//! irregular event is exactly what you miss.
+//! of frames sampled across a few seconds. Frames are chosen to land on the
+//! jump rather than at fixed intervals, because on a fixed interval an
+//! irregular event is exactly what you miss. (This is also how the wink's
+//! removal was confirmed by eye rather than by a green test.)
 
 use panefx::animation::AsciiAnimation;
 use panefx::skullspin::{sequence, Act, SkullSpin};
@@ -19,14 +20,10 @@ fn main() {
     // deliberately irregular, which is the whole point of it.
     let mut want: Vec<f32> = vec![0.0, 0.4];
     let mut t = 0.0f32;
-    let (mut got_wink, mut got_jump) = (false, false);
-    while t < 90.0 && !(got_wink && got_jump) {
+    let mut got_jump = false;
+    while t < 90.0 && !got_jump {
         let (act, phase, _) = sequence(t, 4.0, 0x5EED);
         match act {
-            Act::Wink if !got_wink && phase > 0.4 && phase < 0.6 => {
-                want.push(t);
-                got_wink = true;
-            }
             Act::Jump if !got_jump && phase > 0.1 => {
                 // The whole arc: crouch, rise, peak, fall, land.
                 for d in [-0.10f32, 0.0, 0.16, 0.30, 0.46] {
@@ -39,10 +36,7 @@ fn main() {
         t += step_ms as f32 / 1000.0;
     }
     want.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    eprintln!(
-        "wink captured: {got_wink}   jump captured: {got_jump}   frames: {}",
-        want.len()
-    );
+    eprintln!("jump captured: {got_jump}   frames: {}", want.len());
 
     let n = want.len();
     let (iw, ih) = (cols * cw * n, rows * ch);

@@ -1,4 +1,4 @@
-//! The michael.slop skull, spinning ghostty-style — and it winks, and it jumps.
+//! The michael.slop skull, spinning ghostty-style — and it jumps.
 //!
 //! A port of `site/static/app.js:initSkullSpin`, which is the reference: the
 //! site and this must show the same face turning the same way, so the crop, the
@@ -16,16 +16,19 @@
 //! infinite and the skull vanishes for a frame; clamped, it thins to a sliver
 //! and turns through, which is what the eye expects.
 //!
-//! # The wink and the jump
+//! # The jump
 //!
-//! Both are what Michael asked for on top of the site's version, and both are
-//! deliberately IRREGULAR. A skull that winks on a strict four-second beat
-//! reads as a loading spinner; one whose timing you cannot predict reads as
-//! something alive. So each is driven by a hash of its own occurrence number —
+//! What Michael asked for on top of the site's version, and deliberately
+//! IRREGULAR. A skull that acts on a strict four-second beat reads as a
+//! loading spinner; one whose timing you cannot predict reads as something
+//! alive. So it is driven by a hash of its own occurrence number —
 //! deterministic (no RNG state, same on every machine) but unpredictable to a
 //! viewer.
 //!
-//! The wink closes ONE socket, chosen per occurrence, by filling it with bone.
+//! A wink lived here too until 2026-08-20. It was removed on Michael's call,
+//! and it had never actually worked: it filled sprite rows 8..=12 while the
+//! eye sockets sit at rows 11..=14, so it painted bone across the forehead
+//! and mostly missed the eyes.
 //! The jump is a squash-and-stretch arc: the skull compresses before it leaves,
 //! stretches through the air, and compresses again on landing. Without the
 //! squash it is a picture being translated upward; with it, it has weight.
@@ -78,7 +81,7 @@ fn outline_shade(b: u8) -> Option<(char, f32)> {
 
 /// Deterministic hash of one integer to [0,1).
 ///
-/// Used to jitter the wink and jump timing. A hash rather than an RNG so the
+/// Used to jitter the jump timing. A hash rather than an RNG so the
 /// animation is identical on every machine and across restarts — a spinner that
 /// desyncs between two monitors showing the same effect looks broken.
 fn hash01(n: u64) -> f32 {
@@ -119,12 +122,11 @@ pub struct SkullSpin {
 /// What the skull is doing right now.
 ///
 /// **A sequence, not three overlapping clocks.** The first version ran spin,
-/// wink and jump on independent schedules, so the skull could wink mid-leap or
-/// blink while edge-on -- and a wink is unreadable on a face turned away, while
+/// acts on independent schedules, so the skull could act mid-leap or
 /// a jump that starts mid-spin reads as a glitch rather than a hop.
 ///
 /// So it takes turns: spin, settle, do ONE thing facing the viewer, spin again.
-/// The face is square-on for every wink and every jump, which is the only time
+/// The face is square-on for every jump, which is the only time
 /// either is worth watching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Act {
@@ -132,16 +134,13 @@ pub enum Act {
     Spin,
     /// Come to rest facing the viewer, before acting.
     Settle,
-    Wink,
     Jump,
 }
 
 /// One step of the sequence: what to do, and for how long (seconds).
 ///
-/// Durations are properties of the ACTION, not settings: a wink that lasts a
-/// second looks like the skull fell asleep, and a jump slower than about
+/// Durations are properties of the ACTION, not settings: a jump slower than about
 /// three-quarters of a second stops reading as ballistic.
-const WINK_DUR: f32 = 0.34;
 const JUMP_DUR: f32 = 0.72;
 const SETTLE_DUR: f32 = 0.22;
 
@@ -150,7 +149,7 @@ const SETTLE_DUR: f32 = 0.22;
 /// Returns `(act, phase, elapsed_spin)` -- `phase` runs 0..1 through the
 /// current act, and `elapsed_spin` is the total time spent spinning so far,
 /// which is what `theta` is derived from. Deriving the angle from spin time
-/// rather than wall time is what makes the skull HOLD its angle while it winks
+/// rather than wall time is what makes the skull HOLD its angle while it acts
 /// instead of drifting through the pause.
 ///
 /// A free function so the sequence is testable without a grid: "does it ever
@@ -179,27 +178,17 @@ pub fn sequence(t: f32, every: f32, seed: u64) -> (Act, f32, f32) {
         }
         clock += SETTLE_DUR;
 
-        // Which action, chosen per occurrence. Jump slightly rarer than wink:
-        // it moves the whole skull, so it reads as the bigger event.
-        let jumping = hash01(k ^ seed ^ 0x5A5A) < 0.4;
-        let (act, dur) = if jumping {
-            (Act::Jump, JUMP_DUR)
-        } else {
-            (Act::Wink, WINK_DUR)
-        };
+        // The jump is the only act. The wink was removed 2026-08-20 --
+        // Michael's call, and it was broken besides: it filled sprite rows
+        // 8..=12 while the eye sockets live at rows 11..=14, so it painted
+        // bone across the forehead and mostly missed the eyes.
+        let (act, dur) = (Act::Jump, JUMP_DUR);
         if t < clock + dur {
             return (act, (t - clock) / dur, spun);
         }
         clock += dur;
     }
     (Act::Spin, 0.0, spun)
-}
-
-/// Which eye winks on occurrence `k`.
-pub fn wink_eye(t: f32, every: f32, seed: u64) -> bool {
-    // Same walk as `sequence`, but only the occurrence index is wanted.
-    let k = if every > 0.0 { (t / every.max(0.001)) as u64 } else { 0 };
-    hash01(k ^ seed ^ 0xA5A5) < 0.5
 }
 
 /// Vertical lift and squash for a jump at `phase` (0..1).
@@ -328,7 +317,7 @@ impl AsciiAnimation for SkullSpin {
                 let ease = 1.0 - (1.0 - e) * (1.0 - e);
                 theta.cos() + (1.0 - theta.cos()) * ease
             }
-            Act::Wink | Act::Jump => 1.0,
+            Act::Jump => 1.0,
             Act::Spin => theta.cos(),
         };
         // Clamped away from zero: at exactly edge-on the divide below is
@@ -348,11 +337,6 @@ impl AsciiAnimation for SkullSpin {
             Act::Jump => jump_shape(phase, ROWS as f32 * 0.55),
             _ => (0.0, 1.0),
         };
-        let wink = match act {
-            Act::Wink => Some((phase, wink_eye(self.t, every, 0xBEEF))),
-            _ => None,
-        };
-
         // Panel cell -> sprite cell, undoing the layout, the jump and the spin.
         let fx = (col as f32 - ox) / z;
         let fy = (row as f32 - oy + lift * z) / (z * squash);
@@ -365,22 +349,6 @@ impl AsciiAnimation for SkullSpin {
         let u = ((fx / XSCALE as f32 - cx) / c + cx).round() as isize;
 
         let mut v = self.label(u, sy);
-
-        // The wink fills one socket with bone. Both sockets sit in the sprite's
-        // upper half; the eye is chosen per occurrence.
-        if let Some((p, left)) = wink {
-            if is_outline(v) && sy >= 8 && sy <= 12 {
-                let on_left = (u as f32) < cx;
-                if on_left == left {
-                    // Closes and opens rather than snapping shut, so it reads
-                    // as a blink and not a dropped frame.
-                    let closed = (p * std::f32::consts::PI).sin();
-                    if closed > 0.35 {
-                        v = BONE_CELL;
-                    }
-                }
-            }
-        }
 
         match v {
             AIR => None,
@@ -528,15 +496,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_skull_has_two_sockets_to_wink_with() {
-        // The wink fills a socket; if the trace lost them there is nothing to
-        // close and the feature silently does nothing.
-        let dark_in_eye_band: usize = (8..=12)
-            .map(|r| SKULL[r].bytes().filter(|&b| is_outline(b)).count())
-            .sum();
-        assert!(dark_in_eye_band > 20, "only {dark_in_eye_band} dark cells in the eye band");
-    }
+    // A `the_skull_has_two_sockets_to_wink_with` test lived here and is worth
+    // remembering: it asserted rows 8..=12 held dark cells, which is TRUE
+    // (they are outline pixels on the cranium) while the sockets are actually
+    // at rows 11..=14. So it passed for the whole life of a wink that never
+    // hit an eye. A test that measures the wrong rows is how a broken feature
+    // stays green; the feature is gone (2026-08-20) and so is the test.
 
     #[test]
     fn it_draws_a_skull() {
@@ -562,7 +527,7 @@ mod tests {
         // Without this the sockets fill in as the skull turns and the face
         // stops reading as a face -- the one thing the label scheme exists for.
         let mut s = built();
-        s.set_param("wink_every", &ParamValue::Int { v: 0 });
+        s.set_param("act_every", &ParamValue::Int { v: 0 });
         for _ in 0..120 {
             s.step();
             let any_dark = (0..s.rows)
@@ -575,9 +540,9 @@ mod tests {
 
     #[test]
     fn the_acts_never_overlap() {
-        // THE bug this sequencer replaced. Spin, wink and jump used to run on
-        // three independent clocks, so the skull could wink mid-leap or blink
-        // while edge-on -- and a wink is unreadable on a face turned away.
+        // THE bug this sequencer replaced. Spin and the acts used to run on
+        // independent clocks, so the skull could act mid-leap or act while
+        // edge-on -- and an act is unreadable on a face turned away.
         //
         // Now they take turns, so at any instant exactly one act is running.
         // That is what the type guarantees, and this is the check that the
@@ -595,15 +560,15 @@ mod tests {
         }
         // And over 200s every act must actually happen, or the sequence has a
         // branch it never takes.
-        for want in ["Spin", "Settle", "Wink", "Jump"] {
+        for want in ["Spin", "Settle", "Jump"] {
             assert!(seen.contains(want), "{want} never occurred in 200s");
         }
     }
 
     #[test]
-    fn winking_and_jumping_happen_square_on() {
-        // The reason for settling first. A wink on a face turned 80 degrees
-        // away is invisible, and a jump that starts mid-spin reads as a glitch.
+    fn jumping_happens_square_on() {
+        // The reason for settling first: a jump that starts mid-spin reads as
+        // a glitch rather than a leap.
         let mut s = built();
         s.set_param("act_every", &ParamValue::Int { v: 3000 });
         let mut checked = 0;
@@ -611,7 +576,7 @@ mod tests {
             s.step();
             let every = s.act_every_milli as f32 / 1000.0;
             let (act, _, spun) = sequence(s.t, every, 0x5EED);
-            if matches!(act, Act::Wink | Act::Jump) {
+            if matches!(act, Act::Jump) {
                 // `raw` is forced to 1.0 for these acts -- the face is square
                 // on, whatever the spin angle happens to be.
                 let theta = spun * (s.spin_milli as f32 / 1000.0);
