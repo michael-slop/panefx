@@ -355,10 +355,21 @@ and the WinLibs mingw64 `bin` on PATH.
 * Params are stored per (monitor, effect), not per layer: two layers running
   the same effect on one monitor share their knobs.
 
-## OPEN: one Alacritty window shows the pane effect, the other does not
+## SOLVED: one Alacritty window showed the pane effect, the other did not
 
-Reported 2026-08-19. **Not solved.** Paused mid-investigation; this is what is
-established so far, so the next session does not start over.
+Reported 2026-08-19, **fixed the same day** (`row_base` in `render.rs`).
+Kept because the ruled-out list below is exactly why it took a while: every
+obvious suspect was healthy, which is what pointed at the crop.
+
+**The cause.** One simulation is shared by every terminal panel and sized to
+the TALLEST window. Each panel's PIXELS are bottom-aligned so a bottom-anchored
+effect stays rooted at the last text row -- but the ROWS it read started at 0,
+the top of the shared grid. `flames` lives in the last few rows of that grid,
+so a 119-row window reading a 160-row sim never reached the fire.
+
+**What identified it:** switching to `rain`, which fills the whole grid, made
+both windows behave identically. A full-grid effect working while a
+bottom-anchored one failed is a crop, not a panel.
 
 ### Ruled OUT, with evidence
 
