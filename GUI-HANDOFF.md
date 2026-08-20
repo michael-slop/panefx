@@ -397,3 +397,29 @@ simply restart the older one and see whether the effect appears.
 Worth knowing: the config on disk is Michael's own saved state. An earlier
 `revert` restored it exactly, and the greys are not something this session
 introduced.
+
+## OPEN: panefx has DISPLAY4's resolution wrong
+
+Found 2026-08-19 while testing `warlockspin`, and NOT investigated -- noting it
+so it is not rediscovered from scratch.
+
+panefx reports DISPLAY4 as **1920x1080**. Windows
+(`System.Windows.Forms.Screen.AllScreens`) reports it as **1280x720**. The
+monitor really is 1280x720.
+
+The effect is that anything drawn on DISPLAY4 is scaled for a panel 1.5x larger
+than the screen, so it overflows the right and bottom edges. It looked at first
+like a bug in the new effect's layout; it is not -- the layout arithmetic fits
+in every case, it is being handed the wrong panel size.
+
+**`consistent` does NOT catch this**, which is worth knowing: monitor, panel,
+DIB and surface all agree with each other at 1920x1080. They are consistently
+wrong. The check only compares panefx's numbers to each other, never to what
+Windows says the display is.
+
+Not a stale cache -- it survives a full daemon restart.
+
+Start at `desktop::enumerate_monitors` and compare what it returns for
+DISPLAY4 against `EnumDisplaySettingsW`. `REPORT.exe` prints both views (the
+daemon's enumeration and the per-display mode query), so a report from a
+machine showing this has the evidence side by side.
