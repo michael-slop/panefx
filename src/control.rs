@@ -146,6 +146,17 @@ pub struct Snapshot {
     #[serde(default)]
     pub panes: Vec<PaneView>,
 
+    /// The SHARED pane simulation's grid, in cells.
+    ///
+    /// One simulation is shared by every terminal panel; each blits its own
+    /// sub-rect and clamps its draw to these dimensions. So a panel wanting
+    /// more cells than the sim has draws a truncated frame, and one wanting
+    /// none draws nothing -- both invisible from outside until now.
+    #[serde(default)]
+    pub sim_cols: usize,
+    #[serde(default)]
+    pub sim_rows: usize,
+
     /// The desktop's own params, for every effect any monitor is running.
     ///
     /// Keyed by effect name because monitors can differ. The daemon does not

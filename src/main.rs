@@ -690,6 +690,8 @@ fn handle_command(
         effect: sim.name().to_string(),
         effects: animation::EFFECTS.iter().map(|s| s.to_string()).collect(),
         params: sim.params(),
+        sim_cols: sim.dimensions().0,
+        sim_rows: sim.dimensions().1,
         config: ConfigView::of(cfg),
         panes: panefx::panel::PANES
             .lock()

@@ -185,6 +185,25 @@ pub fn paint_cached(hdc: HDC, hwnd: HWND) {
     }
 }
 
+/// Which simulation row a panel's row 0 maps to.
+///
+/// ONE simulation is shared by every terminal panel and is sized to the
+/// TALLEST window. A shorter panel draws fewer rows, and the pixels it draws
+/// are bottom-aligned -- so the rows it reads must be the BOTTOM of the shared
+/// grid too.
+///
+/// Reading from row 0 instead was a real bug, and a silent one: `flames` lives
+/// in the last few rows of its grid, so a 119-row window reading a 160-row
+/// sim's rows 0..118 never reached the fire. One terminal showed the effect and
+/// the other was blank, while every diagnostic said both panes were healthy,
+/// correctly sized and correctly z-pinned.
+///
+/// A no-op whenever the sim is not taller than the panel -- which is every
+/// wallpaper monitor, since those build a sim sized to themselves.
+pub fn row_base(anim_rows: usize, rows: i32) -> i32 {
+    (anim_rows as i32 - rows).max(0)
+}
+
 /// Draw an animation into `hwnd`, clipped to `width` x `height` pixels.
 ///
 /// Works against the `AsciiAnimation` trait, not a concrete effect, so adding
@@ -442,7 +461,29 @@ pub fn draw_layers(
         row_cells.clear();
         row_cells.resize(ncols, None);
 
+        // Read the BOTTOM `rows` of the simulation, not the top.
+        //
+        // ONE simulation is shared by every panel and is sized to the TALLEST
+        // window. A shorter window draws fewer rows -- and taking them from
+        // row 0 means it reads the TOP of that grid while its own pixels are
+        // bottom-aligned (see `y_offset` above).
+        //
+        // For a bottom-anchored effect that is fatal, and silently so. `flames`
+        // lives in the last few rows of the grid (there is a test called
+        // `stays_a_bottom_band_on_a_tall_panel`), so with a 160-row sim a
+        // 119-row window read rows 0..118 and never reached the fire at all:
+        // one terminal showed the effect and the other was blank, with every
+        // pane reporting healthy, correctly sized and correctly z-pinned.
+        //
+        // Measured: with `flames`, the tall window's band had 141 distinct
+        // colours and the short window's 43 (i.e. nothing). Switching to
+        // `rain`, which fills the whole grid, brought them to 48 and 43 --
+        // which is what identified the crop rather than the panel as the
+        // fault.
+        let row_base = row_base(anim_rows, rows);
+
         for row in 0..rows {
+            let sim_row = (row_base + row) as usize;
             // --- read the row once, collecting the distinct colours ---
             buckets.clear();
             let mut any = false;
@@ -452,7 +493,7 @@ pub fn draw_layers(
                 let k = layers
                     .iter()
                     .rev()
-                    .find_map(|l| l.cell_at(col, row as usize))
+                    .find_map(|l| l.cell_at(col, sim_row))
                     .map(|(ch, c)| (ch, c.colorref()));
                 row_cells[col] = k;
                 if let Some((_, c)) = k {
@@ -589,6 +630,42 @@ pub fn draw_layers(
 
 #[cfg(test)]
 mod tests {
+    /// A SHORTER pane must read the BOTTOM of the shared simulation.
+    ///
+    /// The bug this pins: one simulation is shared by every terminal panel and
+    /// sized to the tallest window. Reading from row 0 meant a shorter window
+    /// took the TOP of that grid while its pixels were bottom-aligned -- so a
+    /// bottom-anchored effect like `flames` (see
+    /// `stays_a_bottom_band_on_a_tall_panel`) never appeared in it at all. Two
+    /// Alacritty windows of different heights: the tall one had the fire, the
+    /// short one was blank, and every pane diagnostic said both were fine.
+    #[test]
+    fn a_shorter_pane_reads_the_bottom_of_the_shared_sim() {
+        // The real numbers off the machine this was found on.
+        assert_eq!(row_base(160, 119), 41, "119 rows of a 160-row sim = 41..159");
+        // The tall window, whose height set the sim size, is unaffected.
+        assert_eq!(row_base(160, 160), 0);
+    }
+
+    /// The wallpaper must not shift at all.
+    ///
+    /// Each monitor builds a simulation sized to itself, so the base is always
+    /// zero there. If this ever became non-zero the desktop effects would crop
+    /// their own tops off.
+    #[test]
+    fn a_sim_sized_to_its_panel_is_never_shifted() {
+        for n in [1usize, 24, 72, 160, 400] {
+            assert_eq!(row_base(n, n as i32), 0, "sim of {n} rows shifted");
+        }
+    }
+
+    /// A panel asking for more rows than the sim has must not read backwards.
+    #[test]
+    fn wanting_more_rows_than_the_sim_has_does_not_go_negative() {
+        assert_eq!(row_base(72, 80), 0);
+        assert_eq!(row_base(0, 10), 0);
+    }
+
     use super::*;
 
     /// The desktop damage set must round-trip and DRAIN.
