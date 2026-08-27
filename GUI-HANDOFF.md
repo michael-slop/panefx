@@ -493,22 +493,72 @@ wallpaper_fps 21 -> 10 changes NOTHING, and the first attempt at this concluded
 the frame rate did not matter. Read `wallpaper_fps_effective`, or sample
 `presents` over a few seconds, before trusting any before/after around it.
 
+### CORRECTION: it is the per-frame CLEAR, not the upload
+
+The section above concluded the CPU->GPU upload was the bottleneck. **That was
+wrong**, and the correction is worth keeping because the wrong answer was
+plausible and had arithmetic behind it.
+
+`present_us` is measured inside `present()` and the snapshot already carries
+it. Reading it settles the question:
+
+| | |
+|---|---|
+| ALL four monitors' `present()` | **1.7% of one core** |
+| total daemon | 28-30% |
+
+So the entire Map + memcpy + CopyResource + Present path is under 2%. A partial
+upload (dirty rectangles) would have optimised almost nothing. That work was
+written and then reverted.
+
+Three more measurements locate the real cost:
+
+| test | result | rules out |
+|---|---|---|
+| 5x fewer cells, one monitor | 10.4% -> 10.9% (no change) | per-CELL work |
+| `flames` vs `rain`, same grid | 31.0% vs 16.1% | draw calls -- `flames` has 57/frame, `rain` 305 |
+| halve present rate | halves CPU | anything not per-FRAME |
+
+Per-cell work does not matter. Draw calls do not matter (the effect with the
+FEWEST costs the MOST). Only the frame count matters.
+
+What is per-frame, per-monitor and independent of everything else:
+**`FillRect` over the whole panel** (`render.rs`, before the glyph loop), plus
+the full-panel DIB the present then reads. For DISPLAY1 that is 14.7 MB cleared
+every frame; across four monitors, **~390 MB/s of clearing** at 10fps.
+
+### An optimisation that already exists but never fires
+
+`tick` skips a surface whose sim reports `changed() == false` -- no draw, no
+clear, no present. Measured over 200 frames at 10fps, **every effect reports
+changed 100% of the time**: rain, waves, flames, plasma, starfield, skullspin.
+The skip is dead code in practice.
+
 ### What would actually help, in order
 
-1. **Dirty rectangles.** `Present1` with `DXGI_PRESENT_PARAMETERS` uploads only
-   changed regions. Most effects change a fraction of the screen per frame --
-   `skullspin` touches one small area of a 1920x1080 panel. This is the big one
-   and it attacks the measured bottleneck directly.
-2. **Skip the upload when the frame is identical.** The dirty-tracking already
-   exists (`SimPool::dirty` + `force_redraw`) and `tick` honours it -- but a
-   continuously animating effect like `waves` reports changed() every frame, so
-   it never fires. A cheap content hash of the drawn DIB would catch the cases
-   where an effect is animating but the visible output is unchanged.
-3. **Per-monitor frame rates.** DISPLAY1 costs 3x DISPLAY3 purely for being
-   bigger. A tall portrait secondary rarely needs the same rate as the primary.
-4. **Idle throttling.** Drop to a few fps when the machine is idle, on battery,
-   or when a monitor is fully occluded. The occlusion check already exists; the
-   idle and power ones do not.
+Ordered by measured headroom, now that the bottleneck is known:
+
+1. **Do not clear what will be overwritten.** The full-panel `FillRect` is the
+   single biggest fixed cost. Most effects paint a background colour into every
+   cell anyway, so the clear is redundant for them -- it exists for the cells an
+   effect leaves empty. Clearing only the rows/spans that end up empty, or
+   skipping it entirely for effects that guarantee full coverage, attacks the
+   measured bottleneck directly. Needs a trait answer like
+   `fills_every_cell() -> bool`.
+2. **Per-monitor frame rates.** DISPLAY1 costs 3x DISPLAY3 purely for being
+   bigger (12.0% vs 3.9% alone), and the cost is per-frame -- so halving just
+   that one screen's rate is the cheapest real win available. A tall portrait
+   secondary rarely needs the primary's cadence.
+3. **Make the existing skip fire.** `changed()` is 100% for every effect, so
+   the skip never runs. Either hash the drawn output (catching effects that
+   animate without visibly changing) or let effects report honestly -- several
+   have their own internal clocks slower than the frame rate.
+4. **Idle and power throttling.** Drop to a few fps when the machine is idle,
+   on battery, or when a monitor is occluded. The occlusion check exists; idle
+   and power do not.
+
+**Not worth doing:** dirty-rectangle uploads (`Present1`). The whole present
+path is 1.7%; there is nothing there to win.
 
 Cheap wins available TODAY with no code change: lower `wallpaper_fps` (it is
 linear), or raise `detail` (weakly helpful). Turning the wallpaper off entirely
