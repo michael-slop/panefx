@@ -690,6 +690,16 @@ fn handle_command(
         effect: sim.name().to_string(),
         effects: animation::EFFECTS.iter().map(|s| s.to_string()).collect(),
         params: sim.params(),
+        render_us: {
+            use std::sync::atomic::Ordering::Relaxed;
+            let mut m = std::collections::BTreeMap::new();
+            m.insert("clear".into(), panefx::render::CLEAR_US.load(Relaxed));
+            m.insert("cells".into(), panefx::render::CELLS_US.load(Relaxed));
+            m.insert("glyphs".into(), panefx::render::GLYPH_US.load(Relaxed));
+            m.insert("flush".into(), panefx::render::FLUSH_US.load(Relaxed));
+            m.insert("frames".into(), panefx::render::RENDER_FRAMES.load(Relaxed));
+            m
+        },
         sim_cols: sim.dimensions().0,
         sim_rows: sim.dimensions().1,
         config: ConfigView::of(cfg),

@@ -152,6 +152,13 @@ pub struct Snapshot {
     /// sub-rect and clamps its draw to these dimensions. So a panel wanting
     /// more cells than the sim has draws a truncated frame, and one wanting
     /// none draws nothing -- both invisible from outside until now.
+    /// Cumulative microseconds per render phase, and the frame count to divide
+    /// them by. Temporary instrumentation: three hypotheses about where the
+    /// CPU goes were each measured and each wrong, and process-CPU sampling
+    /// stopped being reproducible, so the daemon times its own phases.
+    #[serde(default)]
+    pub render_us: std::collections::BTreeMap<String, u64>,
+
     #[serde(default)]
     pub sim_cols: usize,
     #[serde(default)]

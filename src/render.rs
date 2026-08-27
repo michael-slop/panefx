@@ -185,6 +185,49 @@ pub fn paint_cached(hdc: HDC, hwnd: HWND) {
     }
 }
 
+/// Font quality for the glyph runs, switchable at runtime for measurement.
+///
+/// `PANEFX_FONT_QUALITY=nonantialiased` selects the cheap path. Left as an env
+/// var rather than a config key while it is being evaluated: it changes how
+/// every effect LOOKS, and that is Michael's call to make after seeing both.
+fn font_quality() -> u32 {
+    use windows::Win32::Graphics::Gdi::NONANTIALIASED_QUALITY;
+    match std::env::var("PANEFX_FONT_QUALITY").ok().as_deref() {
+        Some("nonantialiased") => NONANTIALIASED_QUALITY.0 as u32,
+        _ => CLEARTYPE_QUALITY.0 as u32,
+    }
+}
+
+/// Cumulative microseconds in each phase of a wallpaper frame.
+///
+/// Three hypotheses about panefx's CPU were measured and all three were wrong:
+/// the GPU upload (the whole present path is 1.7% of a core), the per-frame
+/// clear, and the draw calls (the effect with the FEWEST calls costs the MOST).
+/// Inferring from process-CPU deltas then stopped being reproducible -- the
+/// same rain-vs-waves comparison inverted between runs.
+///
+/// So the daemon times its own phases instead. ETW would need elevation this
+/// session does not have, and in-process counters are more precise anyway:
+/// they measure exactly the calls in question rather than sampling around
+/// them.
+///
+/// Read them with `{"cmd":"get"}` and divide by `RENDER_FRAMES`.
+pub static CLEAR_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static CELLS_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static GLYPH_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static FLUSH_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static RENDER_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Add `t`'s elapsed microseconds to `c`. Kept tiny so the instrumentation
+/// cannot itself distort what it measures.
+#[inline]
+fn tick_us(c: &std::sync::atomic::AtomicU64, t: std::time::Instant) {
+    c.fetch_add(
+        t.elapsed().as_micros() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// Which simulation row a panel's row 0 maps to.
 ///
 /// ONE simulation is shared by every terminal panel and is sized to the
@@ -375,7 +418,14 @@ pub fn draw_layers(
                 DEFAULT_CHARSET.0.into(),
                 OUT_TT_PRECIS.0.into(),
                 0,
-                CLEARTYPE_QUALITY.0.into(),
+                // ClearType is a READ-MODIFY-WRITE per glyph: subpixel
+                // antialiasing has to sample the destination to blend against
+                // it. Over a transparent background that is the whole cost of
+                // `ExtTextOutW`, which instrumentation puts at 22.8% of a core
+                // -- 83% of the daemon's total. `NONANTIALIASED` skips the
+                // blend entirely, and on a pixel-art DOS face at 9-15px there
+                // is little for antialiasing to smooth anyway.
+                font_quality(),
                 (DEFAULT_PITCH.0 | FF_DONTCARE.0).into(),
                 PCWSTR(g.face_utf16.as_ptr()),
             );
@@ -406,7 +456,9 @@ pub fn draw_layers(
             right: width,
             bottom: height,
         };
+        let t_clear = std::time::Instant::now();
         FillRect(mem_dc, &full, g.brush);
+        tick_us(&CLEAR_US, t_clear);
 
         // Inset to match Alacritty's own text padding, so the animation's
         // bottom row lands on the terminal's bottom text row rather than
@@ -487,6 +539,7 @@ pub fn draw_layers(
             // --- read the row once, collecting the distinct colours ---
             buckets.clear();
             let mut any = false;
+            let t_cells = std::time::Instant::now();
             for col in 0..ncols {
                 // Top-down: the first layer that answers wins the cell.
                 // `rev()` because `layers[0]` is the BOTTOM.
@@ -503,11 +556,13 @@ pub fn draw_layers(
                     }
                 }
             }
+            tick_us(&CELLS_US, t_cells);
             if !any {
                 continue;
             }
 
             // --- one ExtTextOutW per colour in this row ---
+            let t_glyphs = std::time::Instant::now();
             for &(colour, _) in buckets.iter() {
                 run.clear();
                 dx.clear();
@@ -561,7 +616,9 @@ pub fn draw_layers(
                     Some(dx.as_ptr()),
                 );
             }
+            tick_us(&GLYPH_US, t_glyphs);
         }
+        RENDER_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // --- present ---
         //
@@ -592,7 +649,9 @@ pub fn draw_layers(
         // The BOOL reports whether the batch flushed cleanly. There is nothing
         // useful to do if it does not -- the frame below is the best we have
         // either way -- so it is discarded deliberately rather than ignored.
+        let t_flush = std::time::Instant::now();
         let _ = GdiFlush();
+        tick_us(&FLUSH_US, t_flush);
 
         let bits = g.bits;
         let stride = g.stride;
