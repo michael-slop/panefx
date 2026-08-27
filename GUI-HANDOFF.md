@@ -409,10 +409,15 @@ Worth knowing: the config on disk is Michael's own saved state. An earlier
 `revert` restored it exactly, and the greys are not something this session
 introduced.
 
-## OPEN: panefx has DISPLAY4's resolution wrong
+## NOT A BUG: the DISPLAY4 resolution mismatch
 
-Found 2026-08-19 while testing `warlockspin`, and NOT investigated -- noting it
-so it is not rediscovered from scratch.
+Found 2026-08-19 while testing `warlockspin`; **resolved the same day, and it
+was not a panefx fault.** The monitor really was running at 1280x720 at the
+time and has since been set back to 1920x1080; panefx now agrees with Windows
+exactly. It was reporting the truth about a display that had been changed
+underneath it.
+
+Kept for the one durable lesson below.
 
 panefx reports DISPLAY4 as **1920x1080**. Windows
 (`System.Windows.Forms.Screen.AllScreens`) reports it as **1280x720**. The
@@ -434,3 +439,77 @@ Start at `desktop::enumerate_monitors` and compare what it returns for
 DISPLAY4 against `EnumDisplaySettingsW`. `REPORT.exe` prints both views (the
 daemon's enumeration and the per-display mode query), so a report from a
 machine showing this has the evidence side by side.
+
+## Power and resource use -- measured 2026-08-19
+
+Baseline on pHub, four monitors, `waves` everywhere plus `skullspin` on
+DISPLAY3, `fps 10` / `wallpaper_fps 21` / detail 8:
+
+**28-30% of one core** (1.8% of the 16-core machine), 95 MB working set,
+449 handles.
+
+### Where it goes
+
+Isolated by switching things off and re-measuring, not by reading the code:
+
+| condition | CPU |
+|---|---|
+| baseline | 28-30% |
+| panes off (wallpaper only) | 25.4% |
+| **wallpaper off (panes only)** | **2.5%** |
+| only DISPLAY1 (1440x2560) | 12.0% |
+| only DISPLAY3 (1920x1080) | 3.9% |
+
+The wallpaper is essentially all of it. The panes cost ~3%.
+
+### It is the UPLOAD, not the drawing
+
+Coarsening the cells cuts the glyph count 4x and barely moves the needle:
+
+| detail | cells | CPU |
+|---|---|---|
+| 8 | 10x15 | 31.5% |
+| 5 | 16x25 | 29.1% |
+| 3 | 20x31 | 27.9% |
+
+But the present RATE is almost perfectly linear:
+
+| wallpaper fps | CPU |
+|---|---|
+| 10 | 30.1% |
+| 5 | 16.9% |
+| 2 | 8.7% |
+
+Because `Surface::present` copies the WHOLE panel every frame regardless of
+what changed: `Map` a staging texture, memcpy row by row, `Unmap`,
+`CopyResource` to the back buffer. At four monitors and 10 real fps that is
+**~390 MB/s to the GPU, and about double that counting the staging memcpy**.
+DISPLAY1 alone is 14.75 MB per frame.
+
+### A measurement trap worth remembering
+
+`wallpaper_fps` is capped by the daemon's own `fps`. With `fps 10`, setting
+wallpaper_fps 21 -> 10 changes NOTHING, and the first attempt at this concluded
+the frame rate did not matter. Read `wallpaper_fps_effective`, or sample
+`presents` over a few seconds, before trusting any before/after around it.
+
+### What would actually help, in order
+
+1. **Dirty rectangles.** `Present1` with `DXGI_PRESENT_PARAMETERS` uploads only
+   changed regions. Most effects change a fraction of the screen per frame --
+   `skullspin` touches one small area of a 1920x1080 panel. This is the big one
+   and it attacks the measured bottleneck directly.
+2. **Skip the upload when the frame is identical.** The dirty-tracking already
+   exists (`SimPool::dirty` + `force_redraw`) and `tick` honours it -- but a
+   continuously animating effect like `waves` reports changed() every frame, so
+   it never fires. A cheap content hash of the drawn DIB would catch the cases
+   where an effect is animating but the visible output is unchanged.
+3. **Per-monitor frame rates.** DISPLAY1 costs 3x DISPLAY3 purely for being
+   bigger. A tall portrait secondary rarely needs the same rate as the primary.
+4. **Idle throttling.** Drop to a few fps when the machine is idle, on battery,
+   or when a monitor is fully occluded. The occlusion check already exists; the
+   idle and power ones do not.
+
+Cheap wins available TODAY with no code change: lower `wallpaper_fps` (it is
+linear), or raise `detail` (weakly helpful). Turning the wallpaper off entirely
+takes it to 2.5%.
