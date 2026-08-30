@@ -58,10 +58,19 @@ const T_COOL: i32 = 4;
 /// Green shades for the four bands. Kept bright at the cool end because the
 /// panel is only ever seen through Alacritty at `opacity = 0.6`, which blends
 /// everything back toward the terminal's dark background.
+// THE BOOK'S OWN FOUR, taken from necronomicon.html 2026-08-29.
+//
+// NOT four greens, which is what these were and what made the wallpaper read
+// as a different fire from the one on the book's cover. The cool bands are a
+// TEAL and a PURPLE -- that is where the depth comes from, and an all-green
+// ramp flattens it into one hue at four brightnesses.
+//
+// The book is the source of truth for this palette; panefx, self.net, pub.net
+// and the desktop all render the same fire and must agree on its colours.
 const C_HOT: Rgb = Rgb(0xc8, 0xff, 0xd0);
 const C_WARM: Rgb = Rgb(0x62, 0xe6, 0x70);
-const C_COOL: Rgb = Rgb(0x28, 0x8c, 0x36);
-const C_DIM: Rgb = Rgb(0x1a, 0x4a, 0x20);
+const C_COOL: Rgb = Rgb(0x3d, 0x8f, 0xa8); // teal
+const C_DIM: Rgb = Rgb(0x4a, 0x35, 0x68); // purple
 
 pub const BACKGROUND: Rgb = Rgb(0x1c, 0x1c, 0x1c);
 
