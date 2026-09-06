@@ -235,6 +235,18 @@ Write-Host "installed -> $glzrDir  (panefx, panefx-ctl, panefx-gui)"
 
 # Prove the copies match rather than trusting that Copy-Item did what it said.
 # A stale copy is invisible until you wonder why a change did not take.
+#
+# Guarded, because this block sits BETWEEN stopping the old daemon and starting
+# the new one: anything that throws here leaves panefx installed but NOT
+# RUNNING, which looks like a failed build rather than a skipped check. Seen
+# 2026-09-06 -- Get-FileHash was not on PATH in a non-interactive shell and the
+# install died here with the daemon down and the binaries already correct.
+# A verification step must never be the reason the thing it verifies is stopped.
+if (-not (Get-Command Get-FileHash -ErrorAction SilentlyContinue)) {
+    Write-Warning 'Get-FileHash unavailable; skipping the copy check (install continues)'
+    $skipHashCheck = $true
+}
+if (-not $skipHashCheck) {
 $srcHash = (Get-FileHash $exe).Hash
 foreach ($t in @((Join-Path $binDir 'panefx.exe'), (Join-Path $glzrDir 'panefx.exe'))) {
     if ((Get-FileHash $t).Hash -ne $srcHash) { throw "copy mismatch: $t" }
@@ -252,6 +264,7 @@ foreach ($t in @((Join-Path $binDir 'panefx-gui.exe'), (Join-Path $glzrDir 'pane
     if ((Get-FileHash $t).Hash -ne $guiHash) { throw "copy mismatch: $t" }
 }
 Write-Host 'verified: all five installed copies match the build'
+}
 
 # --daemon is REQUIRED: without it panefx.exe hands off to the control TUI,
 # because typing `panefx` in a terminal should open the TUI. Omit the flag here
