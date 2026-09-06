@@ -846,6 +846,13 @@ fn build_wallpaper_rows(
         min: 1,
         max: 120,
     });
+    rows.push(Row::Config {
+        key: "wallpaper_freeze_at",
+        label: "freeze at %",
+        value: ci("wallpaper_freeze_at"),
+        min: 1,
+        max: 100,
+    });
     let eff = ci("wallpaper_fps_effective");
     if eff > 0 && eff < asked {
         // The wallpaper is ticked from the daemon loop, so `fps` caps it. Say

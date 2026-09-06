@@ -225,35 +225,14 @@ pub fn clear_legacy_layered_styles() {}
 /// window style, and stripping one from an unrelated app would be rude.
 #[cfg(windows)]
 pub fn pid_is_target(pid: u32) -> bool {
-    use windows::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
-        TH32CS_SNAPPROCESS,
-    };
-    if pid == 0 {
-        return false;
+    // One shared walk (see crate::proc_name) instead of a second copy of the
+    // ToolHelp loop that disagreed with desktop.rs about trimming.
+    match crate::proc_name::of(pid) {
+        Some(stem) => crate::ipc::DEFAULT_TARGETS
+            .iter()
+            .any(|t| stem.eq_ignore_ascii_case(t)),
+        None => false,
     }
-    unsafe {
-        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
-            return false;
-        };
-        let mut e = PROCESSENTRY32W {
-            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-            ..Default::default()
-        };
-        let mut ok = Process32FirstW(snap, &mut e).is_ok();
-        while ok {
-            if e.th32ProcessID == pid {
-                let name = String::from_utf16_lossy(&e.szExeFile);
-                let name = name.trim_end_matches('\0').to_lowercase();
-                let stem = name.trim_end_matches(".exe");
-                return crate::ipc::DEFAULT_TARGETS
-                    .iter()
-                    .any(|t| stem.eq_ignore_ascii_case(t));
-            }
-            ok = Process32NextW(snap, &mut e).is_ok();
-        }
-    }
-    false
 }
 
 #[cfg(test)]

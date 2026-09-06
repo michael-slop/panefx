@@ -133,6 +133,23 @@ pub struct Config {
     /// this path draws up to one full-monitor bitmap per screen against the
     /// terminal path's small ones.
     pub wallpaper_fps: u64,
+
+    /// Freeze a monitor's wallpaper once windows cover this percentage of it.
+    ///
+    /// 100 means the old behaviour: freeze only when every pixel is covered.
+    /// That sounds safe and is nearly useless -- under a tiling WM with ANY gap
+    /// configured, tiles never reach the monitor edges, so it never fires and a
+    /// full-monitor simulation runs all day behind a 1px border.
+    ///
+    /// The default leaves real headroom: a wallpaper still visibly showing
+    /// through keeps animating, and one reduced to a sliver stops.
+    pub wallpaper_freeze_at: u32,
+
+    /// Where window geometry comes from: `"auto"`, `"glazewm"` or `"native"`.
+    ///
+    /// `auto` prefers GlazeWM and falls back to Win32, which is what makes the
+    /// window manager optional instead of required. See `window_source.rs`.
+    pub window_source: String,
     /// Effect per monitor, keyed by `DISPLAY<n>` index. An absent entry — or the
     /// literal `"off"` — means no surface at all for that monitor, so Windows'
     /// own wallpaper shows through.
@@ -202,6 +219,13 @@ impl Default for Config {
             wallpaper_monitor_params: Default::default(),
             // Half the terminal rate. The desktop is scenery.
             wallpaper_fps: 5,
+            // 92%: comfortably above a tiled screen's few-pixel gaps, and far
+            // enough below a genuinely half-covered desktop that a visible
+            // wallpaper never freezes.
+            wallpaper_freeze_at: 92,
+            // Auto: keep GlazeWM where it exists, work without it where it
+            // does not. Nobody should have to set this to get either.
+            window_source: "auto".to_string(),
             // EMPTY = wallpapers off. A new feature must not change what the
             // user already sees until they ask for it.
             wallpaper_effects: Default::default(),
@@ -326,6 +350,25 @@ fn env_u64(key: &str) -> Option<u64> {
 }
 
 impl Config {
+    /// The opacity that should actually be written to the terminal right now.
+    ///
+    /// With the backdrops off there is nothing behind the terminal to see, so a
+    /// see-through window just shows the plain desktop through the text. That
+    /// is not what "turn the backdrop off" means -- it means give me an
+    /// ordinary, solid terminal back.
+    ///
+    /// This is deliberately a DERIVED value rather than a write to `opacity`.
+    /// Clobbering the stored number would silently lose the setting: switch the
+    /// backdrops off, switch them back on, and the carefully chosen 80% would
+    /// have become 100% with no way to know what it used to be.
+    pub fn effective_opacity(&self) -> u8 {
+        if self.pane_off {
+            100
+        } else {
+            self.opacity
+        }
+    }
+
     /// Path of the optional TOML config.
     pub fn path() -> Option<std::path::PathBuf> {
         std::env::var("USERPROFILE")
@@ -371,6 +414,16 @@ impl Config {
         }
         if let Some(v) = env_u64("PANEFX_WALLPAPER_FPS").filter(|v| *v > 0 && *v <= 120) {
             cfg.wallpaper_fps = v;
+        }
+        if let Some(v) = env_u64("PANEFX_WALLPAPER_FREEZE_AT").filter(|v| *v >= 1 && *v <= 100) {
+            cfg.wallpaper_freeze_at = v as u32;
+        }
+        if let Ok(v) = std::env::var("PANEFX_WINDOW_SOURCE") {
+            if crate::window_source::Preference::parse(&v).is_some() {
+                cfg.window_source = v.trim().to_lowercase();
+            } else {
+                crate::log_warn!("[panefx] PANEFX_WINDOW_SOURCE '{v}' is not auto/glazewm/native; ignoring");
+            }
         }
         if let Some(v) = env_i32("PANEFX_WALLPAPER_CELL_W").filter(|v| *v > 0) {
             cfg.wallpaper_cell_w = v;
@@ -521,6 +574,15 @@ impl Config {
 
             match k.as_str() {
                 "font" => self.font = v.to_string(),
+                // Validated on the way in. A typo must not silently become
+                // `auto` -- someone who wrote `natve` wants to know.
+                "window_source" => match crate::window_source::Preference::parse(v) {
+                    Some(p) => self.window_source = p.as_str().to_string(),
+                    None => crate::log_warn!(
+                        "[panefx] window_source '{v}' is not auto/glazewm/native; keeping '{}'",
+                        self.window_source
+                    ),
+                },
                 // CLAMPED, not rejected. Every other key here drops an
                 // out-of-range value and keeps the code default, which is right
                 // when the value is nonsense. Opacity is different: the floor
@@ -550,6 +612,13 @@ impl Config {
                     if let Ok(n) = v.parse::<u64>() {
                         if n > 0 && n <= 120 {
                             self.wallpaper_fps = n;
+                        }
+                    }
+                }
+                "wallpaper_freeze_at" => {
+                    if let Ok(n) = v.parse::<u32>() {
+                        if (1..=100).contains(&n) {
+                            self.wallpaper_freeze_at = n;
                         }
                     }
                 }
@@ -672,6 +741,10 @@ impl Config {
         s.push_str("# hand works until the next save, which overwrites the whole file.\n\n");
 
         s.push_str(&format!("font = \"{}\"\n", self.font));
+        s.push_str("\n# Where window geometry comes from: auto | glazewm | native.\n");
+        s.push_str("# auto prefers GlazeWM and falls back to Win32, which is what makes\n");
+        s.push_str("# the window manager optional rather than required.\n");
+        s.push_str(&format!("window_source = \"{}\"\n", self.window_source));
 
         s.push_str("\n# Backdrop behind a 60%-opaque terminal: extra frames are close to\n");
         s.push_str("# invisible, and renderer cost is per-frame per-panel.\n");
@@ -737,6 +810,13 @@ impl Config {
         s.push_str("# a [wallpaper] header would make `fps` in it overwrite the terminal\n");
         s.push_str("# frame rate.\n");
         s.push_str(&format!("wallpaper_fps = {}\n", self.wallpaper_fps));
+        s.push_str("\n# Freeze a monitor's wallpaper once windows cover this much of it,\n");
+        s.push_str("# as a percentage. 100 means only when every pixel is covered, which\n");
+        s.push_str("# under a tiling WM with any gap configured means never.\n");
+        s.push_str(&format!(
+            "wallpaper_freeze_at = {}\n",
+            self.wallpaper_freeze_at
+        ));
         s.push_str("\n# A wallpaper has no terminal text to line up with, so it does NOT\n");
         s.push_str("# use cell_w/cell_h above. 15x23 keeps a 1440x2560 portrait at ~10k\n");
         s.push_str("# cells instead of ~24k.\n");
@@ -987,6 +1067,16 @@ impl Config {
         let as_i64 = || v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok()));
         let as_str = || v.as_str().map(|s| s.to_string());
         match key {
+            "window_source" => match as_str() {
+                Some(s2) => match crate::window_source::Preference::parse(&s2) {
+                    Some(p) => {
+                        self.window_source = p.as_str().to_string();
+                        true
+                    }
+                    None => false,
+                },
+                _ => false,
+            },
             "font" => match as_str() {
                 Some(s) if !s.trim().is_empty() => {
                     self.font = s;
@@ -1072,6 +1162,9 @@ impl Config {
             },
             "wallpaper_fps" => matches!(as_i64(), Some(n) if n > 0 && n <= 120).then(|| {
                 self.wallpaper_fps = as_i64().unwrap() as u64;
+            }).is_some(),
+            "wallpaper_freeze_at" => matches!(as_i64(), Some(n) if (1..=100).contains(&n)).then(|| {
+                self.wallpaper_freeze_at = as_i64().unwrap() as u32;
             }).is_some(),
             // The friendly knob. Writes `wallpaper_cell_w/h` from the ladder
             // rather than keeping a second, competing notion of size -- the raw
@@ -1624,6 +1717,81 @@ ink = \"#0000ff\"");
         let mut back = Config::default();
         back.apply_toml(&c.to_toml());
         assert!(back.pane_off, "pane_off did not survive a save/load");
+    }
+
+    /// Switching the backdrops off must give back an ordinary solid terminal --
+    /// WITHOUT destroying the opacity that was chosen for when they are on.
+    #[test]
+    fn backdrops_off_makes_the_terminal_solid_but_remembers_the_setting() {
+        let mut c = Config::default();
+        assert!(c.set_field("opacity", &serde_json::json!(80)));
+        assert_eq!(c.effective_opacity(), 80, "backdrops on: use the setting");
+
+        assert!(c.set_field("pane_off", &serde_json::json!(true)));
+        assert_eq!(
+            c.effective_opacity(),
+            100,
+            "with nothing drawn behind it, a see-through terminal shows the bare desktop"
+        );
+        assert_eq!(
+            c.opacity, 80,
+            "the STORED value must survive -- clobbering it loses the setting for good"
+        );
+
+        assert!(c.set_field("pane_off", &serde_json::json!(false)));
+        assert_eq!(c.effective_opacity(), 80, "turning them back on restores it");
+    }
+
+    /// `window_source` must survive a save/load.
+    ///
+    /// This test exists because it did NOT, and the failure was completely
+    /// silent: `set_field` accepted `"native"`, the live daemon switched, and
+    /// `save()` wrote a file with no `window_source` line at all — so the next
+    /// restart came back on GlazeWM as though nothing had been asked for. A
+    /// field can be fully wired through env, TOML parsing and `set_field` and
+    /// still be missing from `to_toml`, which is the one direction nothing else
+    /// exercises.
+    #[test]
+    fn window_source_round_trips_and_rejects_nonsense() {
+        let mut c = Config::default();
+        assert_eq!(c.window_source, "auto");
+
+        assert!(c.set_field("window_source", &serde_json::json!("native")));
+        assert_eq!(c.window_source, "native");
+
+        assert!(
+            c.to_toml().contains("window_source"),
+            "to_toml must EMIT the field, not just parse it"
+        );
+
+        let mut back = Config::default();
+        back.apply_toml(&c.to_toml());
+        assert_eq!(back.window_source, "native", "did not survive save/load");
+
+        // A typo must be refused, not silently accepted as auto.
+        assert!(!c.set_field("window_source", &serde_json::json!("natve")));
+        assert_eq!(c.window_source, "native", "a rejected value must not mutate");
+    }
+
+    /// The freeze threshold has to survive a save/load, or the wallpaper goes
+    /// back to animating behind a covered screen on the next restart.
+    #[test]
+    fn wallpaper_freeze_at_round_trips_and_is_range_checked() {
+        let mut c = Config::default();
+        assert_eq!(c.wallpaper_freeze_at, 92);
+
+        assert!(c.set_field("wallpaper_freeze_at", &serde_json::json!(75)));
+        assert_eq!(c.wallpaper_freeze_at, 75);
+
+        // Out of range must be refused rather than clamped silently: 0 would
+        // freeze an empty desktop and 101 could never be reached.
+        assert!(!c.set_field("wallpaper_freeze_at", &serde_json::json!(0)));
+        assert!(!c.set_field("wallpaper_freeze_at", &serde_json::json!(101)));
+        assert_eq!(c.wallpaper_freeze_at, 75, "a rejected value must not mutate");
+
+        let mut back = Config::default();
+        back.apply_toml(&c.to_toml());
+        assert_eq!(back.wallpaper_freeze_at, 75);
     }
 
     #[test]

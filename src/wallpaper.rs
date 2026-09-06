@@ -196,23 +196,22 @@ impl SimPool {
     }
 }
 
-/// Does `windows` fully cover `m`?
+/// How much of `m` the visible windows cover, as a percentage 0..=100.
 ///
-/// Conservative by construction: it reports occluded only when the visible
-/// windows genuinely tile over the whole monitor. Animating when it was not
-/// strictly necessary costs a little CPU; freezing a wallpaper the user can see
-/// is a bug they notice.
-pub fn is_occluded(m: &MonitorInfo, windows: &[ipc::Window]) -> bool {
-    // Check the degenerate case BEFORE computing edges, so a zero-area monitor
-    // never reaches the scanline (where a zero-height band would trivially
-    // "cover" it).
+/// EXACT, not a bounding box: `UnionRect` would report two windows in opposite
+/// corners as covering everything between them. Under a tiling WM, two tiles
+/// genuinely covering a monitor between them is the NORMAL case, so the union
+/// has to be computed properly.
+pub fn covered_pct(m: &MonitorInfo, windows: &[ipc::Window]) -> u32 {
+    // The degenerate case BEFORE any geometry, so a zero-area monitor never
+    // reaches the scanline (where a zero-height band would divide by zero).
     if m.width <= 0 || m.height <= 0 {
-        return false;
+        return 0;
     }
     // Saturating throughout: these are i32 screen coordinates straight off the
     // wire, and `x + width` on a bogus rect overflows. In release that WRAPS
     // rather than panicking, turning a far-away window into one that appears to
-    // cover the screen — i.e. a wallpaper frozen for no visible reason.
+    // cover the screen -- i.e. a wallpaper frozen for no visible reason.
     let mon_l = m.x;
     let mon_t = m.y;
     let mon_r = m.x.saturating_add(m.width);
@@ -227,7 +226,7 @@ pub fn is_occluded(m: &MonitorInfo, windows: &[ipc::Window]) -> bool {
         if !w.is_visible() || w.is_minimized() {
             continue;
         }
-        // Skip degenerate rects outright — a window mid-creation or being
+        // Skip degenerate rects outright -- a window mid-creation or being
         // animated closed can report zero or negative extents.
         if w.width <= 0 || w.height <= 0 {
             continue;
@@ -240,23 +239,19 @@ pub fn is_occluded(m: &MonitorInfo, windows: &[ipc::Window]) -> bool {
         if cr <= cl || cb <= ct {
             continue;
         }
-        // Fast path: one window covering the whole monitor. The common
-        // maximised/single-tile case.
-        if cl <= mon_l && ct <= mon_t && cr >= mon_r && cb >= mon_b {
-            return true;
-        }
         rects.push((cl, ct, cr, cb));
     }
     if rects.is_empty() {
-        return false;
+        return 0;
     }
 
-    // Scanline union.
-    //
-    // NOT a bounding box: `UnionRect` would report two windows in opposite
-    // corners as covering everything between them, freezing a visibly
-    // half-empty desktop. Under a tiling WM, two tiles genuinely covering a
-    // monitor between them is the NORMAL case, so this has to be exact.
+    // i64 for the areas. A 4K monitor is ~8.3M pixels, which fits in i32, but
+    // the intermediate `covered * 100` does not.
+    let total = (mon_r as i64 - mon_l as i64) * (mon_b as i64 - mon_t as i64);
+    if total <= 0 {
+        return 0;
+    }
+
     let mut ys: Vec<i32> = Vec::with_capacity(rects.len() * 2 + 2);
     ys.push(mon_t);
     ys.push(mon_b);
@@ -267,11 +262,14 @@ pub fn is_occluded(m: &MonitorInfo, windows: &[ipc::Window]) -> bool {
     ys.sort_unstable();
     ys.dedup();
 
+    let mut covered: i64 = 0;
     for pair in ys.windows(2) {
         let (band_t, band_b) = (pair[0], pair[1]);
         if band_b <= mon_t || band_t >= mon_b || band_b <= band_t {
             continue;
         }
+        let band_h = band_b as i64 - band_t as i64;
+
         // Every x-interval covering this horizontal band.
         let mut spans: Vec<(i32, i32)> = rects
             .iter()
@@ -279,25 +277,65 @@ pub fn is_occluded(m: &MonitorInfo, windows: &[ipc::Window]) -> bool {
             .map(|(l, _, r, _)| (*l, *r))
             .collect();
         if spans.is_empty() {
-            return false;
+            continue;
         }
         spans.sort_unstable();
-        // Merge and check the merged run spans the monitor's full width.
-        let mut reach = mon_l;
-        for (l, r) in spans {
-            if l > reach {
-                return false; // a gap the user can see through
-            }
-            reach = reach.max(r);
-            if reach >= mon_r {
-                break;
+
+        // Merge overlapping spans and total their width. Overlap is normal --
+        // a floating window sits on top of a tile -- and counting it twice
+        // would report more than 100% coverage.
+        let mut width: i64 = 0;
+        let (mut cur_l, mut cur_r) = spans[0];
+        for (l, r) in spans.into_iter().skip(1) {
+            if l > cur_r {
+                width += cur_r as i64 - cur_l as i64;
+                cur_l = l;
+                cur_r = r;
+            } else if r > cur_r {
+                cur_r = r;
             }
         }
-        if reach < mon_r {
-            return false;
-        }
+        width += cur_r as i64 - cur_l as i64;
+        covered += width * band_h;
     }
-    true
+
+    // Integer division truncates, so 99.9% reports 99. That is deliberate: it
+    // means a threshold of 100 still means "genuinely every pixel".
+    ((covered * 100) / total).clamp(0, 100) as u32
+}
+
+/// Is `m` covered enough to be worth freezing?
+///
+/// # Why a threshold and not "fully covered"
+///
+/// This used to demand total coverage, and the comment defending that said
+/// animating unnecessarily costs a little CPU while freezing a visible
+/// wallpaper is a bug the user notices. Both halves are still true; the
+/// conclusion was wrong in practice.
+///
+/// Under a tiling WM with ANY gap configured, tiles never reach the monitor
+/// edges, so total coverage never happens and the freeze never fires. Measured
+/// on SloppyLaptopy 2026-09-05: `outer_gap` of 1px on all four sides was enough
+/// for a fully tiled screen to report "not occluded" and animate a wallpaper of
+/// which perhaps 0.3% was visible -- a full-monitor simulation and bitmap, every
+/// frame, all day, for a 1px border.
+///
+/// So the question became "how much can be seen", not "is any of it visible".
+pub fn is_occluded_at(m: &MonitorInfo, windows: &[ipc::Window], threshold_pct: u32) -> bool {
+    if m.width <= 0 || m.height <= 0 {
+        return false;
+    }
+    // Clamped low at 1: a threshold of 0 would freeze an empty desktop, which
+    // is the one state where the wallpaper is the ONLY thing on screen.
+    covered_pct(m, windows) >= threshold_pct.clamp(1, 100)
+}
+
+/// Does `windows` fully cover `m`?
+///
+/// The strict form, kept as its own name because "fully covered" is a
+/// meaningful question independent of whatever threshold is configured.
+pub fn is_occluded(m: &MonitorInfo, windows: &[ipc::Window]) -> bool {
+    is_occluded_at(m, windows, 100)
 }
 
 /// One monitor's wallpaper.
@@ -603,7 +641,7 @@ impl WallpaperSet {
     /// Must be handed the UNFILTERED list: a terminal-only view would miss every
     /// browser and file manager, which are exactly the windows that cover a
     /// desktop.
-    pub fn observe_windows(&mut self, windows: &[ipc::Window]) {
+    pub fn observe_windows(&mut self, windows: &[ipc::Window], freeze_at: u32) {
         for s in self.surfaces.iter_mut() {
             // An `off` monitor has no panel and no simulation, so whether it is
             // covered is a question with no consumer. Skip the scanline entirely
@@ -613,7 +651,7 @@ impl WallpaperSet {
                 s.occluded = false;
                 continue;
             }
-            let now = is_occluded(&s.monitor, windows);
+            let now = is_occluded_at(&s.monitor, windows, freeze_at);
             if s.occluded && !now {
                 // Coming back into view: force one draw, because the sim may
                 // report unchanged on this frame and leave a stale bitmap.
@@ -840,6 +878,65 @@ mod tests {
         assert!(!is_occluded(&mon(0, 0, 1920, 1080), &[]));
     }
 
+    /// The bug this whole threshold exists for.
+    ///
+    /// A tiling WM with a 1px outer gap leaves a one-pixel border all the way
+    /// round. Under the old "must cover every pixel" rule that screen was
+    /// reported visible forever, so a full-monitor simulation and bitmap ran at
+    /// full rate behind a border 0.3% of the screen wide. Measured on
+    /// SloppyLaptopy 2026-09-05, where `outer_gap` really is 1px.
+    #[test]
+    fn a_one_pixel_gap_no_longer_defeats_the_freeze() {
+        let m = mon(0, 0, 1920, 1080);
+        let tiled = [win(1, 1, 1918, 1078, "tiling", "shown")];
+
+        // Strictly speaking it is not fully covered, and that stays true.
+        assert!(
+            !is_occluded(&m, &tiled),
+            "a 1px border means genuinely not every pixel is covered"
+        );
+        // But it is 99% covered, and freezing it is obviously right.
+        assert_eq!(covered_pct(&m, &tiled), 99);
+        assert!(
+            is_occluded_at(&m, &tiled, 92),
+            "a 1px gap must not keep a whole monitor animating"
+        );
+    }
+
+    /// The guard on the other side: a visibly half-empty desktop keeps running.
+    #[test]
+    fn a_half_covered_desktop_still_animates() {
+        let m = mon(0, 0, 1920, 1080);
+        let half = [win(0, 0, 960, 1080, "tiling", "shown")];
+        assert_eq!(covered_pct(&m, &half), 50);
+        assert!(!is_occluded_at(&m, &half, 92));
+    }
+
+    /// Overlapping windows must not be counted twice.
+    ///
+    /// Without span merging, a floating window sitting on top of a tile would
+    /// push the total past 100% and freeze a desktop that is mostly visible.
+    #[test]
+    fn overlap_is_not_double_counted() {
+        let m = mon(0, 0, 1000, 1000);
+        let stacked = [
+            win(0, 0, 500, 1000, "tiling", "shown"),
+            win(0, 0, 400, 1000, "floating", "shown"),
+        ];
+        assert_eq!(
+            covered_pct(&m, &stacked),
+            50,
+            "the second window is entirely inside the first's columns"
+        );
+    }
+
+    /// A threshold of 0 must not freeze an empty desktop -- that is the one
+    /// state where the wallpaper is the only thing there is to look at.
+    #[test]
+    fn a_zero_threshold_cannot_freeze_an_empty_desktop() {
+        assert!(!is_occluded_at(&mon(0, 0, 1920, 1080), &[], 0));
+    }
+
     #[test]
     fn exact_cover_occludes() {
         let w = [win(0, 0, 1920, 1080, "tiling", "shown")];
@@ -968,7 +1065,7 @@ mod tests {
         set.surfaces[0].effect = OFF.to_string();
         set.surfaces[0].panel = None;
         let covering = [win(0, 0, 1920, 1080, "tiling", "shown")];
-        set.observe_windows(&covering);
+        set.observe_windows(&covering, 100);
         assert!(
             !set.surfaces[0].occluded,
             "an off monitor has no surface to freeze"

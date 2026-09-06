@@ -726,31 +726,10 @@ pub fn focus_existing_gui() -> bool {
 }
 
 /// Lower-case stem of the executable owning `pid` (`"panefx-gui"`), or None.
+///
+/// Delegates to [`crate::proc_name`]: this walk existed here AND in
+/// term_opacity.rs, with two different ways of stripping the extension.
 #[cfg(windows)]
 fn process_name(pid: u32) -> Option<String> {
-    use windows::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
-        TH32CS_SNAPPROCESS,
-    };
-    unsafe {
-        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
-        let mut e = PROCESSENTRY32W {
-            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-            ..Default::default()
-        };
-        let mut ok = Process32FirstW(snap, &mut e).is_ok();
-        while ok {
-            if e.th32ProcessID == pid {
-                let name = String::from_utf16_lossy(&e.szExeFile);
-                let name = name.trim_end_matches('\0').trim_end_matches(char::from(0));
-                return Some(
-                    name.trim_end_matches(".exe")
-                        .trim_end_matches(".EXE")
-                        .to_lowercase(),
-                );
-            }
-            ok = Process32NextW(snap, &mut e).is_ok();
-        }
-    }
-    None
+    crate::proc_name::of(pid)
 }

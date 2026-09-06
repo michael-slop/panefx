@@ -1213,9 +1213,15 @@ impl App {
 
         // key, label, min, max, and the one-line reason it matters. The hint is
         // the point of having this in a GUI rather than a config file.
-        const ROWS: [(&str, &str, i64, i64, &str); 11] = [
+        const ROWS: [(&str, &str, i64, i64, &str); 12] = [
             ("fps", "frame rate", 1, 120, "how often panefx redraws. The wallpaper cannot exceed this."),
             ("wallpaper_fps", "wallpaper fps", 1, 120, "the desktop layer's own rate, capped by the frame rate above."),
+            // 1..100, never 0: a zero would freeze an empty desktop, which is
+            // the one moment the wallpaper is the only thing on screen.
+            ("wallpaper_freeze_at", "freeze at %", 1, 100,
+             "stop animating a screen once windows cover this much of it. 
+              100 means only when every pixel is covered -- which, with any
+              gap configured, never happens."),
             // Range from the DAEMON's own constants, not a guess. It rejects
             // anything below the floor rather than clamping, so a slider that
             // went lower would move and change nothing -- which is exactly how

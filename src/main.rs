@@ -293,6 +293,26 @@ fn main() -> anyhow::Result<()> {
         Mode::Daemon => {}
     }
 
+    // ONE daemon per logon session, decided before anything is allocated.
+    //
+    // Placed here rather than after setup on purpose: a refused instance used
+    // to get as far as building fonts, panels and a wallpaper surface — ~92MB
+    // — before it was of no use to anyone. Now it costs a mutex and a socket.
+    //
+    // The loser tells the winner on its way out, because a guard nobody can
+    // observe is how the duplicate problem stayed a mystery. See
+    // `single_instance` for the whole argument.
+    let _instance = match panefx::single_instance::acquire() {
+        Ok(lock) => lock,
+        Err(()) => {
+            panefx::single_instance::report_refused_to_incumbent(control::DEFAULT_PORT);
+            // 3, not 1: distinguishable in a scheduled task's Last Result and
+            // in GlazeWM's shell-exec, where "already running" is a normal,
+            // successful-enough outcome and not a crash to investigate.
+            std::process::exit(3);
+        }
+    };
+
     let mut cfg = config::Config::load();
 
     // Font substitution is SILENT — CreateFontW succeeds and you simply get a
@@ -314,19 +334,24 @@ fn main() -> anyhow::Result<()> {
 
     panel::register_class()?;
 
+    // Where window geometry comes from. GlazeWM when it is there, Win32 when it
+    // is not -- panefx used to simply refuse to start without the WM, which
+    // made the pane half unusable for anyone not already running it.
+    //
     // The GlazeWM socket lives on its own thread; the render loop only ever
     // does a non-blocking try_recv. See `ipc::IpcThread` for why.
-    let client = match ipc::IpcThread::spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            panefx::log_warn!(
-                "[panefx] cannot reach GlazeWM at {}: {e}\n\
-                 Is GlazeWM running? Panels need its IPC for window geometry.",
-                ipc::IPC_URL
-            );
-            return Err(e);
-        }
-    };
+    let pref = panefx::window_source::Preference::parse(&cfg.window_source)
+        .unwrap_or(panefx::window_source::Preference::Auto);
+    let client = panefx::window_source::connect(pref)?;
+
+    // WinEvent hooks, and ONLY for the native backend: GlazeWM already tells us
+    // when to re-query, and running both would double every update.
+    //
+    // Installed HERE, on the thread that owns the `PeekMessageW` loop below --
+    // a WINEVENT_OUTOFCONTEXT hook is delivered through the message queue, so
+    // one installed on a thread that never pumps silently never fires.
+    #[cfg(windows)]
+    let _win_events = (client.name() == "native").then(panefx::native_windows::install_hooks);
 
     // Tray icon: the daemon has no window and no console, so without this it is
     // completely invisible -- no way to tell it is running, reach the TUI, or
@@ -347,9 +372,17 @@ fn main() -> anyhow::Result<()> {
 
     // Push the configured opacity out once at startup so panefx's config and
     // the terminal's cannot drift apart.
-    match term_opacity::apply(cfg.opacity) {
+    //
+    // EFFECTIVE, not stored: starting up with `pane_off = true` must leave the
+    // terminal solid. Using `cfg.opacity` here would make the backdrop-off
+    // state look correct only until the next restart, which is the worst kind
+    // of bug -- one that comes back on reboot.
+    match term_opacity::apply(cfg.effective_opacity()) {
         Ok(term_opacity::Outcome::Written) => {
-            panefx::log_info!("[panefx] background opacity -> {}%", cfg.opacity)
+            panefx::log_info!(
+                "[panefx] background opacity -> {}%",
+                cfg.effective_opacity()
+            )
         }
         Ok(term_opacity::Outcome::AlreadyCorrect) => {}
         Ok(term_opacity::Outcome::KeyMissing) => panefx::log_warn!(
@@ -506,7 +539,7 @@ fn main() -> anyhow::Result<()> {
                     // Occlusion needs the UNFILTERED list: `reconcile` keeps only
                     // terminals, but a browser or file manager covering the
                     // screen is exactly what should freeze the wallpaper.
-                    wall.observe_windows(&windows);
+                    wall.observe_windows(&windows, cfg.wallpaper_freeze_at);
                 }
                 ipc::IpcMessage::LayoutMayHaveChanged => {
                     // No geometry in the event — must ask.
@@ -847,8 +880,16 @@ fn handle_command(
             // L to drag would otherwise rewrite alacritty.toml ~90 times and
             // make it re-parse each one. `needs_query` is deliberately NOT set
             // — window geometry has nothing to do with opacity.
-            if key == "opacity" {
-                *pending_opacity = Some((cfg.opacity, Instant::now()));
+            //
+            // `pane_off` queues one too, and that is the whole mechanism behind
+            // "the terminal goes solid when the backdrop is off". Turning the
+            // backdrops off leaves a transparent terminal over the plain
+            // desktop, which is not what anyone means by "off" -- they mean
+            // give me my normal terminal back. `effective_opacity` decides the
+            // number; the stored `opacity` is never overwritten, so switching
+            // the backdrops back on restores the exact value that was chosen.
+            if key == "opacity" || key == "pane_off" {
+                *pending_opacity = Some((cfg.effective_opacity(), Instant::now()));
             }
             // The wallpaper grid changed. Without this the new value is stored
             // and read back correctly by `cell_for` -- but the live surfaces
@@ -931,6 +972,16 @@ fn handle_command(
         Command::Logs { lines } => {
             // Capped so a bad client cannot ask for an unbounded response.
             Reply::with_logs(panefx::log::tail(lines.min(1000)))
+        }
+
+        Command::Duplicate { pid } => {
+            // WARN, not info: this is the symptom of a launcher starting the
+            // daemon twice, and it should stand out in the logs tab rather
+            // than scroll past among the wallpaper-grid chatter.
+            panefx::log_warn!(
+                "[panefx] refused a duplicate daemon (pid {pid}) -- something started panefx twice"
+            );
+            Reply::ok()
         }
 
         Command::WallpaperParam {

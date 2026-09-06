@@ -85,8 +85,20 @@ if ($toolchain.Count -gt 0) {
 } else {
     $cargo = @('cargo')
 }
-$cargoExe  = $cargo[0]
-$cargoArgs = @($cargo[1..($cargo.Count - 1)])
+$cargoExe = $cargo[0]
+# Select-Object -Skip, NOT $cargo[1..($cargo.Count - 1)].
+#
+# With a single-element $cargo -- the fallback branch, which is every machine
+# WITHOUT nightly-gnu, i.e. the laptop -- that slice is $cargo[1..0], and in
+# PowerShell `1..0` is a DESCENDING range @(1, 0). So it yields $null followed
+# by 'cargo', and the script runs `cargo cargo build`, which fails with
+#
+#     error: no such command: `cargo`
+#
+# after the daemon has already been stopped -- the identical "and the wallpaper
+# stayed down" trap the comment above describes, hiding in the other branch.
+# Measured on SloppyLaptopy 2026-09-05.
+$cargoArgs = @($cargo | Select-Object -Skip 1)
 $binDir    = Join-Path $env:USERPROFILE 'bin'
 $glzrDir   = Join-Path $env:USERPROFILE '.glzr\glazewm\scripts'
 

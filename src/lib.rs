@@ -21,7 +21,17 @@ pub mod log;
 pub mod animation;
 pub mod compositor;
 pub mod config;
+// pid -> executable stem, extracted from the two copies that used to live in
+// desktop.rs and term_opacity.rs.
+pub mod proc_name;
 pub mod control;
+// One daemon per logon session. Lives in the LIB, not main.rs, so the guard and
+// its "a duplicate was refused" reporting can be unit-tested and reused.
+pub mod single_instance;
+// Where window geometry comes from: GlazeWM, or Win32 directly.
+pub mod window_source;
+#[cfg(windows)]
+pub mod native_windows;
 // Not `#[cfg(windows)]`: `config` needs the MIN/MAX percent constants to
 // validate its `opacity` field, and that runs everywhere.
 pub mod opacity;

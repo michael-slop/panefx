@@ -101,6 +101,15 @@ features = [
   "Win32_Graphics_Dxgi",
   "Win32_Graphics_Dxgi_Common",
   "Win32_Graphics_DirectComposition",
+  # The native window source. DWMWA_EXTENDED_FRAME_BOUNDS is the VISIBLE
+  # edge of a window -- GetWindowRect includes an invisible resize border on
+  # standard windows, and a backdrop sized to that is visibly too big.
+  # DWMWA_CLOAKED is how a window on another virtual desktop is detected;
+  # such a window is still "visible" to IsWindowVisible.
+  "Win32_Graphics_Dwm",
+  # SetWinEventHook, for real move/resize notifications. GlazeWM emits none
+  # (see the ipc.rs header), so its backend re-queries on a 500ms poll.
+  "Win32_UI_Accessibility",
 ]
 
 [profile.release]

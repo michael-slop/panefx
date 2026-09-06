@@ -154,13 +154,16 @@ fn run_checks() -> Vec<Check> {
         detail: build.map(|b| format!("build {b}")),
     });
 
-    // GlazeWM. Required for the PANE effects and nothing else -- the wallpaper
-    // works without it, so this must not read as a failed install.
+    // GlazeWM. No longer needed for anything: panefx falls back to a native
+    // Win32 window source, so the pane effects work with no window manager at
+    // all. Demoted from PartLost to Optional -- reporting it as a lost feature
+    // would tell a tester to go and install a whole window manager they do not
+    // need.
     let glaze = find_glazewm();
     out.push(Check {
         name: "GlazeWM",
-        need: Need::PartLost,
-        why: "Without it, effects BEHIND WINDOWS do nothing. Wallpaper effects still work.",
+        need: Need::Optional,
+        why: "Optional. panefx follows windows natively without it; GlazeWM adds workspace awareness.",
         winget: Some("glzr-io.glazewm"),
         url: "https://glzr.io/",
         found: glaze.is_some(),
@@ -407,30 +410,62 @@ fn stop_running() {
     std::thread::sleep(std::time::Duration::from_millis(400));
 }
 
-/// Start the daemon, preferring GlazeWM's `shell-exec`.
+/// Register the logon task, then start the daemon.
 ///
-/// Not decoration: a process started as a child of this installer can die with
-/// it when the console closes. Handing it to GlazeWM makes the WM its parent,
-/// which is also how it is launched normally.
+/// # Why a scheduled task and not GlazeWM
+///
+/// This used to hand the daemon to GlazeWM's `shell-exec`, because a process
+/// started as a child of this installer dies with it when the console closes,
+/// and making the WM its parent avoided that. It worked, and it cost more than
+/// it was worth:
+///
+///   * It required a window manager to start a program that no longer needs one.
+///   * On this machine it produced two launchers, and GlazeWM's matching
+///     shutdown command killed panefx BY IMAGE NAME -- every copy, including
+///     ones it had not started. Seven daemons in one logon, six of them dead.
+///
+/// A logon task solves the original console-death problem outright: the task
+/// scheduler is the parent, so nothing this installer does can take the daemon
+/// with it. It is the same shape mesh.ether uses on this machine.
 fn start_daemon(dest: &Path) {
     let exe = dest.join("panefx.exe");
-    if let Some(cli) = glazewm_cli() {
-        let arg = format!("{} --daemon", exe.display());
-        let ok = std::process::Command::new(&cli)
-            .args(["command", "shell-exec", &arg])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if ok {
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            report_daemon();
-            return;
-        }
-    }
+    register_logon_task(&exe);
     spawn_detached(&exe);
     std::thread::sleep(std::time::Duration::from_secs(2));
     report_daemon();
 }
+
+/// Make panefx start at logon, with no window manager involved.
+///
+/// `schtasks.exe` rather than the Task Scheduler COM API: this is one command,
+/// it needs no extra crate features, and it works unelevated for the current
+/// user. `/F` makes re-running the installer an update rather than an error.
+#[cfg(windows)]
+fn register_logon_task(exe: &Path) {
+    // Quoted INSIDE the /TR value: the path contains spaces on plenty of
+    // machines, and schtasks parses this string itself.
+    let tr = format!("\"{}\" --daemon", exe.display());
+    let out = std::process::Command::new("schtasks.exe")
+        .args([
+            "/Create", "/TN", "panefx", "/TR", &tr, "/SC", "ONLOGON", "/RL", "LIMITED", "/F",
+        ])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => println!("  logon task 'panefx' registered"),
+        Ok(o) => {
+            // Not fatal. The daemon still starts below; it just will not come
+            // back by itself after a reboot, and saying so is better than
+            // implying the install failed.
+            let msg = String::from_utf8_lossy(&o.stderr);
+            println!("  could not register the logon task ({}): {}", o.status, msg.trim());
+            println!("  panefx will run now but will not start automatically at logon.");
+        }
+        Err(e) => println!("  could not run schtasks.exe: {e}"),
+    }
+}
+
+#[cfg(not(windows))]
+fn register_logon_task(_exe: &Path) {}
 
 #[cfg(windows)]
 fn spawn_detached(exe: &Path) {
@@ -506,14 +541,10 @@ fn find_glazewm() -> Option<PathBuf> {
         .or_else(|| find_on_path("glazewm.exe"))
 }
 
-fn glazewm_cli() -> Option<PathBuf> {
-    let pf = std::env::var("ProgramFiles").unwrap_or_default();
-    let cli = PathBuf::from(format!("{pf}\\glzr.io\\GlazeWM\\cli\\glazewm.exe"));
-    if cli.exists() {
-        return Some(cli);
-    }
-    find_glazewm()
-}
+// `glazewm_cli` lived here. It existed only to hand the daemon to the WM's
+// `shell-exec` so the WM would be its parent; the logon task does that job now
+// and does not need a window manager to exist. `find_glazewm` stays, because
+// the dependency report still tells you whether GlazeWM is installed.
 
 fn process_running(name: &str) -> bool {
     std::process::Command::new("tasklist")

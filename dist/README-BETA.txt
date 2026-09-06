@@ -1,141 +1,106 @@
-================================================================
-  panefx - beta
-  animated ASCII backdrops behind windows, and on the desktop
-================================================================
+panefx — animated ASCII backdrops behind your windows, and on your desktop
+==========================================================================
 
-Thanks for testing this. It is a beta: it works on the machines it has been
-run on, and the point of you having it is to find the ones where it does not.
+Thanks for testing this. It is a beta: it works, but you are looking at it
+because things may still be wrong.
 
 
-----------------------------------------------------------------
-  START HERE
-----------------------------------------------------------------
+WHAT IT DOES
+------------
 
-  1. Extract the WHOLE zip to a folder. Do not run anything from
-     inside the zip window -- the installer needs the other files
-     next to it.
+Two separate things, and you can run either without the other:
 
-  2. Double-click  INSTALL.exe
+  * WALLPAPER   an animated effect drawn on the desktop, behind your icons.
+  * BACKDROPS   the same kind of effect drawn behind each terminal window,
+                showing through it. This one needs a see-through terminal --
+                panefx draws BEHIND the window, so an opaque window hides it
+                completely. Alacritty and Neovide are supported out of the box.
 
-     It checks what your machine has, tells you what is missing and
-     what each missing thing costs you, and asks before installing
-     anything. Nothing is downloaded unless you say yes.
-
-  3. When it finishes, panefx is running. Look for the FX icon in
-     your system tray (bottom-right, possibly under the "^" arrow).
-
-  4. Click that icon to open the control panel.
-
-Windows may show a blue "Windows protected your PC" box, because these
-programs are not code-signed. Click "More info" then "Run anyway". If you
-would rather not, that is a completely reasonable place to stop -- tell me
-and I will find another way to get it to you.
+Windows only. It uses DirectComposition and the desktop's WorkerW layer, so
+there is no Linux or macOS build and there will not be one.
 
 
-----------------------------------------------------------------
-  WHAT IT NEEDS
-----------------------------------------------------------------
+INSTALLING
+----------
 
-  Windows 10 or 11        required
-  GlazeWM                 needed ONLY for the effects behind windows.
-                          panefx reads window positions from GlazeWM;
-                          with no GlazeWM those do nothing. The desktop
-                          wallpaper effects work fine without it.
-  BigBlueTerm437 font     ships in this folder; the installer sets it
-                          up. Without it Windows silently substitutes
-                          another typeface and every effect looks wrong
-                          -- with no error message anywhere.
-  Alacritty               optional, only for the terminal effect.
+Double-click INSTALL.exe.
 
-INSTALL.exe checks all four and offers to install what is missing.
+It checks what is present, tells you what is missing and why it matters, copies
+the programs into your user folder, registers the bundled font, and sets panefx
+to start when you log in.
+
+Nothing is written outside your own user profile. No service, no driver, no
+admin prompt.
 
 
-----------------------------------------------------------------
-  USING IT
-----------------------------------------------------------------
+USING IT
+--------
 
-  panefx                 open the control panel  (or click the tray icon)
-  panefx --tui           the terminal version, for SSH
-  panefx --daemon        start the background daemon by hand
-  panefx --help
+    panefx           the control panel
+    panefx --tui     the same thing in a terminal, if you prefer
+    panefx --daemon  the background process (the installer starts this for you)
 
-In the control panel:
+The control panel is also on the tray icon. Right-click it for Reload and Exit.
 
-  wallpaper tab   pick a monitor on the left, then an effect. Effects
-                  STACK in layers -- set a base effect, then "add a layer
-                  above" to put something on top of it (flames
-                  underneath, a spinning skull over them).
-  TUI-fx tab      the effect drawn behind terminal windows. Needs GlazeWM.
-  logs tab        what the daemon has been doing.
-  copy to...      apply one monitor's setup to the others.
-  dark / light    your choice is remembered.
+Everything is live: change an effect or a colour and it happens immediately.
+Settings are saved to
 
-Buttons are Windows 98 style: raised when idle, pushed in when selected.
+    %USERPROFILE%\.config\panefx\config.toml
+
+which is a plain text file you can read, edit and delete. Deleting it resets
+everything to defaults.
 
 
-----------------------------------------------------------------
-  WHEN SOMETHING GOES WRONG   <-- the part I actually need
-----------------------------------------------------------------
+TURNING PARTS OFF
+-----------------
 
-  Double-click  REPORT.exe
+  * Backdrops only:  settings tab -> "backdrops" -> off.
+                     Your terminal goes solid again automatically.
+  * Wallpaper only:  wallpaper tab -> pick the monitor -> effect "off".
+                     That monitor goes back to your normal Windows wallpaper
+                     and costs nothing.
 
-It writes a file to your Desktop called  panefx-report-<date>.txt
-
-Send me that file. It contains what panefx thinks is happening, its recent
-log, your display layout and refresh rates, and your settings. It is plain
-text -- open it and read it first if you like.
-
-It does NOT send anything anywhere. It writes one local file and stops.
-
-Please also say, in your own words:
-  - what you were doing
-  - what you expected
-  - what happened instead
-  - which monitor, if it is only one of them
-
-Screenshots or a phone video of flickering are genuinely useful. Flicker is
-hard to describe and obvious to see.
+They are independent. Turning one off never affects the other.
 
 
-----------------------------------------------------------------
-  KNOWN ROUGH EDGES
-----------------------------------------------------------------
+ABOUT YOUR WINDOW MANAGER
+-------------------------
 
-  - The effect behind windows needs GlazeWM running. Not installed, or
-    installed but not started, means nothing appears there. Expected,
-    not a bug.
-  - Multi-monitor setups are where the interesting bugs live. Mixed
-    refresh rates, rotated screens and mixed resolutions especially --
-    please try those if you have them.
-  - If the wallpaper is torn, flickering, or black, that is worth a
-    report even if it fixes itself.
-  - A crash leaves no dialog: the window just vanishes. Run REPORT.exe
-    anyway -- the daemon's log usually survives it.
-  - The control panel has no live preview yet. You see an effect by
-    applying it.
+panefx does not need one. It reads window positions from Windows directly.
+
+If you happen to run GlazeWM it will use that instead, which additionally
+understands workspaces. You do not need to install it, and INSTALL.exe lists it
+as optional for exactly that reason.
 
 
-----------------------------------------------------------------
-  UNINSTALLING
-----------------------------------------------------------------
+IF SOMETHING IS WRONG
+---------------------
 
-  1. Right-click the tray icon -> Exit
-  2. Delete these three files from  %USERPROFILE%\bin\
-       panefx.exe   panefx-gui.exe   panefx-ctl.exe
-  3. Settings live in  %USERPROFILE%\.config\panefx\  -- delete that
-     folder to remove them.
+Run REPORT.exe and send the output. It prints what panefx thinks is happening:
+which windows it found, what each monitor is doing, and the recent log.
 
-Nothing is installed to Program Files, nothing runs as administrator, and
-nothing is added to your startup unless GlazeWM was already launching it.
+Known things worth checking first:
+
+  * Nothing appears behind the terminal
+        Your terminal is opaque. panefx draws behind it, so it needs
+        transparency. In Alacritty that is `opacity` in alacritty.toml --
+        panefx sets it for you, so give it a couple of seconds to reload.
+
+  * The wrong font, or blocks instead of characters
+        The bundled font did not register. Right-click
+        BigBlueTerm437NerdFontMono-Regular.ttf and Install, then restart panefx.
+
+  * Your antivirus removed it
+        This is an unsigned binary built by one person, and heuristic scanners
+        do flag those. If panefx vanishes after install, check your antivirus
+        quarantine before reinstalling.
+
+  * It stops animating when a window covers the screen
+        That is deliberate, and it is saving your battery. The threshold is
+        "freeze at %" in the settings tab.
 
 
-----------------------------------------------------------------
-  ATTRIBUTION
-----------------------------------------------------------------
+LICENCE
+-------
 
-BigBlueTerm437 Nerd Font Mono - CC BY-SA 4.0
-  VileR's Ultimate Oldschool PC Font Pack, via Nerd Fonts.
-  https://int10h.org/oldschool-pc-fonts/
-  https://www.nerdfonts.com/
-
-The Windows 98 interface is a tribute to a look, not anyone's code.
+See LICENSE.

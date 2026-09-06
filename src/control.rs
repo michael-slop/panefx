@@ -86,6 +86,19 @@ pub enum Command {
         key: String,
         val: ParamValue,
     },
+    /// "A second daemon tried to start and I refused."
+    ///
+    /// Sent BY the instance that lost the single-instance mutex, TO the one
+    /// holding it, immediately before the loser exits. The winner logs it.
+    ///
+    /// This exists because the guard alone is invisible: the daemon has no
+    /// console, so a refused start would otherwise leave no trace anywhere the
+    /// user could look. Routing it to the incumbent's in-memory log puts it in
+    /// the GUI's logs tab, which is where "why did that happen" gets answered.
+    Duplicate {
+        /// The refused process's pid, so a repeat offender can be identified.
+        pid: u32,
+    },
     /// Fetch the daemon's recent log lines.
     ///
     /// Separate from `Get` because the log is polled far more often than the
@@ -263,6 +276,17 @@ pub struct ConfigView {
     /// Terminal backdrops switched off entirely. The wallpaper is unaffected.
     pub pane_off: bool,
     pub wallpaper_fps: u64,
+    /// Where window geometry is coming from: `"auto"`, `"glazewm"`, `"native"`.
+    ///
+    /// This is the CONFIGURED preference, not the backend that actually won —
+    /// with `auto` the two differ whenever GlazeWM is absent. The log line at
+    /// startup is the record of what is really running.
+    pub window_source: String,
+    /// Percentage of a monitor that must be covered before its wallpaper
+    /// freezes. Reported so "why is it still animating" is answerable without
+    /// opening config.toml -- the old fixed 100% never fired under a tiling WM
+    /// with gaps, and looked exactly like a broken freeze.
+    pub wallpaper_freeze_at: u32,
     /// What the wallpaper can ACTUALLY achieve: it is ticked from the daemon
     /// loop, so `fps` caps it. Reported separately so the TUI never shows a
     /// number the screen is not delivering.
@@ -288,6 +312,8 @@ impl ConfigView {
             opacity: cfg.opacity,
             pane_off: cfg.pane_off,
             wallpaper_fps: cfg.wallpaper_fps,
+            window_source: cfg.window_source.clone(),
+            wallpaper_freeze_at: cfg.wallpaper_freeze_at,
             wallpaper_fps_effective: cfg.wallpaper_fps.min(cfg.fps).max(1),
             wallpaper_detail: cfg.wallpaper_detail,
             wallpaper_cell_w: cfg.wallpaper_cell_w,
