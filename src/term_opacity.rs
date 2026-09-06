@@ -156,14 +156,42 @@ pub fn set_alacritty_opacity(path: &Path, percent: u8) -> anyhow::Result<Outcome
     Ok(Outcome::Written)
 }
 
-/// Write the opacity to whichever terminal configs panefx can reach.
+/// Write the opacity to every terminal panefx can reach.
 ///
-/// Today that is Alacritty only. **Neovide is not reachable**: it launches
-/// `nvim --embed` with no `--listen`, so there is no named pipe to set
-/// `g:neovide_opacity` through — verified by launching it and enumerating
-/// `\\.\pipe\`. Rather than pretend, panefx leaves Neovide alone; if it is ever
-/// launched with `--listen`, this is where that support would go.
+/// Both of them: Alacritty through its config file, Neovide over its embedded
+/// Neovim's RPC pipe (see `crate::neovide_opacity`).
+///
+/// # This used to say Neovide was unreachable
+///
+/// The claim was that Neovide "launches `nvim --embed` with no `--listen`, so
+/// there is no named pipe", verified by enumerating `\\.\pipe\`. That is wrong:
+/// Neovim always opens a default pipe and `--listen` only renames it. The
+/// enumeration almost certainly lost the backslashes in `\\.\pipe\` to shell
+/// quoting and listed a nonexistent `C:\pipe` instead, which returns empty
+/// rather than failing. Setting `g:neovide_opacity` over the real pipe and
+/// reading it back works; see the module docs on `neovide_opacity`.
+///
+/// # Why Neovide's result does not become an error
+///
+/// The return value stays the Alacritty outcome. Neovide not running is the
+/// normal case, and it must not turn a successful opacity change into a warning
+/// on every startup and every drag of the slider.
 pub fn apply(percent: u8) -> anyhow::Result<Outcome> {
+    // First, so that a missing alacritty.toml does not stop Neovide being set.
+    let neovide = crate::neovide_opacity::apply(percent);
+    if neovide.reached > 0 {
+        crate::log_info!(
+            "[panefx] neovide opacity -> {percent}% ({} instance(s))",
+            neovide.reached
+        );
+    }
+    if neovide.failed > 0 {
+        crate::log_warn!(
+            "[panefx] {} neovim pipe(s) refused the opacity command",
+            neovide.failed
+        );
+    }
+
     let Some(path) = alacritty_config_path() else {
         anyhow::bail!("no APPDATA, so alacritty.toml cannot be located");
     };
@@ -184,12 +212,28 @@ pub fn apply(percent: u8) -> anyhow::Result<Outcome> {
 ///
 /// Best-effort and silent: a window that was never layered is left alone, and a
 /// failure here is not worth bothering the user about.
+///
+/// # Not every window of a target process is a terminal
+///
+/// This walk must skip `WINIT_EVENT_TARGET_CLASS`. winit creates one hidden
+/// helper window per event loop to receive thread messages, and it is
+/// deliberately `WS_VISIBLE` because a window has to be visible to get
+/// `WM_PAINT` -- what keeps it off the screen is `WS_EX_LAYERED` with no alpha
+/// ever set. Stripping that flag here made it a visible 16x16 window painting
+/// its uninitialised white client area at (0,0): a small white square in the
+/// corner of the desktop, one per Alacritty or Neovide process.
+///
+/// It looked like a wallpaper artefact for a long time, and it survives closing
+/// panefx, because the style change persists on the window until it is
+/// destroyed -- which is exactly what the paragraph above says about the legacy
+/// styles this function exists to clean up. Squares already on screen clear when
+/// those windows next close.
 #[cfg(windows)]
 pub fn clear_legacy_layered_styles() {
     use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetWindowLongPtrW, GetWindowThreadProcessId, SetWindowLongPtrW, GWL_EXSTYLE,
-        WS_EX_LAYERED,
+        EnumWindows, GetClassNameW, GetWindowLongPtrW, GetWindowThreadProcessId, SetWindowLongPtrW,
+        GWL_EXSTYLE, WS_EX_LAYERED,
     };
 
     unsafe extern "system" fn cb(hwnd: HWND, _l: LPARAM) -> BOOL {
@@ -197,6 +241,17 @@ pub fn clear_legacy_layered_styles() {
             let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
             if style & (WS_EX_LAYERED.0 as isize) == 0 {
                 return BOOL(1);
+            }
+            // Never the winit helper window: it needs its layering to stay
+            // invisible. Checked BEFORE the process filter because it is the
+            // cheaper call and the one that actually matters here.
+            let mut class = [0u16; 64];
+            let n = GetClassNameW(hwnd, &mut class);
+            if n > 0 {
+                let name = String::from_utf16_lossy(&class[..n as usize]);
+                if name == crate::ipc::WINIT_EVENT_TARGET_CLASS {
+                    return BOOL(1);
+                }
             }
             // Only touch windows belonging to a process panefx targets, so we
             // never strip layering from an application that set it for its own

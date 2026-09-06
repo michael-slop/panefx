@@ -22,10 +22,24 @@ pub const IPC_URL: &str = "ws://localhost:6123";
 /// Processes that get a backdrop by default.
 ///
 /// Both are winit apps, so both report the generic `"Window Class"` — which is
-/// exactly why the match is on process name. Neovide needs
-/// `transparency = 0.6` in its own config for the backdrop to be visible;
-/// panefx draws BEHIND the window, so an opaque one hides it entirely.
+/// exactly why the match is on process name. panefx draws BEHIND the window, so
+/// an opaque one hides the backdrop entirely; panefx sets the opacity of both
+/// itself (see `term_opacity::apply`), Alacritty through its config file and
+/// Neovide over its Neovim RPC pipe.
+///
+/// Neovide's own config file has NO transparency key — an earlier note here
+/// recommending `transparency = 0.6` there was advising a line Neovide silently
+/// ignores. `g:neovide_opacity` is the real knob.
 pub const DEFAULT_TARGETS: &[&str] = &["alacritty", "neovide"];
+
+/// winit's hidden per-event-loop helper window.
+///
+/// Not a terminal, despite belonging to a target process: winit creates it to
+/// receive thread messages, keeps it `WS_VISIBLE` so it gets `WM_PAINT`, and
+/// relies on `WS_EX_LAYERED` to keep it off the screen. Anything that walks a
+/// target process's windows and changes styles has to skip it — see
+/// `term_opacity::clear_legacy_layered_styles`.
+pub const WINIT_EVENT_TARGET_CLASS: &str = "Winit Thread Event Target";
 
 /// The complete set of events GlazeWM can emit, from `SubscribableEvent` in
 /// `wm-common/src/app_command.rs`. We subscribe to `all` rather than listing

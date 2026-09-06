@@ -37,6 +37,9 @@ pub mod native_windows;
 pub mod opacity;
 // Background opacity, driven through the terminals' own per-pixel alpha.
 pub mod term_opacity;
+// The Neovide half of that: it has no config-file key, so its opacity is set
+// over the embedded Neovim's RPC pipe.
+pub mod neovide_opacity;
 pub mod fire;
 pub mod flames;
 pub mod palette;
