@@ -116,13 +116,24 @@ impl SimPool {
     pub fn acquire(&mut self, key: &SimKey, cfg: &Config) {
         // Scope::Wallpaper -- THE line that makes the desktop tunable
         // independently of the terminal backdrop.
-        let sim = animation::rebuild(
+        let mut sim = animation::rebuild(
             cfg,
             &key.effect,
             key.cols,
             key.rows,
             seed_for(key.monitor),
             animation::Scope::Wallpaper(key.monitor),
+        );
+        // `build` set the rate from the PANE's fps, which is the wrong clock
+        // out here -- the wallpaper runs at `wallpaper_fps`. Without this an
+        // oscillating effect breathes at the wrong speed on the desktop, and
+        // the error is invisible in the config because both numbers are right.
+        // Ignored by every effect that does not care about the rate.
+        sim.set_param(
+            "__fps",
+            &crate::animation::ParamValue::Int {
+                v: cfg.wallpaper_fps.max(1) as i64,
+            },
         );
         self.sims.insert(key.clone(), PooledSim { sim, dirty: true });
     }

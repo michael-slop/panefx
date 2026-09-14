@@ -324,7 +324,14 @@ pub fn build(
             });
             Box::new(s)
         }
-        _ => Box::new(crate::flames::Flames::new(cols, rows, seed)),
+        _ => {
+            let mut f = crate::flames::Flames::new(cols, rows, seed);
+            // Same shape as rain/waves above: the rate is a construction-time
+            // fact the effect cannot read for itself, and flames needs it so
+            // `osc_secs` counts seconds rather than frames.
+            f.set_fps(cfg.fps as f32);
+            Box::new(f)
+        }
     }
 }
 
