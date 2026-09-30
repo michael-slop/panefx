@@ -61,6 +61,19 @@ enum Row {
         text: String,
         count: u32,
     },
+    /// One colour theme. Enter applies it everywhere panefx reaches.
+    Theme {
+        id: String,
+        name: String,
+        swatches: Vec<(u8, u8, u8)>,
+        live: bool,
+    },
+    /// One app a theme can reach. Enter or ←→ switches it on/off.
+    ThemeTarget {
+        id: String,
+        label: String,
+        on: bool,
+    },
     /// Non-selectable explanation, used when the wallpaper layer is missing.
     /// An empty list there would read as "panefx is broken" when in fact the
     /// terminal backdrops are entirely fine.
@@ -80,6 +93,9 @@ enum View {
     /// Exists because the daemon has NO CONSOLE: every failure was previously
     /// invisible, and two real bugs hid behind that for an hour each.
     Logs,
+    /// The colour themes: pick one and panefx recolours itself and every app
+    /// it can reach.
+    Themes,
 }
 
 impl View {
@@ -88,12 +104,14 @@ impl View {
             View::Effects => 0,
             View::Wallpaper => 1,
             View::Logs => 2,
+            View::Themes => 3,
         }
     }
     fn next(self) -> Self {
         match self {
             View::Effects => View::Wallpaper,
-            View::Wallpaper => View::Logs,
+            View::Wallpaper => View::Themes,
+            View::Themes => View::Logs,
             View::Logs => View::Effects,
         }
     }
@@ -104,9 +122,11 @@ struct App {
     effect: String,
     effects: Vec<String>,
     /// Rows per view, rebuilt from every snapshot.
-    rows: [Vec<Row>; 3],
+    rows: [Vec<Row>; 4],
     /// Selection per view, PRESERVED across rebuilds.
-    sel: [ListState; 3],
+    sel: [ListState; 4],
+    /// The live theme's display name, for the Themes header.
+    theme_name: String,
     view: View,
     status: String,
     dirty: bool,
@@ -158,6 +178,15 @@ impl Conn {
         })
     }
 
+    /// A theme change writes several apps' files and can take longer than the
+    /// ordinary two-second reply window.
+    fn send_slow(&mut self, v: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        self.stream.set_read_timeout(Some(Duration::from_secs(20)))?;
+        let r = self.send(v);
+        self.stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        r
+    }
+
     fn send(&mut self, v: serde_json::Value) -> anyhow::Result<serde_json::Value> {
         writeln!(self.stream, "{v}")?;
         self.stream.flush()?;
@@ -174,12 +203,14 @@ impl App {
             conn,
             effect: String::new(),
             effects: Vec::new(),
-            rows: [Vec::new(), Vec::new(), Vec::new()],
+            rows: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             sel: [
                 ListState::default(),
                 ListState::default(),
                 ListState::default(),
+                ListState::default(),
             ],
+            theme_name: String::new(),
             view: View::Effects,
             status: "connected".into(),
             dirty: false,
@@ -195,7 +226,15 @@ impl App {
         app.sel[0].select(Some(0));
         app.sel[1].select(Some(0));
         app.sel[2].select(Some(0));
+        app.sel[3].select(Some(0));
         app.absorb(&reply);
+        // Start the cursor on the live theme.
+        if let Some(i) = app.rows[View::Themes.idx()]
+            .iter()
+            .position(|r| matches!(r, Row::Theme { live: true, .. }))
+        {
+            app.sel[3].select(Some(i));
+        }
         Ok(app)
     }
 
@@ -422,6 +461,10 @@ impl App {
         self.wallpaper_param_monitor = wmon;
         self.rows[View::Wallpaper.idx()] = wrows;
 
+        let (trows, tname) = build_theme_rows(snap);
+        self.rows[View::Themes.idx()] = trows;
+        self.theme_name = tname;
+
         // Clamp EVERY view's selection to its new row count.
         //
         // `absorb` rebuilds the lists wholesale, so a shorter list would leave
@@ -516,9 +559,63 @@ impl App {
                 self.status = "press Enter to apply this effect to every monitor".into();
                 return;
             }
+            Row::Theme { .. } => {
+                self.status = "Enter applies this theme  ·  n / N = next / previous".into();
+                return;
+            }
+            Row::ThemeTarget { .. } => {
+                self.toggle_target();
+                return;
+            }
             Row::Note(_) | Row::Log { .. } => return,
         };
         self.dispatch(msg);
+    }
+
+    /// Switch the theme, and say what each app did.
+    fn apply_theme(&mut self, name: &str) {
+        self.status = format!("applying {name}...");
+        match self.conn.send_slow(serde_json::json!({"cmd":"theme","name":name})) {
+            Ok(reply) => {
+                if let Some(e) = reply.get("error").and_then(|e| e.as_str()) {
+                    self.status = format!("error: {e}");
+                    return;
+                }
+                self.absorb(&reply);
+                self.status = reply
+                    .get("snapshot")
+                    .and_then(|s| s.get("theme_report"))
+                    .map(report_summary)
+                    .unwrap_or_else(|| "applied".into());
+            }
+            Err(e) => self.status = format!("connection lost: {e}"),
+        }
+    }
+
+    /// Flip the highlighted app in or out of `theme_skip`.
+    fn toggle_target(&mut self) {
+        let Some(Row::ThemeTarget { id, on, .. }) = self.rows().get(self.selected()).cloned() else {
+            return;
+        };
+        if id == "panefx" {
+            self.status = "panefx itself always follows the theme".into();
+            return;
+        }
+        let mut skip: Vec<String> = self
+            .rows()
+            .iter()
+            .filter_map(|r| match r {
+                Row::ThemeTarget { id, on: false, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .filter(|s| *s != id)
+            .collect();
+        if on {
+            skip.push(id.clone());
+        }
+        self.dispatch(serde_json::json!({"cmd":"set","key":"theme_skip","val":skip.join(",")}));
+        self.dirty = false; // written through to config.toml by the daemon
+        self.status = format!("{id} {}", if on { "left alone from now on" } else { "follows the theme again" });
     }
 
     fn dispatch(&mut self, msg: serde_json::Value) {
@@ -601,6 +698,8 @@ impl App {
             // These are cycled or fired, never typed into.
             Row::WallpaperMonitor { .. }
             | Row::WallpaperApplyAll
+            | Row::Theme { .. }
+            | Row::ThemeTarget { .. }
             | Row::Note(_)
             | Row::Log { .. } => return,
         };
@@ -897,6 +996,8 @@ fn row_label(r: &Row) -> String {
         Row::WallpaperMonitor { index, label, .. } => format!("{index}  {label}"),
         Row::WallpaperApplyAll => "apply to all".into(),
         Row::Log { at, .. } => format!("{:>4}s", at),
+        Row::Theme { name, live, .. } => format!("{}{name}", if *live { "● " } else { "  " }),
+        Row::ThemeTarget { label, .. } => label.clone(),
         Row::Note(_) => String::new(),
     }
 }
@@ -974,8 +1075,99 @@ fn row_value(r: &Row, effect: &str) -> String {
                 text.clone()
             }
         }
+        Row::Theme { live, .. } => if *live { "live".into() } else { String::new() },
+        Row::ThemeTarget { on, .. } => if *on { "‹ follows ›".into() } else { "‹ left alone ›".into() },
         Row::Note(t) => t.clone(),
     }
+}
+
+/// The Themes tab: every theme under its group heading, then the apps a theme
+/// reaches with their on/off, then what the last change did to each.
+fn build_theme_rows(snap: &serde_json::Value) -> (Vec<Row>, String) {
+    let live = snap.get("theme").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let is_house = |id: &str| matches!(id, "slop" | "aether" | "house" | "");
+    let mut rows = Vec::new();
+    let mut live_name = live.clone();
+    let mut group = String::new();
+    for t in snap.get("themes").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
+        let id = t.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let name = t.get("name").and_then(|v| v.as_str()).unwrap_or(&id).to_string();
+        let g = t.get("group").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if g != group {
+            rows.push(Row::Note(g.to_uppercase()));
+            group = g;
+        }
+        let swatches = t
+            .get("swatches")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().and_then(panefx::palette::Rgb::parse_hex))
+                    .map(|c| (c.0, c.1, c.2))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let is_live = id == live || (is_house(&id) && is_house(&live));
+        if is_live {
+            live_name = name.clone();
+        }
+        rows.push(Row::Theme { id, name, swatches, live: is_live });
+    }
+    let targets = snap.get("theme_targets").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    if !targets.is_empty() {
+        rows.push(Row::Note(String::new()));
+        rows.push(Row::Note("APPS A THEME REACHES".into()));
+        for t in targets {
+            rows.push(Row::ThemeTarget {
+                id: t.get("id").and_then(|v| v.as_str()).unwrap_or("").into(),
+                label: t.get("label").and_then(|v| v.as_str()).unwrap_or("").into(),
+                on: t.get("on").and_then(|v| v.as_bool()).unwrap_or(true),
+            });
+        }
+    }
+    if let Some(r) = snap.get("theme_report") {
+        rows.push(Row::Note(String::new()));
+        rows.push(Row::Note("LAST CHANGE".into()));
+        for line in report_lines(r) {
+            rows.push(Row::Note(line));
+        }
+    }
+    (rows, live_name)
+}
+
+/// `themes::Report` as lines: `label  outcome  note`.
+fn report_lines(r: &serde_json::Value) -> Vec<String> {
+    r.get("targets")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .map(|t| {
+                    let label = t.get("label").and_then(|v| v.as_str()).unwrap_or("");
+                    let o = t.get("outcome").cloned().unwrap_or_default();
+                    let state = o.get("state").and_then(|v| v.as_str()).unwrap_or("").replace('_', " ");
+                    let note = o.get("note").and_then(|v| v.as_str()).unwrap_or("");
+                    format!("{label:<26} {state:<11} {note}")
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One line for the status bar: how many apps changed, and any that did not.
+fn report_summary(r: &serde_json::Value) -> String {
+    let name = r.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    for t in r.get("targets").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
+        let state = t
+            .get("outcome")
+            .and_then(|o| o.get("state"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+            .replace('_', " ");
+        *counts.entry(state).or_default() += 1;
+    }
+    let parts: Vec<String> = counts.into_iter().map(|(k, n)| format!("{n} {k}")).collect();
+    format!("{name}: {}", parts.join(", "))
 }
 
 /// Rows that cannot be selected — pure explanation.
@@ -1023,9 +1215,19 @@ KEYS
     left/right     adjust a value (H / L for x10)
     Enter          type a value
     a              (Wallpaper) apply this effect to every monitor
+    t              the Themes tab
+    n / N          next / previous colour theme (any tab)
     s              save to the config file
     r              revert to the saved config
     q              quit without saving
+
+THEMES
+    panefx-ctl theme list          every theme, the live one marked
+    panefx-ctl theme <id>          switch -- panefx, Alacritty, the editors,
+                                   Windows light/dark, and every app it finds
+    panefx-ctl theme next|prev     cycle
+    panefx-ctl theme house         back to the look you dialled in by hand
+    panefx-ctl --themes            open this TUI on the Themes tab
 
 Changes apply instantly but are NOT saved until `s`, so experiment freely.
 
@@ -1033,16 +1235,100 @@ ENVIRONMENT
     PANEFX_PORT    control-channel port (default 6124)
 ";
 
+/// `panefx-ctl theme <id|next|prev|house|list>`. Talks to the running daemon,
+/// so the change is live; with no daemon, does the file side itself and says
+/// panefx's own colours wait for its next start. Returns the exit code.
+fn theme_cli(what: &str) -> i32 {
+    use panefx::themes;
+    let port: u16 = std::env::var("PANEFX_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_PORT);
+    let conn = Conn::connect(port).ok();
+
+    if what == "list" || what == "ls" {
+        let current = panefx::config::Config::load().theme;
+        let all = themes::catalog::load(&themes::catalog::Dirs::from_env());
+        let mut group = String::new();
+        for t in &all {
+            if t.group != group {
+                println!("{}", t.group.to_uppercase());
+                group = t.group.clone();
+            }
+            let live = t.id == current || (t.is_house() && themes::catalog::is_house(&current));
+            println!("  {} {:<18} {}", if live { "●" } else { " " }, t.id, t.name);
+        }
+        return 0;
+    }
+
+    if let Some(mut c) = conn {
+        return match c.send_slow(serde_json::json!({"cmd":"theme","name":what})) {
+            Ok(reply) => {
+                if let Some(e) = reply.get("error").and_then(|e| e.as_str()) {
+                    eprintln!("panefx: {e}");
+                    return 1;
+                }
+                let r = reply.get("snapshot").and_then(|s| s.get("theme_report")).cloned().unwrap_or_default();
+                println!(
+                    "theme: {} ({})",
+                    r.get("name").and_then(|v| v.as_str()).unwrap_or("?"),
+                    r.get("theme").and_then(|v| v.as_str()).unwrap_or("?")
+                );
+                for l in report_lines(&r) {
+                    println!("  {l}");
+                }
+                0
+            }
+            Err(e) => {
+                eprintln!("panefx: the daemon did not answer ({e})");
+                1
+            }
+        };
+    }
+
+    // No daemon: the files, now; panefx's own colours on its next start.
+    let Some(env) = themes::fsutil::Env::from_system() else {
+        eprintln!("panefx: no USERPROFILE");
+        return 1;
+    };
+    let all = themes::catalog::load(&themes::catalog::Dirs::from_env());
+    let mut disk = panefx::config::Config::load();
+    match themes::switch(&mut disk, &all, what, &env) {
+        Ok(report) => {
+            if let Err(e) = disk.save() {
+                eprintln!("panefx: could not save config.toml: {e}");
+                return 1;
+            }
+            for l in report.lines() {
+                println!("{l}");
+            }
+            println!("(panefx is not running: its own colours apply when it next starts)");
+            0
+        }
+        Err(e) => {
+            eprintln!("panefx: {e}");
+            1
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     // `panefx` with no arguments hands off to this binary, so any flags the
     // user typed arrive here. Handle them rather than ignoring them silently.
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut start_view = View::Effects;
     match args.first().map(String::as_str) {
         None => {}
         Some("-h") | Some("--help") => {
             println!("{HELP}");
             return Ok(());
         }
+        Some("theme") | Some("themes") if args.len() >= 2 => {
+            std::process::exit(theme_cli(&args[1]));
+        }
+        Some("theme") | Some("themes") | Some("--themes") => start_view = View::Themes,
+        // `panefx --tui` forwards its own flag here.
+        Some("-t") | Some("--tui") => {}
         Some(other) => {
             eprintln!("panefx: unknown option '{other}'\n\n{HELP}");
             std::process::exit(2);
@@ -1068,6 +1354,7 @@ fn main() -> anyhow::Result<()> {
         }
     };
     let mut app = App::new(conn)?;
+    app.view = start_view;
 
     enable_raw_mode()?;
     std::io::stdout().execute(EnterAlternateScreen)?;
@@ -1176,9 +1463,13 @@ fn run<B: Backend>(term: &mut Terminal<B>, app: &mut App) -> anyhow::Result<()> 
                     View::Effects => "TUI-Pane — the backdrop behind your windows".into(),
                     View::Wallpaper => "desktop wallpaper".into(),
                     View::Logs => "daemon log — newest last".into(),
+                    View::Themes => "colour themes — Enter applies everywhere panefx reaches".into(),
                 };
             }
             KeyCode::Char('w') => app.view = View::Wallpaper,
+            KeyCode::Char('t') => app.view = View::Themes,
+            KeyCode::Char('n') => app.apply_theme("next"),
+            KeyCode::Char('N') => app.apply_theme("prev"),
             KeyCode::Char('e') => app.view = View::Effects,
             // `g` for logs: `l` is already "adjust right".
             KeyCode::Char('g') => {
@@ -1199,6 +1490,8 @@ fn run<B: Backend>(term: &mut Terminal<B>, app: &mut App) -> anyhow::Result<()> 
                 let row = app.rows().get(app.selected()).cloned();
                 match row {
                     Some(Row::WallpaperApplyAll) => app.apply_to_all(),
+                    Some(Row::Theme { id, .. }) => app.apply_theme(&id),
+                    Some(Row::ThemeTarget { .. }) => app.toggle_target(),
                     Some(Row::WallpaperMonitor { .. }) | Some(Row::Note(_)) | None => {}
                     // A colour opens the PICKER, not a text field: a hex code
                     // alone means guessing what it looks like before
@@ -1267,10 +1560,19 @@ fn draw(f: &mut Frame, app: &App) {
         Span::raw(" "),
         Span::styled(" Wallpaper ", tab_style(View::Wallpaper)),
         Span::raw(" "),
+        Span::styled(" Themes ", tab_style(View::Themes)),
+        Span::raw(" "),
         Span::styled(" Logs ", tab_style(View::Logs)),
         Span::raw("   "),
     ];
     match app.view {
+        View::Themes => {
+            header.push(Span::raw("live: "));
+            header.push(Span::styled(
+                app.theme_name.clone(),
+                Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD),
+            ));
+        }
         View::Effects => {
             header.push(Span::raw("effect: "));
             header.push(Span::styled(
@@ -1348,6 +1650,26 @@ fn draw(f: &mut Frame, app: &App) {
                     Span::styled(format!("  {:>6} ", row_label(r)), Style::default().fg(Color::DarkGray)),
                     Span::styled(row_value(r, ""), style),
                 ]));
+            }
+            // A theme shows what it looks like, in its own colours -- the
+            // one thing a name cannot tell you.
+            if let Row::Theme { swatches, .. } = r {
+                let style = if i == sel {
+                    Style::default().fg(Color::Black).bg(Color::LightGreen).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                let mut spans = vec![
+                    Span::styled(
+                        if i == sel && app.blink_on { "▌ " } else { "  " },
+                        Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!("{:<30}", row_label(r)), style),
+                ];
+                for (r8, g8, b8) in swatches {
+                    spans.push(Span::styled("██", Style::default().fg(Color::Rgb(*r8, *g8, *b8))));
+                }
+                return ListItem::new(Line::from(spans));
             }
             if row_is_note(r) {
                 return ListItem::new(Line::from(vec![
@@ -1464,6 +1786,7 @@ fn draw(f: &mut Frame, app: &App) {
         View::Effects => " ↑↓ move   ←→ adjust (H/L ×10)   Enter type ",
         View::Wallpaper => " ↑↓ move   ←→ effect (incl. off)   [a] all monitors ",
         View::Logs => " ↑↓ scroll   [R] refresh ",
+        View::Themes => " ↑↓ move   Enter apply   n/N next/prev   ←→ app on/off ",
     };
     f.render_stateful_widget(
         List::new(items).block(Block::default().borders(Borders::ALL).title(list_title)),

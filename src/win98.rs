@@ -76,6 +76,10 @@ pub struct Palette {
     pub bad: Color32,
     pub warn: Color32,
     pub black: Color32,
+
+    /// Which egui base style this palette sits on. A field, not a comparison
+    /// with `DARK`: a palette built from a colour theme is neither const.
+    pub dark: bool,
 }
 
 impl Palette {
@@ -116,6 +120,7 @@ impl Palette {
         bad: theme_gen::light::BAD,
         warn: theme_gen::light::WARN,
         black: theme_gen::light::BLACK,
+        dark: false,
     };
 
     /// The same scheme taken down, derived rather than invented -- the
@@ -150,7 +155,55 @@ impl Palette {
         bad: theme_gen::dark::BAD,
         warn: theme_gen::dark::WARN,
         black: theme_gen::dark::BLACK,
+        dark: true,
     };
+
+    /// The same chrome in a colour theme's colours.
+    ///
+    /// Built the way the house palette itself is: the face is the theme's
+    /// background lifted a little toward its text, the bevels are that face
+    /// pushed toward light and dark, the title bar and selection are the
+    /// accent, and the status colours are the theme's own green, red and
+    /// yellow. `None` when the palette lacks a background or foreground.
+    pub fn from_theme(t: &crate::themes::catalog::Theme) -> Option<Palette> {
+        use crate::themes::derive::mix;
+        let c = |x: crate::palette::Rgb| Color32::from_rgb(x.0, x.1, x.2);
+        let bg = t.rgb("background")?;
+        let fg = t.rgb("foreground")?;
+        let acc = t.first(&["accent", "color4"]).unwrap_or(fg);
+        let light = t.is_light();
+        let white = crate::palette::Rgb(255, 255, 255);
+        let black = crate::palette::Rgb(0, 0, 0);
+        let face = mix(bg, fg, if light { 0.06 } else { 0.10 });
+        let hue = |k: &str, d: crate::palette::Rgb| t.rgb(k).unwrap_or(d);
+        let on_accent = if crate::themes::catalog::luminance(acc) > 0.55 { mix(bg, black, 0.5) } else { mix(fg, white, 0.6) };
+        let inactive = hue("color8", mix(fg, bg, 0.6));
+        Some(Palette {
+            desktop: c(bg),
+            button_face: c(face),
+            bevel_white: c(if light { mix(face, white, 0.85) } else { mix(face, fg, 0.35) }),
+            bevel_light: c(if light { mix(face, white, 0.45) } else { mix(face, fg, 0.18) }),
+            bevel_shadow: c(mix(face, black, if light { 0.28 } else { 0.40 })),
+            bevel_dark: c(mix(face, black, if light { 0.60 } else { 0.75 })),
+            title_start: c(acc),
+            title_end: c(mix(acc, bg, 0.55)),
+            title_inactive: c(inactive),
+            title_inact_end: c(mix(inactive, bg, 0.55)),
+            text: c(fg),
+            muted: c(mix(fg, bg, 0.45)),
+            navy: c(acc),
+            white: c(on_accent),
+            yellow: c(hue("color3", acc)),
+            field_bg: c(if light { mix(bg, white, 0.6) } else { mix(bg, black, 0.25) }),
+            panel_bg: c(bg),
+            bone: c(fg),
+            ok: c(hue("color2", acc)),
+            bad: c(hue("color1", acc)),
+            warn: c(hue("color3", acc)),
+            black: c(mix(bg, black, 0.85)),
+            dark: !light,
+        })
+    }
 }
 
 /// Which way the 3D edge faces.
@@ -447,11 +500,11 @@ pub fn apply_theme(ctx: &egui::Context, p: &Palette) {
     // system/user preference. panefx has exactly one look at a time, so the
     // same style is written to both slots -- otherwise the window silently
     // reverts to egui's defaults when Windows is set to the other mode.
-    let theme = if *p == Palette::DARK { egui::Theme::Dark } else { egui::Theme::Light };
+    let theme = if p.dark { egui::Theme::Dark } else { egui::Theme::Light };
     let mut style = (*ctx.style_of(theme)).clone();
     let v = &mut style.visuals;
 
-    v.dark_mode = *p == Palette::DARK;
+    v.dark_mode = p.dark;
     v.panel_fill = p.button_face;
     v.window_fill = p.button_face;
     v.extreme_bg_color = p.field_bg;

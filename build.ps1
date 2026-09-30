@@ -270,7 +270,16 @@ Write-Host 'verified: all five installed copies match the build'
 # because typing `panefx` in a terminal should open the TUI. Omit the flag here
 # and the daemon never starts, which looks exactly like a build that failed.
 # GlazeWM's startup_commands needs the same flag.
-Start-Process -FilePath (Join-Path $glzrDir 'panefx.exe') -ArgumentList '--daemon' -WindowStyle Hidden
+#
+# Through the `panefx` logon task when there is one (INSTALL.exe registers it),
+# NOT Start-Process: a daemon started from this shell is this shell's child and
+# inherits its environment, and one started from an agent's or an SSH session's
+# shell dies with that session. The task starts it the way a logon does.
+if (Get-ScheduledTask -TaskName 'panefx' -ErrorAction SilentlyContinue) {
+    Start-ScheduledTask -TaskName 'panefx'
+} else {
+    Start-Process -FilePath (Join-Path $glzrDir 'panefx.exe') -ArgumentList '--daemon' -WindowStyle Hidden
+}
 Start-Sleep -Seconds 3
 if (Get-Process -Name panefx -ErrorAction SilentlyContinue) {
     Write-Host 'daemon restarted'

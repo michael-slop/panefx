@@ -77,6 +77,9 @@ enum Mode {
     /// works over SSH, which is how the laptop drives this machine.
     Tui,
     Help,
+    /// `panefx theme <id|next|prev|house|list>` -- handed to `panefx-ctl`,
+    /// which has a console to print what each app did.
+    Theme,
     /// An unrecognised flag — say so rather than guessing.
     Unknown(String),
 }
@@ -99,6 +102,7 @@ fn mode_for(first: Option<&str>) -> Mode {
         Some("-t") | Some("--tui") => Mode::Tui,
         Some("-g") | Some("--gui") => Mode::Gui,
         Some("-h") | Some("--help") => Mode::Help,
+        Some("theme") | Some("themes") | Some("--themes") => Mode::Theme,
         Some(other) => Mode::Unknown(other.to_string()),
     }
 }
@@ -163,6 +167,12 @@ mod tests {
     }
 
     #[test]
+    fn theme_goes_to_the_console_binary() {
+        assert_eq!(mode_for(Some("theme")), Mode::Theme);
+        assert_eq!(mode_for(Some("--themes")), Mode::Theme);
+    }
+
+    #[test]
     fn unknown_flags_are_reported_not_guessed() {
         assert_eq!(
             mode_for(Some("--wallpaper")),
@@ -180,6 +190,8 @@ USAGE:
                         one that works over SSH
     panefx --daemon     run the background daemon
     panefx --help       this text
+    panefx theme <id>   switch the colour theme everywhere (also: list,
+                        next, prev, house) -- see `panefx-ctl --help`
 
 The daemon is normally started by your window manager, not by hand — it
 reads every window position from GlazeWM's IPC, so it is a function of the
@@ -294,6 +306,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Mode::Tui => return launch_sibling("panefx-ctl.exe", true),
+        Mode::Theme => return launch_sibling("panefx-ctl.exe", true),
         Mode::Help => {
             // No console on this binary, so printing here goes nowhere useful.
             // Hand `--help` to the console binary, which can actually show it.
@@ -376,6 +389,9 @@ fn main() -> anyhow::Result<()> {
             None
         }
     };
+
+    // Themes: the menu, and the tray's copy of it.
+    let mut themes = ThemeState::new(&cfg);
 
     let mut panels: HashMap<isize, Panel> = HashMap::new();
 
@@ -534,6 +550,21 @@ fn main() -> anyhow::Result<()> {
                     panefx::log_info!("[panefx] exiting on request from the tray");
                     return Ok(());
                 }
+                tray::TrayAction::Theme(_)
+                | tray::TrayAction::ThemeNext
+                | tray::TrayAction::ThemePrev => {
+                    let name = match action {
+                        tray::TrayAction::Theme(i) => themes.themes.get(i).map(|t| t.id.clone()),
+                        tray::TrayAction::ThemeNext => Some("next".to_string()),
+                        _ => Some("prev".to_string()),
+                    };
+                    if let Some(name) = name {
+                        if let Err(e) = apply_theme(&name, &mut cfg, &mut sim, &mut wall, &mut themes) {
+                            panefx::log_warn!("[panefx] theme {name}: {e}");
+                        }
+                        force_redraw = true;
+                    }
+                }
             }
         }
 
@@ -592,6 +623,7 @@ fn main() -> anyhow::Result<()> {
                     sim_rows,
                     &mut needs_query,
                     &mut pending_opacity,
+                    &mut themes,
                 );
                 server.reply(peer, &reply);
             }
@@ -730,6 +762,35 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
+        // --- themes: apps that were open when the theme changed ---
+        //
+        // Xournal++ rewrites its own settings on exit, so a theme written while
+        // it runs would be undone. Those targets report "waiting" and land here
+        // once the app has closed.
+        if !themes.pending.is_empty() && themes.last_retry.elapsed() >= THEME_RETRY {
+            themes.last_retry = Instant::now();
+            if let Some(env) = themes.env.clone() {
+                let current = cfg.theme.clone();
+                let pending = std::mem::take(&mut themes.pending);
+                for (target, theme_id) in pending {
+                    match panefx::themes::retry(&target, &theme_id, &current, &themes.themes, &env) {
+                        Some(panefx::themes::targets::Outcome::Deferred(_)) => {
+                            themes.pending.push((target, theme_id))
+                        }
+                        Some(outcome) => {
+                            panefx::log_info!("[panefx] theme {theme_id}: {target} {}", outcome.word());
+                            if let Some(r) = themes.report.as_mut() {
+                                if let Some(t) = r.targets.iter_mut().find(|t| t.id == target) {
+                                    t.outcome = outcome;
+                                }
+                            }
+                        }
+                        None => {}
+                    }
+                }
+            }
+        }
+
         // --- desktop wallpaper, on its OWN clock ---
         //
         // Called every daemon frame but rate-limited internally to
@@ -763,6 +824,115 @@ fn main() -> anyhow::Result<()> {
 // unchanged.
 use animation::{apply_saved_params, rebuild};
 
+/// The daemon's side of themes: the menu, where the apps live, what the last
+/// change did, and which apps are still waiting to be recoloured.
+struct ThemeState {
+    themes: Vec<panefx::themes::catalog::Theme>,
+    env: Option<panefx::themes::fsutil::Env>,
+    report: Option<panefx::themes::Report>,
+    /// (target id, theme id) for apps that were running and would have
+    /// overwritten the change. Retried every `THEME_RETRY` until they land or
+    /// the theme moves on.
+    pending: Vec<(String, String)>,
+    last_retry: Instant,
+}
+
+/// How often to retry an app that was open when the theme changed. The check
+/// is a process list; five seconds is prompt without being a poll loop.
+const THEME_RETRY: Duration = Duration::from_secs(5);
+
+impl ThemeState {
+    fn new(cfg: &config::Config) -> Self {
+        let mut s = ThemeState {
+            themes: Vec::new(),
+            env: panefx::themes::fsutil::Env::from_system(),
+            report: None,
+            pending: Vec::new(),
+            last_retry: Instant::now(),
+        };
+        s.reload(cfg);
+        s
+    }
+
+    /// Re-read the menu and palettes, so a theme synced from the laptop or
+    /// dropped into `~\.config\panefx\themes` appears without a restart. Also
+    /// refreshes the tray's copy.
+    fn reload(&mut self, cfg: &config::Config) {
+        self.themes = panefx::themes::catalog::load(&panefx::themes::catalog::Dirs::from_env());
+        let current = self.themes.iter().position(|t| {
+            t.id == cfg.theme || (t.is_house() && panefx::themes::catalog::is_house(&cfg.theme))
+        });
+        tray::set_themes(
+            self.themes.iter().map(|t| (t.group.clone(), t.name.clone())).collect(),
+            current,
+        );
+    }
+
+    fn views(&self) -> Vec<control::ThemeView> {
+        self.themes
+            .iter()
+            .map(|t| control::ThemeView {
+                id: t.id.clone(),
+                name: t.name.clone(),
+                group: t.group.clone(),
+                swatches: t.swatches().into_iter().map(|c| c.to_hex()).collect(),
+                light: t.is_light(),
+            })
+            .collect()
+    }
+
+    fn target_views(cfg: &config::Config) -> Vec<control::ThemeTargetView> {
+        let mut v = vec![control::ThemeTargetView {
+            id: "panefx".into(),
+            label: "panefx effects + GUI".into(),
+            on: true,
+        }];
+        v.extend(panefx::themes::targets::all().iter().map(|t| control::ThemeTargetView {
+            id: t.id().into(),
+            label: t.label().into(),
+            on: !cfg.theme_skip.iter().any(|s| s == t.id()),
+        }));
+        v
+    }
+}
+
+/// Switch the theme: the config ON DISK first (so unsaved tweaks in the live
+/// config stay unsaved), then the same colours copied into the live config and
+/// pushed to the running effects -- terminal backdrop and every wallpaper --
+/// without rebuilding anything. No `revert`: color.mesh's Windows backend
+/// reloaded the whole daemon to change five colours.
+fn apply_theme(
+    name: &str,
+    cfg: &mut config::Config,
+    sim: &mut Box<dyn AsciiAnimation>,
+    wall: &mut wallpaper::WallpaperSet,
+    ts: &mut ThemeState,
+) -> Result<panefx::themes::Report, String> {
+    let Some(env) = ts.env.clone() else {
+        return Err("no USERPROFILE, so there is nowhere to write themes".into());
+    };
+    ts.reload(cfg);
+    let mut disk = config::Config::load();
+    let report = panefx::themes::switch(&mut disk, &ts.themes, name, &env)?;
+    disk.save().map_err(|e| format!("could not save config.toml: {e}"))?;
+
+    panefx::themes::effects::sync_colours(&disk, cfg);
+    cfg.theme = disk.theme.clone();
+    apply_saved_params(sim.as_mut(), cfg, animation::Scope::Pane);
+    for eff in animation::EFFECTS {
+        wall.reapply_params(eff, cfg);
+    }
+
+    ts.pending = report.deferred();
+    ts.last_retry = Instant::now();
+    ts.report = Some(report.clone());
+    ts.reload(cfg);
+    for line in report.lines() {
+        panefx::log_info!("[panefx] {line}");
+    }
+    Ok(report)
+}
+
 /// Handle one control command. Returns the reply to send back.
 #[allow(clippy::too_many_arguments)]
 fn handle_command(
@@ -776,12 +946,18 @@ fn handle_command(
     sim_rows: usize,
     needs_query: &mut bool,
     pending_opacity: &mut Option<(u8, Instant)>,
+    ts: &mut ThemeState,
 ) -> control::Reply {
     use control::{Command, ConfigView, Reply, Snapshot, WallpaperMonitorView};
 
     let snapshot = |sim: &Box<dyn AsciiAnimation>,
                     cfg: &config::Config,
-                    wall: &wallpaper::WallpaperSet| Snapshot {
+                    wall: &wallpaper::WallpaperSet,
+                    ts: &ThemeState| Snapshot {
+        theme: cfg.theme.clone(),
+        themes: ts.views(),
+        theme_targets: ThemeState::target_views(cfg),
+        theme_report: ts.report.clone(),
         effect: sim.name().to_string(),
         effects: animation::EFFECTS.iter().map(|s| s.to_string()).collect(),
         params: sim.params(),
@@ -924,7 +1100,7 @@ fn handle_command(
     };
 
     match cmd {
-        Command::Get => Reply::with(snapshot(sim, cfg, wall)),
+        Command::Get => Reply::with(snapshot(sim, cfg, wall, ts)),
 
         Command::Set { key, val } => {
             if !cfg.set_field(&key, &val) {
@@ -953,6 +1129,16 @@ fn handle_command(
             if key == "opacity" || key == "pane_off" {
                 *pending_opacity = Some((cfg.effective_opacity(), Instant::now()));
             }
+            // Which apps a theme may touch is decided against the SAVED config
+            // (a theme change starts from disk), so a switch flipped in the GUI
+            // is written through now -- just that key, not every unsaved tweak.
+            if key == "theme_skip" {
+                let mut disk = config::Config::load();
+                disk.theme_skip = cfg.theme_skip.clone();
+                if let Err(e) = disk.save() {
+                    return Reply::err(format!("could not save theme_skip: {e}"));
+                }
+            }
             // The wallpaper grid changed. Without this the new value is stored
             // and read back correctly by `cell_for` -- but the live surfaces
             // keep the grid they were BUILT with, so the TUI reports a change
@@ -975,7 +1161,7 @@ fn handle_command(
                 let name = sim.name().to_string();
                 *sim = rebuild(cfg, &name, sim_cols, sim_rows, 0x5EED_1234, animation::Scope::Pane);
             }
-            Reply::with(snapshot(sim, cfg, wall))
+            Reply::with(snapshot(sim, cfg, wall, ts))
         }
 
         Command::Effect { name } => {
@@ -996,7 +1182,7 @@ fn handle_command(
             }
             *last_rotate = Instant::now();
             panefx::log_info!("[panefx] effect -> {wanted}");
-            Reply::with(snapshot(sim, cfg, wall))
+            Reply::with(snapshot(sim, cfg, wall, ts))
         }
 
         Command::Param { key, val } => {
@@ -1006,7 +1192,7 @@ fn handle_command(
             // Mirror into config so a later save persists it.
             let name = sim.name().to_string();
             cfg.set_effect_param(&name, &key, val.display());
-            Reply::with(snapshot(sim, cfg, wall))
+            Reply::with(snapshot(sim, cfg, wall, ts))
         }
 
         Command::Save => match cfg.save() {
@@ -1028,8 +1214,13 @@ fn handle_command(
             wall.rebuild_surfaces(cfg);
             // Same for opacity: the reloaded config may carry a different one.
             *pending_opacity = Some((cfg.opacity, Instant::now()));
-            Reply::with(snapshot(sim, cfg, wall))
+            Reply::with(snapshot(sim, cfg, wall, ts))
         }
+
+        Command::Theme { name } => match apply_theme(&name, cfg, sim, wall, ts) {
+            Ok(_) => Reply::with(snapshot(sim, cfg, wall, ts)),
+            Err(e) => Reply::err(e),
+        },
 
         Command::Logs { lines } => {
             // Capped so a bad client cannot ask for an unbounded response.
@@ -1075,7 +1266,7 @@ fn handle_command(
             // the change is visible immediately without restarting the
             // animation.
             wall.reapply_params(&eff, cfg);
-            Reply::with(snapshot(sim, cfg, wall))
+            Reply::with(snapshot(sim, cfg, wall, ts))
         }
 
         Command::WallpaperLayer {
@@ -1096,7 +1287,7 @@ fn handle_command(
             // Rebuilt rather than patched in place: the stack's LENGTH changed,
             // so the surface's sim list has to be rebuilt from the config.
             wall.rebuild_surfaces(cfg);
-            Reply::with(snapshot(sim, cfg, wall))
+            Reply::with(snapshot(sim, cfg, wall, ts))
         }
 
         Command::WallpaperEffect { monitor, name } => {
@@ -1123,7 +1314,7 @@ fn handle_command(
                     }
                 }
             }
-            Reply::with(snapshot(sim, cfg, wall))
+            Reply::with(snapshot(sim, cfg, wall, ts))
         }
     }
 }
@@ -1240,6 +1431,7 @@ mod cli_tests {
             Mode::Tui => "tui",
             Mode::Daemon => "daemon",
             Mode::Help => "help",
+            Mode::Theme => "theme",
             Mode::Unknown(_) => "unknown",
         }
     }

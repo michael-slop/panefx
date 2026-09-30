@@ -189,6 +189,16 @@ pub struct Config {
     /// than two settings that can disagree. The raw pair stays editable for
     /// anyone who wants a size off the ladder.
     pub wallpaper_detail: u8,
+
+    /// The live colour theme's id (see `crate::themes`). `"slop"` -- or the key
+    /// being absent -- is the house theme: whatever colours were dialled in by
+    /// hand. A FLAT key, never a `[theme]` section: a non-effect section's keys
+    /// fall through to the top level (see `apply_toml`), and `to_toml` would
+    /// drop the section on the next save.
+    pub theme: String,
+    /// Theme targets switched off, by id (`winmode`, `alacritty`, ...). A theme
+    /// change leaves these alone.
+    pub theme_skip: Vec<String>,
 }
 
 impl Default for Config {
@@ -238,6 +248,8 @@ impl Default for Config {
             // 5 -> 16x25, within a pixel of the 15x23 this used to default to,
             // so the look does not change on first run after the knob appeared.
             wallpaper_detail: 5,
+            theme: crate::themes::catalog::HOUSE_ID.to_string(),
+            theme_skip: Vec::new(),
         }
     }
 }
@@ -477,7 +489,7 @@ impl Config {
     /// Deliberately hand-rolled rather than pulling in a TOML crate: this is a
     /// dozen flat `key = value` lines, and the dependency is not worth it.
     /// Unknown keys are ignored so an old binary tolerates a newer file.
-    fn apply_toml(&mut self, text: &str) {
+    pub(crate) fn apply_toml(&mut self, text: &str) {
         // Section tracking: `[rain]` / `[flames]` hold per-effect params, which
         // are stashed verbatim and handed to the effect when it is built. Only
         // the top level (no section) sets Config fields.
@@ -694,6 +706,8 @@ impl Config {
                     }
                 }
                 "chars" => self.chars_override = Some(v.to_string()),
+                "theme" => self.theme = v.trim().to_lowercase(),
+                "theme_skip" => self.theme_skip = Config::parse_list(v),
                 "rotation" => {
                     let list = Config::parse_list(v);
                     if !list.is_empty() {
@@ -798,6 +812,23 @@ impl Config {
         s.push_str(&format!("opacity = {}\n", self.opacity));
         s.push_str(&format!("pane_off = {}
 ", self.pane_off));
+
+        // Written only when they say something: on the house theme with every
+        // target on, the file is exactly what it was before themes existed.
+        if !crate::themes::catalog::is_house(&self.theme) {
+            s.push_str("\n# The colour theme panefx has applied everywhere it can (`panefx-ctl\n");
+            s.push_str("# theme list`). Change it from the Themes tab, the tray, or\n");
+            s.push_str("# `panefx-ctl theme <id|next|prev|house>` -- not here: a theme also\n");
+            s.push_str("# writes the other apps' files, which editing this line does not.\n");
+            s.push_str(&format!("theme = \"{}\"\n", self.theme));
+        }
+        if !self.theme_skip.is_empty() {
+            if crate::themes::catalog::is_house(&self.theme) {
+                s.push('\n');
+            }
+            s.push_str("# Theme targets left alone when the theme changes.\n");
+            s.push_str(&format!("theme_skip = \"{}\"\n", self.theme_skip.join(", ")));
+        }
 
         s.push_str("\n# --- desktop wallpaper ----------------------------------------------\n");
         s.push_str("# Drawn into Explorer's WorkerW layer, BEHIND the desktop icons.\n");
@@ -1083,6 +1114,16 @@ impl Config {
                     true
                 }
                 _ => false,
+            },
+            // Which theme targets to leave alone. The theme ITSELF is not a
+            // field you set: changing it writes other apps' files, so it has its
+            // own command (`theme`).
+            "theme_skip" => match as_str() {
+                Some(s) => {
+                    self.theme_skip = Config::parse_list(&s);
+                    true
+                }
+                None => false,
             },
             "cell_w" => matches!(as_i64(), Some(n) if n > 0 && n <= 200).then(|| {
                 self.cell_w = as_i64().unwrap() as i32;

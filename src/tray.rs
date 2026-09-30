@@ -21,7 +21,7 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
     GetCursorPos, LoadIconW, PostQuitMessage, RegisterClassExW, SetForegroundWindow,
-    TrackPopupMenu, HICON, ICONINFO, IDI_APPLICATION, MF_SEPARATOR, MF_STRING, TPM_BOTTOMALIGN,
+    TrackPopupMenu, HICON, ICONINFO, IDI_APPLICATION, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, TPM_BOTTOMALIGN,
     TPM_RIGHTALIGN, WM_APP, WM_COMMAND, WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSEXW,
     WS_OVERLAPPED,
 };
@@ -96,6 +96,12 @@ const WM_TRAYICON: u32 = WM_APP + 1;
 const ID_OPEN_GUI: usize = 1;
 const ID_RELOAD: usize = 2;
 const ID_EXIT: usize = 3;
+const ID_THEME_NEXT: usize = 4;
+const ID_THEME_PREV: usize = 5;
+/// Theme `i` in the menu is `ID_THEME_BASE + i`. The range is bounded so an
+/// unrelated WM_COMMAND id can never read as a theme pick.
+const ID_THEME_BASE: usize = 100;
+const MAX_THEMES: usize = 400;
 
 /// What the user picked from the tray menu.
 ///
@@ -109,6 +115,23 @@ pub enum TrayAction {
     OpenGui,
     Reload,
     Exit,
+    /// A theme from the Theme submenu, by its position in the menu.
+    Theme(usize),
+    ThemeNext,
+    ThemePrev,
+}
+
+/// The theme menu as the daemon last described it: `(group, name)` per theme
+/// in menu order, and which one is live. The daemon owns the list; this is only
+/// what the next right-click draws.
+static THEMES: std::sync::Mutex<(Vec<(String, String)>, Option<usize>)> =
+    std::sync::Mutex::new((Vec::new(), None));
+
+/// Tell the tray what the Theme submenu should offer, and which is ticked.
+pub fn set_themes(entries: Vec<(String, String)>, current: Option<usize>) {
+    if let Ok(mut t) = THEMES.lock() {
+        *t = (entries, current);
+    }
 }
 
 /// Menu command id -> action.
@@ -121,6 +144,11 @@ pub fn action_for(id: usize) -> Option<TrayAction> {
         ID_OPEN_GUI => Some(TrayAction::OpenGui),
         ID_RELOAD => Some(TrayAction::Reload),
         ID_EXIT => Some(TrayAction::Exit),
+        ID_THEME_NEXT => Some(TrayAction::ThemeNext),
+        ID_THEME_PREV => Some(TrayAction::ThemePrev),
+        i if (ID_THEME_BASE..ID_THEME_BASE + MAX_THEMES).contains(&i) => {
+            Some(TrayAction::Theme(i - ID_THEME_BASE))
+        }
         _ => None,
     }
 }
@@ -185,6 +213,38 @@ unsafe fn show_menu(hwnd: HWND) {
     // `panefx --tui` because it is the only one of the two that works over
     // SSH, but a tray menu is never reached over SSH.
     let _ = AppendMenuW(menu, MF_STRING, ID_OPEN_GUI, gui);
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+
+    // Theme: the whole list as a submenu, grouped the way the pickers group
+    // it, the live one ticked -- then next/previous, for cycling without
+    // opening anything. Names are the user's data, so they are wide strings
+    // built here rather than `w!` literals. `DestroyMenu` on the parent frees
+    // the submenu too.
+    let mut keep: Vec<Vec<u16>> = Vec::new();
+    let wide = |s: &str, keep: &mut Vec<Vec<u16>>| {
+        keep.push(s.encode_utf16().chain(std::iter::once(0)).collect());
+        PCWSTR(keep.last().unwrap().as_ptr())
+    };
+    if let (Ok(sub), Ok(t)) = (CreatePopupMenu(), THEMES.lock()) {
+        let (entries, current) = &*t;
+        let mut group = "";
+        for (i, (g, name)) in entries.iter().enumerate().take(MAX_THEMES) {
+            if g != group {
+                if !group.is_empty() {
+                    let _ = AppendMenuW(sub, MF_SEPARATOR, 0, PCWSTR::null());
+                }
+                group = g;
+                let head = wide(&g.to_uppercase(), &mut keep);
+                let _ = AppendMenuW(sub, MF_STRING | MF_GRAYED, 0, head);
+            }
+            let flags = if *current == Some(i) { MF_STRING | MF_CHECKED } else { MF_STRING };
+            let label = wide(name, &mut keep);
+            let _ = AppendMenuW(sub, flags, ID_THEME_BASE + i, label);
+        }
+        let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, windows::core::w!("Theme"));
+    }
+    let _ = AppendMenuW(menu, MF_STRING, ID_THEME_NEXT, windows::core::w!("Next theme"));
+    let _ = AppendMenuW(menu, MF_STRING, ID_THEME_PREV, windows::core::w!("Previous theme"));
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     let _ = AppendMenuW(menu, MF_STRING, ID_RELOAD, reload);
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
@@ -296,6 +356,16 @@ mod tests {
         assert_eq!(action_for(ID_OPEN_GUI), Some(TrayAction::OpenGui));
         assert_eq!(action_for(ID_RELOAD), Some(TrayAction::Reload));
         assert_eq!(action_for(ID_EXIT), Some(TrayAction::Exit));
+        assert_eq!(action_for(ID_THEME_NEXT), Some(TrayAction::ThemeNext));
+        assert_eq!(action_for(ID_THEME_PREV), Some(TrayAction::ThemePrev));
+        assert_eq!(action_for(ID_THEME_BASE), Some(TrayAction::Theme(0)));
+        assert_eq!(action_for(ID_THEME_BASE + 26), Some(TrayAction::Theme(26)));
+    }
+
+    #[test]
+    fn the_theme_range_is_bounded() {
+        assert_eq!(action_for(ID_THEME_BASE + MAX_THEMES), None);
+        assert_eq!(action_for(ID_THEME_BASE - 1), None);
     }
 
     #[test]
@@ -308,7 +378,7 @@ mod tests {
 
     #[test]
     fn the_ids_are_distinct() {
-        let ids = [ID_OPEN_GUI, ID_RELOAD, ID_EXIT];
+        let ids = [ID_OPEN_GUI, ID_RELOAD, ID_EXIT, ID_THEME_NEXT, ID_THEME_PREV, ID_THEME_BASE];
         let mut sorted = ids.to_vec();
         sorted.sort_unstable();
         sorted.dedup();

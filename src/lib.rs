@@ -56,6 +56,9 @@ pub mod waves;
 pub mod gui_prefs;
 pub mod setup;
 pub mod theme_gen;
+// Colour themes: one choice, recoloured everywhere panefx can reach -- its own
+// effects and GUI, and every app in `themes::targets`. color.mesh's Windows half.
+pub mod themes;
 pub mod warlock_art;
 pub mod warlockspin;
 pub mod win98;

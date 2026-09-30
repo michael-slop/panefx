@@ -119,6 +119,14 @@ impl Conn {
         })
     }
 
+    /// A theme change writes several apps' files; give it longer than a `get`.
+    fn send_slow(&mut self, msg: &serde_json::Value) -> std::io::Result<serde_json::Value> {
+        self.stream.set_read_timeout(Some(Duration::from_secs(20)))?;
+        let r = self.send(msg);
+        self.stream.set_read_timeout(Some(Duration::from_millis(400)))?;
+        r
+    }
+
     fn send(&mut self, msg: &serde_json::Value) -> std::io::Result<serde_json::Value> {
         writeln!(self.stream, "{msg}")?;
         self.stream.flush()?;
@@ -152,14 +160,17 @@ enum Tab {
     /// whole daemon rather than to one monitor or one effect, which is why
     /// they are not on the wallpaper tab.
     Settings,
+    /// Colour themes: one pick recolours panefx and every app it reaches.
+    Themes,
 }
 
 impl Tab {
-    const ALL: [Tab; 4] = [Tab::Panes, Tab::Wallpaper, Tab::Settings, Tab::Logs];
+    const ALL: [Tab; 5] = [Tab::Panes, Tab::Wallpaper, Tab::Themes, Tab::Settings, Tab::Logs];
     fn label(self) -> &'static str {
         match self {
             Tab::Panes => "TUI-fx",
             Tab::Wallpaper => "wallpaper",
+            Tab::Themes => "themes",
             Tab::Settings => "settings",
             Tab::Logs => "logs",
         }
@@ -176,6 +187,7 @@ impl Tab {
             Tab::Wallpaper => "wallpaper",
             Tab::Settings => "settings",
             Tab::Logs => "logs",
+            Tab::Themes => "themes",
         }
     }
 
@@ -220,6 +232,16 @@ struct App {
     /// Cached: probing the filesystem every frame would be silly.
     glazewm: bool,
     last_poll: std::time::Instant,
+    /// The theme list with palettes, for building the chrome's colours. Read
+    /// from the same files the daemon reads; re-read when the daemon names a
+    /// theme this copy does not know.
+    themes: Vec<panefx::themes::catalog::Theme>,
+    /// The palette last handed to egui, so it is re-applied only on a change
+    /// (`apply_theme` also installs the font).
+    applied: Option<Palette>,
+    /// A theme id already looked for on disk and not found, so the files are
+    /// not re-read every frame while the daemon names it.
+    missing_theme: String,
 }
 
 impl App {
@@ -263,6 +285,9 @@ impl App {
             about: false,
             glazewm: glazewm_path().is_some(),
             last_poll: std::time::Instant::now(),
+            themes: panefx::themes::catalog::load(&panefx::themes::catalog::Dirs::from_env()),
+            applied: None,
+            missing_theme: String::new(),
         };
         app.reconnect();
         app
@@ -297,11 +322,17 @@ impl App {
                 if let Some(s) = reply.get("snapshot") {
                     self.snap = s.clone();
                 }
+                // A `logs` reply carries no snapshot. Keep its lines where the
+                // Logs tab reads them -- otherwise that tab stayed empty.
+                if let (Some(l), Some(obj)) = (reply.get("logs"), self.snap.as_object_mut()) {
+                    obj.insert("logs".into(), l.clone());
+                }
                 // Anything that is not a read or a write-to-disk leaves the
                 // daemon's live state ahead of config.toml.
                 let cmd = msg.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
                 match cmd {
-                    "get" | "logs" => {}
+                    // A theme change saves itself.
+                    "get" | "logs" | "theme" => {}
                     "save" | "revert" => self.dirty = false,
                     _ => self.dirty = true,
                 }
@@ -352,8 +383,12 @@ impl eframe::App for App {
     // eframe 0.36 hands the app a `Ui`, not a `Context` -- the frame is already
     // begun and the central panel allocated.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let p = if self.dark { Palette::DARK } else { Palette::LIGHT };
+        let p = self.palette();
         let ctx = ui.ctx().clone();
+        if self.applied != Some(p) {
+            win98::apply_theme(&ctx, &p);
+            self.applied = Some(p);
+        }
 
         // Poll: the daemon does not push, and something else (the TUI, a
         // script) may have changed it under us.
@@ -446,6 +481,7 @@ impl App {
                 Tab::Panes => self.panes_tab(&mut inner, p),
                 Tab::Wallpaper => self.wallpaper_tab(&mut inner, p),
                 Tab::Settings => self.settings_tab(&mut inner, p),
+                Tab::Themes => self.themes_tab(&mut inner, p),
                 Tab::Logs => self.logs_tab(&mut inner, p),
             },
         }
@@ -488,12 +524,10 @@ impl App {
                 }
             }
             ui.add_space(12.0);
-            if ui.button(if self.dark { "light" } else { "dark" }).clicked() {
+            // The house look's light/dark. Under a colour theme the chrome
+            // wears the theme, so the button only shows while on house.
+            if self.on_house() && ui.button(if self.dark { "light" } else { "dark" }).clicked() {
                 self.dark = !self.dark;
-                win98::apply_theme(
-                    ui.ctx(),
-                    if self.dark { &Palette::DARK } else { &Palette::LIGHT },
-                );
                 self.remember();
             }
             if ui.button("about").clicked() {
@@ -1201,7 +1235,15 @@ impl App {
     /// built, so the GUI could set every effect and colour but could not change
     /// the frame rate. Same keys, same ranges, same `Set` command the TUI
     /// sends, so the two cannot drift apart.
+    /// Scrolls: on a small window the lower settings were clipped and could
+    /// not be reached at all (Michael, 2026-09-30).
     fn settings_tab(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.settings_body(ui, p));
+    }
+
+    fn settings_body(&mut self, ui: &mut egui::Ui, p: &Palette) {
         ui.label(egui::RichText::new("global settings").size(16.0));
         ui.add_space(2.0);
         ui.label(
@@ -1371,6 +1413,184 @@ impl App {
                 self.dirty = true;
             }
         });
+    }
+
+    fn on_house(&self) -> bool {
+        let id = self.snap.get("theme").and_then(|v| v.as_str()).unwrap_or("");
+        panefx::themes::catalog::is_house(id)
+    }
+
+    /// The chrome's colours: the live theme's, or the house light/dark.
+    fn palette(&mut self) -> Palette {
+        let house = if self.dark { Palette::DARK } else { Palette::LIGHT };
+        let id = self.snap.get("theme").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if panefx::themes::catalog::is_house(&id) {
+            return house;
+        }
+        if !self.themes.iter().any(|t| t.id == id) && self.missing_theme != id {
+            self.themes = panefx::themes::catalog::load(&panefx::themes::catalog::Dirs::from_env());
+            if !self.themes.iter().any(|t| t.id == id) {
+                self.missing_theme = id.clone();
+            }
+        }
+        self.themes
+            .iter()
+            .find(|t| t.id == id)
+            .and_then(Palette::from_theme)
+            .unwrap_or(house)
+    }
+
+    fn apply_theme(&mut self, name: &str) {
+        let Daemon::Up(conn) = &mut self.daemon else {
+            self.status = "not connected".into();
+            return;
+        };
+        match conn.send_slow(&serde_json::json!({"cmd":"theme","name":name})) {
+            Ok(reply) => {
+                if let Some(e) = reply.get("error").and_then(|v| v.as_str()) {
+                    self.status = e.to_string();
+                    return;
+                }
+                if let Some(s) = reply.get("snapshot") {
+                    self.snap = s.clone();
+                }
+                self.status = format!(
+                    "theme: {}",
+                    self.snap
+                        .get("theme_report")
+                        .and_then(|r| r.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(name)
+                );
+            }
+            Err(e) => self.daemon = Daemon::Down(e.to_string()),
+        }
+    }
+
+    /// Every theme, drawn in its own colours; one click applies it to panefx
+    /// and every app it reaches. Below: which apps those are (each can be
+    /// switched off) and what the last change did to each.
+    fn themes_tab(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let live = self.snap.get("theme").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let themes = self.snap.get("themes").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let targets = self.snap.get("theme_targets").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let report = self.snap.get("theme_report").cloned();
+        let mut pick: Option<String> = None;
+        let mut skip_toggle: Option<String> = None;
+
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("colour themes").size(16.0));
+            ui.add_space(12.0);
+            if ui.button("< previous").clicked() {
+                pick = Some("prev".into());
+            }
+            if ui.button("next >").clicked() {
+                pick = Some("next".into());
+            }
+        });
+        ui.label(
+            egui::RichText::new("one click recolours panefx, its effects and every app below; house = the look you dialled in")
+                .size(11.0)
+                .color(p.muted),
+        );
+        ui.add_space(6.0);
+
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            let mut group = String::new();
+            for t in &themes {
+                let id = t.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let name = t.get("name").and_then(|v| v.as_str()).unwrap_or(id);
+                let g = t.get("group").and_then(|v| v.as_str()).unwrap_or("");
+                if g != group {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(g.to_uppercase()).size(11.0).color(p.muted));
+                    group = g.to_string();
+                }
+                let is_live = id == live
+                    || (panefx::themes::catalog::is_house(id) && panefx::themes::catalog::is_house(&live));
+                let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width().min(460.0), 22.0), egui::Sense::click());
+                let hovered = resp.hovered();
+                win98::bevel(
+                    ui.painter(),
+                    rect,
+                    win98::toggle_bevel(is_live),
+                    p,
+                    Some(if hovered && !is_live { p.panel_bg } else { win98::toggle_face(is_live, p) }),
+                );
+                ui.painter().text(
+                    rect.left_center() + Vec2::new(8.0, 0.0),
+                    egui::Align2::LEFT_CENTER,
+                    format!("{}{name}", if is_live { "● " } else { "  " }),
+                    egui::FontId::new(win98::size::TEXT, egui::FontFamily::Monospace),
+                    p.text,
+                );
+                // The theme's own eight colours, so a name is never a guess.
+                let sw = t.get("swatches").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                for (i, hex) in sw.iter().enumerate() {
+                    if let Some(c) = hex.as_str().and_then(panefx::palette::Rgb::parse_hex) {
+                        let x = rect.right() - 8.0 - (sw.len() - i) as f32 * 16.0;
+                        let r = Rect::from_min_size(egui::pos2(x, rect.top() + 4.0), Vec2::new(14.0, rect.height() - 8.0));
+                        ui.painter().rect_filled(r, 0.0, egui::Color32::from_rgb(c.0, c.1, c.2));
+                    }
+                }
+                if resp.clicked() && !is_live {
+                    pick = Some(id.to_string());
+                }
+            }
+
+            ui.add_space(12.0);
+            ui.label(egui::RichText::new("APPS A THEME REACHES").size(11.0).color(p.muted));
+            for t in &targets {
+                let id = t.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let label = t.get("label").and_then(|v| v.as_str()).unwrap_or("");
+                let mut on = t.get("on").and_then(|v| v.as_bool()).unwrap_or(true);
+                let enabled = id != "panefx";
+                if ui.add_enabled(enabled, egui::Checkbox::new(&mut on, label)).changed() {
+                    skip_toggle = Some(id);
+                }
+            }
+
+            if let Some(r) = &report {
+                ui.add_space(12.0);
+                ui.label(egui::RichText::new("LAST CHANGE").size(11.0).color(p.muted));
+                for t in r.get("targets").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
+                    let label = t.get("label").and_then(|v| v.as_str()).unwrap_or("");
+                    let o = t.get("outcome").cloned().unwrap_or_default();
+                    let state = o.get("state").and_then(|v| v.as_str()).unwrap_or("");
+                    let note = o.get("note").and_then(|v| v.as_str()).unwrap_or("");
+                    let colour = match state {
+                        "live" | "next_start" => p.ok,
+                        "failed" => p.bad,
+                        "deferred" => p.warn,
+                        _ => p.muted,
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!("{label:<26}")).size(11.0).monospace());
+                        ui.label(egui::RichText::new(format!("{:<11}", state.replace('_', " "))).size(11.0).monospace().color(colour));
+                        ui.label(egui::RichText::new(note).size(11.0).color(p.muted));
+                    });
+                }
+            }
+        });
+
+        if let Some(name) = pick {
+            self.apply_theme(&name);
+        }
+        if let Some(id) = skip_toggle {
+            let mut skip: Vec<String> = targets
+                .iter()
+                .filter(|t| t.get("on").and_then(|v| v.as_bool()) == Some(false))
+                .filter_map(|t| t.get("id").and_then(|v| v.as_str()).map(String::from))
+                .collect();
+            if let Some(i) = skip.iter().position(|s| *s == id) {
+                skip.remove(i);
+            } else {
+                skip.push(id);
+            }
+            self.send(serde_json::json!({"cmd":"set","key":"theme_skip","val":skip.join(",")}));
+            // Written through to config.toml by the daemon.
+            self.dirty = false;
+        }
     }
 
     fn logs_tab(&mut self, ui: &mut egui::Ui, p: &Palette) {

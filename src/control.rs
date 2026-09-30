@@ -99,6 +99,11 @@ pub enum Command {
         /// The refused process's pid, so a repeat offender can be identified.
         pid: u32,
     },
+    /// Switch the colour theme everywhere panefx reaches: its own effects and
+    /// GUI, and every app in `themes::targets`. `name` is a theme id, `next`,
+    /// `prev`, or `house` (the hand-dialled look). The reply's snapshot carries
+    /// `theme_report`, saying what each app did.
+    Theme { name: String },
     /// Fetch the daemon's recent log lines.
     ///
     /// Separate from `Get` because the log is polled far more often than the
@@ -184,6 +189,38 @@ pub struct Snapshot {
     /// — which keeps the selection rule a local, testable decision.
     #[serde(default)]
     pub wallpaper_params: std::collections::BTreeMap<String, Vec<Param>>,
+
+    /// The live theme's id (`slop` = the house look).
+    #[serde(default)]
+    pub theme: String,
+    /// Every theme, in menu order, with what it looks like.
+    #[serde(default)]
+    pub themes: Vec<ThemeView>,
+    /// Every app a theme can reach, and whether it is switched on.
+    #[serde(default)]
+    pub theme_targets: Vec<ThemeTargetView>,
+    /// What the last theme change did, app by app -- including any still
+    /// waiting for their app to close. Absent until a theme has been changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme_report: Option<crate::themes::Report>,
+}
+
+/// One theme, as the pickers show it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ThemeView {
+    pub id: String,
+    pub name: String,
+    pub group: String,
+    /// Eight `#rrggbb` blocks: background, six hues, accent.
+    pub swatches: Vec<String>,
+    pub light: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ThemeTargetView {
+    pub id: String,
+    pub label: String,
+    pub on: bool,
 }
 
 /// One monitor, as the TUI sees it.
@@ -631,6 +668,8 @@ mod tests {
             r#"{"cmd":"wallpaper_effect","monitor":3,"name":"waves"}"#,
             // monitor omitted == apply to all
             r#"{"cmd":"wallpaper_effect","name":"off"}"#,
+            r#"{"cmd":"theme","name":"tokyo-night"}"#,
+            r#"{"cmd":"theme","name":"next"}"#,
         ];
         for c in cases {
             assert!(
