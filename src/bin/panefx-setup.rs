@@ -122,7 +122,7 @@ fn main() {
     println!();
     println!("  Open the control panel :  click the FX icon in your system tray,");
     println!("                            or type  panefx  in a new terminal");
-    println!("  Something wrong        :  run REPORT.exe and send Michael the file");
+    println!("  Something wrong        :  run REPORT.exe and send the file to whoever gave you panefx (or open a GitHub issue)");
     println!("  Read this first        :  README-BETA.txt");
     println!();
     pause("  Press Enter to close.");
@@ -487,7 +487,8 @@ fn report_daemon() {
         println!("    running -- look for the FX icon in your system tray");
     } else {
         println!("    the daemon did not stay running.");
-        println!("    Run REPORT.exe and send Michael the file it writes.");
+        println!("    Run REPORT.exe and send the file it writes to whoever gave you panefx,
+    or attach it to an issue at github.com/michael-slop/panefx/issues.");
     }
 }
 

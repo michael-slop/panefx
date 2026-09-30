@@ -1,35 +1,42 @@
 # panefx
 
-Animated ASCII backdrops that sit **behind** your terminal windows and follow
-them around a tiling window manager.
+Animated ASCII backdrops **behind your terminal windows and on your desktop**,
+and one switch for the colour theme of everything that sits on top of them.
 
-Alacritty at 60% opacity, a panel pinned directly behind it, and a live TUI to
-switch effects and tune them while you watch.
+Alacritty (or Neovide) at partial opacity with a panel pinned directly behind
+it, an animated wallpaper per monitor behind the icons, and a control panel --
+GUI, TUI or tray -- to switch effects, tune them while you watch, and flip the
+whole desktop between 27 colour themes in one click.
 
-> ### ⚠️ This is a personal tool, published as-is
+> ### Windows 11 only
 >
-> It is written for **one machine**: Windows 11, [GlazeWM](https://github.com/glzr-io/glazewm),
-> and [Alacritty](https://alacritty.org/). It depends on GlazeWM's IPC for every
-> window position, so **without GlazeWM running it does nothing at all.**
+> It works best with [GlazeWM](https://github.com/glzr-io/glazewm) and
+> [Alacritty](https://alacritty.org/), but needs neither: with no GlazeWM it
+> follows windows through Win32 itself (`window_source = "auto"`), and the
+> desktop wallpaper needs no terminal at all. The release zip carries an
+> installer (`INSTALL.exe`) that stays inside your user profile -- no admin
+> prompt, no service, no driver.
 >
-> There is no installer, no configuration wizard, and the build sets
-> `target-cpu=native` — the binary is not portable to another CPU. If you want to
-> use it, expect to read the source and adjust paths.
+> It started as a tool for one machine and still has that machine's opinions.
+> Expect to tune things.
 
 ---
 
 ## What it actually is
 
-The interesting part is not the ASCII. It is the **follower**: a borderless,
-never-focusable window that pins itself directly behind another window in the
-z-order and tracks it through every retile, workspace switch and focus change a
-tiling WM throws at it.
+Three things, sharing one daemon:
 
-That machinery does not care what gets drawn into it. ASCII effects are the
-current subsystem, not the definition — image playback, shaders or live system
-stats would slot into the same trait.
+* **The follower.** A borderless, never-focusable window that pins itself
+  directly behind another window in the z-order and tracks it through every
+  retile, workspace switch and focus change a tiling WM throws at it. That
+  machinery does not care what gets drawn into it; ASCII effects are the current
+  subsystem, not the definition.
+* **The wallpaper.** The same effects drawn on the desktop behind the icons, one
+  per monitor, stacked in layers if you like, frozen when a monitor is covered.
+* **The theme driver.** Pick a theme and panefx recolours its own effects and
+  UI, then every app it can reach (see *Themes* below).
 
-Two problems make this harder than it sounds, both solved here:
+Two problems make the follower harder than it sounds, both solved here:
 
 * **GlazeWM emits no move or resize event.** Nothing in its IPC announces new
   geometry. Events are only a hint that *something* changed; the actual rect
@@ -44,47 +51,89 @@ Two problems make this harder than it sounds, both solved here:
 
 | effect | what it is | source |
 |---|---|---|
-| `waves` | Procedural black-water field. Six octaves of ridged, sheared value noise, deformed in place by a travelling swirl. | ported from my own `blackwaves.py` |
-| `rain` | CP437 matrix rain — deliberately **not** katakana, because BigBlueTerm is a DOS font and "ASCII rain" ought to be ASCII. | ported from michaelslop.org's boot screen |
 | `flames` | Sparse-seeded integer fire that sits as a band along the bottom. | port of [msimpson's gist](https://gist.github.com/msimpson/1096950) |
+| `waves` | Procedural black-water field. Six octaves of ridged, sheared value noise, deformed in place by a travelling swirl. | ported from my own `blackwaves.py` |
+| `rain` | CP437 matrix rain -- deliberately **not** katakana, because BigBlueTerm is a DOS font and "ASCII rain" ought to be ASCII. | ported from michaelslop.org's boot screen |
 | `fire` | The classic heat-dissipation fire, full height. | port of [mhearse/asciifire](https://github.com/mhearse/asciifire) |
+| `plasma` | The demoscene sine plasma, quantised so it stays cheap to draw. | |
+| `tunnel` `starfield` | The two other demoscene classics. | |
+| `donut` `sphere` `cube` `galaxy` | Spinning shaded 3D shapes in characters, after the famous `donut.c`. | |
+| `skullspin` | The michael.slop mascot skull, spinning. | ported from michaelslop.org |
+| `warlockspin` | A hooded skeleton in sunglasses, rocking. | traced from a sprite |
+| `wizardtorch` `tgevil` `wzfire` `raalien` | Classic CP437 ANSI art, re-lit by the effect: a torch that flickers, fire that breathes. | traced from `.ANS` files -- see *Credits* |
+| `fishloop` | A frame-by-frame ASCII animation, played back sparse. | an [ascii-motion](https://ascii-motion.app) project -- see *Credits* |
+
+---
+
+## Themes
+
+27 colour themes -- the IDE classics (Tokyo Night, Catppuccin, Gruvbox, Nord,
+Kanagawa, Dracula, One Dark, Solarized, Monokai, GitHub Dark, ...), Omarchy's
+originals, four light ones, and **house**. Pick one and panefx recolours:
+
+| what | how | when |
+|---|---|---|
+| panefx's own effects | every colour of every effect, behind the terminals and on every monitor | instantly |
+| panefx's GUI | the Win98 chrome, rebuilt from the theme | instantly |
+| Alacritty | a palette file of its own, imported last by your `alacritty.toml` (one edit, once) | instantly |
+| Neovim / Neovide | the theme's real colorscheme, switched in every running editor -- needs [`extras/nvim/zz-colormesh.lua`](extras/nvim/) in your config | instantly |
+| Windows | light or dark mode, following the theme | instantly |
+| VS Code | `workbench.colorCustomizations`, spliced in with your comments kept | instantly |
+| Windows Terminal | a colour scheme called `panefx`, delivered as a fragment -- choose it once | next start |
+| Xournal++ | its stylesheet colours, canvas and pen palette (only written while it is closed; panefx waits) | next start |
+
+**House is not a palette.** It is whatever you had dialled in before your first
+theme: that moment, panefx records every value it is about to change, and
+choosing house puts exactly those back. Each app can be switched off (Themes
+tab, or `theme_skip` in the config), and every change reports what each app
+did -- changed, changes on next start, waiting for the app to close, or not
+installed.
+
+```powershell
+panefx theme list          # every theme, the live one marked
+panefx theme tokyo-night   # switch
+panefx theme next          # cycle (also: prev, house)
+```
+
+Add your own: drop a `colors.toml`-style file (`background`, `foreground`,
+`accent`, `cursor`, `selection_*`, `color0`-`color15`) into
+`~\.config\panefx\themes\<name>.toml` and it joins the menu.
 
 ---
 
 ## Usage
 
 ```powershell
-panefx            # open the control TUI
-panefx --daemon   # run the daemon by hand (normally GlazeWM's job)
+panefx            # the GUI control panel
+panefx --tui      # the same controls in a terminal -- the one that works over SSH
+panefx --daemon   # run the daemon by hand (normally the logon task's job)
+panefx theme ...  # themes, as above
 panefx --help     # keys and usage
-
-panefx-ctl        # the TUI directly — what `panefx` hands off to
 ```
 
-Typing `panefx` gives you the TUI, because that is what you actually want from a
-terminal. The daemon needs `--daemon`, and that is what GlazeWM's
-`startup_commands` passes — **drop the flag there and the backdrops silently
-stop appearing at startup.**
-
-It autostarts with GlazeWM, so normally you never launch the daemon yourself.
+The tray icon opens the GUI, and its menu has the whole theme list plus
+next/previous theme. The daemon needs `--daemon`; that is what the logon task
+(or GlazeWM's `startup_commands`) passes.
 
 ### The TUI
 
-Two tabs: **Effects** (the running backdrop) and **Wallpaper** (the desktop).
+Four tabs: **TUI-Pane** (the backdrop behind your windows), **Wallpaper** (the
+desktop), **Themes**, and **Logs**.
 
 | key | does |
 |---|---|
-| `Tab` | switch tab (`w` / `e` jump straight to one) |
+| `Tab` | switch tab (`e` / `w` / `t` / `g` jump straight to one) |
 | `↑` `↓` | move between rows |
 | `←` `→` | adjust (`H` / `L` for ×10) |
-| `Enter` | type a value directly |
+| `Enter` | type a value directly; on the Themes tab, apply the theme |
+| `n` / `N` | next / previous theme, from any tab |
 | `a` | *(Wallpaper tab)* apply this effect to every monitor |
 | `s` | save to `~\.config\panefx\config.toml` |
 | `r` | revert to the saved config |
-| `q` | quit — **without saving** |
+| `q` | quit -- **without saving** |
 
 Changes apply to the running panels **instantly**. Nothing persists until `s`,
-so experiment freely and quit to throw it away.
+so experiment freely and quit to throw it away. (A theme change saves itself.)
 
 The row list is built from whatever the effect declares, so a new effect's knobs
 appear automatically.
@@ -119,6 +168,7 @@ The daemon listens on `127.0.0.1:6124`, newline-delimited JSON:
 {"cmd":"param","key":"darkcut","val":{"kind":"int","v":300}}
 {"cmd":"wallpaper_effect","monitor":3,"name":"rain"}   // one monitor
 {"cmd":"wallpaper_effect","name":"off"}                // every monitor
+{"cmd":"theme","name":"tokyo-night"}                   // or next / prev / house
 {"cmd":"save"}   {"cmd":"revert"}
 ```
 
@@ -229,7 +279,7 @@ covers a lot of ground:
   tests and still looked wrong.
 * **The ports are faithful to sources I chose**, and where they deviate the code
   says so and why.
-* It is **not vibe-coded and not unreviewed**: 207 tests, measured before/after
+* It is **not vibe-coded and not unreviewed**: 450+ tests, measured before/after
   numbers on every optimisation, and the commit history shows the failures as
   well as the fixes — including changes that were reverted because they measured
   no better.
@@ -239,9 +289,23 @@ repository is a fair thing to skip.
 
 ---
 
+## Credits
+
+* **Ports** -- the effects table above names each source; each port's module
+  header records what was kept, what was changed, and why.
+* **ANSI art** -- `wizardtorch`, `tgevil`, `wzfire` and `raalien` are traced
+  from the `.ANS` files `AXB-WIZARDTORCH.ANS`, `TG-EVIL.ANS`, `WZ-FIRE.ANS` and
+  `ra-alien.ans`, by their original artists of the ANSI art scene. They are
+  reproduced as shade maps with the colour discarded. If one of them is yours
+  and you want it credited differently, or removed, open an issue.
+* **fishloop** -- *Fish Loop*, a published [ascii-motion](https://ascii-motion.app)
+  project (`424d1127-7ab4-449a-ac73-a543524a4141`), by its author.
+* **Themes** -- see [THEMES.md](THEMES.md).
+* **Font** -- BigBlueTerm437 Nerd Font Mono: VileR's
+  [Ultimate Oldschool PC Font Pack](https://int10h.org/oldschool-pc-fonts/)
+  (CC BY-SA 4.0), patched by [Nerd Fonts](https://www.nerdfonts.com/).
+
 ## License
 
-MIT. See [LICENSE](LICENSE).
-
-The ported effects credit their sources above; each port's module header records
-what was kept, what was changed, and why.
+MIT for the code. See [LICENSE](LICENSE). The font keeps its own licence
+(CC BY-SA 4.0), and the art and theme palettes are credited above.

@@ -51,6 +51,23 @@ which is a plain text file you can read, edit and delete. Deleting it resets
 everything to defaults.
 
 
+THEMES
+------
+
+The "themes" tab (or the tray's Theme menu, or `panefx theme list`) holds 27
+colour themes. Pick one and panefx recolours its own effects and window, then
+every app it finds: Alacritty, Neovim/Neovide (with extras\nvim installed),
+Windows light/dark mode, VS Code, Windows Terminal (choose the `panefx` scheme
+once) and Xournal++. The tab lists each app, what the last change did to it,
+and a box to leave it alone.
+
+"house" puts everything back exactly as it was before your first theme --
+that moment is recorded in %USERPROFILE%\.config\panefx\house.json.
+
+    panefx theme tokyo-night      switch from a terminal
+    panefx theme next             cycle (also: prev, house)
+
+
 TURNING PARTS OFF
 -----------------
 

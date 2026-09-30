@@ -375,8 +375,17 @@ impl App {
 /// controls. Also the path the daemon is started through: a process started
 /// directly by a GUI can die with it, so GlazeWM owns it instead.
 fn glazewm_path() -> Option<std::path::PathBuf> {
-    let p = std::path::PathBuf::from(r"C:\Program Files\glzr.io\GlazeWM\cli\glazewm.exe");
-    p.exists().then_some(p)
+    // Program Files as Windows reports it (not a hard-coded C:), then PATH.
+    let pf = std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into());
+    let p = std::path::PathBuf::from(pf).join(r"glzr.io\GlazeWM\cli\glazewm.exe");
+    if p.exists() {
+        return Some(p);
+    }
+    std::env::var("PATH").ok().and_then(|path| {
+        path.split(';')
+            .map(|d| std::path::Path::new(d).join("glazewm.exe"))
+            .find(|p| p.exists())
+    })
 }
 
 impl eframe::App for App {

@@ -189,6 +189,10 @@ if ($Beta) {
     Copy-Item "dist\README-BETA.txt" $stage -Force
     Copy-Item "assets\BigBlueTerm437NerdFontMono-Regular.ttf" $stage -Force
     Copy-Item "LICENSE" $stage -Force -ErrorAction SilentlyContinue
+    # The theme credits and the editor plugin travel with the zip: THEMES.md is
+    # how the palettes are credited, and extras\nvim is what makes Neovim follow.
+    Copy-Item "THEMES.md" $stage -Force
+    Copy-Item "extras" $stage -Recurse -Force
 
     $zip = Join-Path ([Environment]::GetFolderPath('Desktop')) 'panefx-beta.zip'
     Remove-Item $zip -Force -ErrorAction SilentlyContinue

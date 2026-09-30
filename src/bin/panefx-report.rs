@@ -53,12 +53,13 @@ fn main() {
  println!("  Report written to:");
  println!("    {}", path.display());
  println!();
- println!("  Send that file to Michael.");
+ println!("  Send that file to whoever gave you panefx, or attach it to an issue at
+  github.com/michael-slop/panefx/issues.");
  println!("  Nothing was sent anywhere by this program.");
  }
  Err(e) => {
  println!("  Could not write the report: {e}");
- println!("  Tell Michael what this window says.");
+ println!("  Send whoever gave you panefx what this window says.");
  }
     }
     println!();

@@ -134,8 +134,18 @@ macro_rules! log_warn {
 mod tests {
     use super::*;
 
+    /// The log is ONE process-wide buffer and tests run in parallel, so these
+    /// tests take turns: `the_buffer_is_bounded` pushes a few hundred lines,
+    /// and landing in the middle of another test's two pushes made that test
+    /// fail about one run in three (seen 2026-09-30).
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn repeats_collapse_into_a_count() {
+        let _turn = serial();
         // THE reason this buffer exists: the floating-pane bug logged one
         // identical line per frame. Without collapsing, a minute of that would
         // evict every other clue from the buffer.
@@ -156,15 +166,18 @@ mod tests {
 
     #[test]
     fn a_different_line_starts_a_new_entry() {
+        let _turn = serial();
         push(Level::Warn, "first distinct line");
         push(Level::Warn, "second distinct line");
-        let t = tail(2);
-        assert_eq!(t.len(), 2);
-        assert_ne!(t[0].text, t[1].text);
+        let t = tail(CAPACITY);
+        let first = t.iter().rposition(|e| e.text == "first distinct line").unwrap();
+        let second = t.iter().rposition(|e| e.text == "second distinct line").unwrap();
+        assert_ne!(first, second, "two different lines are two entries");
     }
 
     #[test]
     fn the_buffer_is_bounded() {
+        let _turn = serial();
         // A daemon that runs for weeks must not grow without limit.
         for i in 0..(CAPACITY + 50) {
             push(Level::Info, format!("line {i}"));
@@ -174,9 +187,13 @@ mod tests {
 
     #[test]
     fn tail_returns_the_newest_lines_last() {
+        let _turn = serial();
         push(Level::Info, "older marker line");
         push(Level::Info, "newer marker line");
-        let t = tail(2);
-        assert_eq!(t.last().unwrap().text, "newer marker line");
+        // Other modules' tests may log in between, so compare positions
+        // rather than insisting the marker is the very last line.
+        let t = tail(CAPACITY);
+        let at = |m: &str| t.iter().rposition(|e| e.text == m).unwrap();
+        assert!(at("newer marker line") > at("older marker line"), "newest must come last");
     }
 }
