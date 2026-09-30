@@ -52,6 +52,19 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Short enough to feel live against Alacritty's own ~2s reload latency.
 const OPACITY_DEBOUNCE: Duration = Duration::from_millis(150);
 
+/// How often to look for a Neovide that has appeared since the last push.
+///
+/// Neovide is push-only over its RPC pipe, so an instance that starts after the
+/// last opacity change is never told the value (see the catch-up block in the
+/// main loop). This is how long a freshly-opened Neovide can sit at the wrong
+/// opacity before it converges.
+///
+/// Two seconds because the work is one directory read of `\\.\pipe\` and the
+/// cost of being wrong is visible: any longer and a new window is noticeably
+/// the wrong opacity while you look at it. Matches the ~2s Alacritty already
+/// takes to reload its own config, so both terminals settle together.
+const NEOVIDE_POLL: Duration = Duration::from_secs(2);
+
 /// What the user asked for on the command line.
 #[derive(Debug, PartialEq, Eq)]
 enum Mode {
@@ -370,6 +383,13 @@ fn main() -> anyhow::Result<()> {
     // below. `None` means nothing is pending.
     let mut pending_opacity: Option<(u8, Instant)> = None;
 
+    // Which `nvim.*` pipes existed at the last check, so a NEW Neovide can be
+    // told the current opacity. Seeded from the startup push below rather than
+    // left empty: an empty set would make every instance already running look
+    // like it had just appeared and earn a redundant command on the first tick.
+    let mut neovide_pipes = panefx::neovide_opacity::pipe_set();
+    let mut neovide_poll = Instant::now();
+
     // Push the configured opacity out once at startup so panefx's config and
     // the terminal's cannot drift apart.
     //
@@ -664,6 +684,48 @@ fn main() -> anyhow::Result<()> {
                         );
                     }
                     Err(e) => panefx::log_warn!("[panefx] could not set opacity: {e}"),
+                }
+            }
+        }
+
+        // --- Neovide catch-up: a NEW instance has to be told ---
+        //
+        // Alacritty needs nothing here. Its opacity lives in alacritty.toml, so
+        // a terminal launched at any later time reads the right value off disk
+        // by itself. Neovide has no such key -- `neovide_opacity` is PUSHED to
+        // a live process over its RPC pipe -- so an instance that starts after
+        // the last push never hears the number at all.
+        //
+        // That is not hypothetical. Measured 2026-09-17: the daemon started on
+        // Sep 16 with `pane_off = true`, correctly wrote `opacity = 1.0` to
+        // alacritty.toml and pushed 100% at startup -- to nothing, because no
+        // Neovide was running. Neovide launched 33 hours later and came up
+        // transparent over a switched-off backdrop, while Alacritty was solid.
+        // The push is not an error when it reaches nothing (that is the normal
+        // case), so it was silent for 33 hours.
+        //
+        // Polled on the set of `nvim.*` pipes rather than on a timer: the value
+        // only needs re-sending when the population CHANGES, so a steady state
+        // costs one directory read per interval and sends nothing. Pushing every
+        // interval regardless would put a `nvim_command` down every pipe forever
+        // for no reason.
+        if neovide_poll.elapsed() >= NEOVIDE_POLL {
+            neovide_poll = Instant::now();
+            let pipes = panefx::neovide_opacity::pipe_set();
+            if pipes != neovide_pipes {
+                // Only push when something APPEARED. A Neovide closing shrinks
+                // the set and needs no command sent anywhere.
+                let appeared = !pipes.is_subset(&neovide_pipes);
+                neovide_pipes = pipes;
+                if appeared {
+                    let want = cfg.effective_opacity();
+                    let applied = panefx::neovide_opacity::apply(want);
+                    if applied.reached > 0 {
+                        panefx::log_info!(
+                            "[panefx] new neovide -> {want}% ({} instance(s))",
+                            applied.reached
+                        );
+                    }
                 }
             }
         }

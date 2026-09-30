@@ -128,6 +128,22 @@ fn nvim_pipes() -> Vec<std::path::PathBuf> {
     Vec::new()
 }
 
+/// The set of `nvim.*` pipe names currently open.
+///
+/// For spotting a Neovide that started AFTER the last push. Alacritty reads its
+/// opacity from a file and so needs no equivalent; Neovide is push-only, and a
+/// push that lands before the process exists is simply lost (see `apply`).
+///
+/// Names rather than full paths, and a `BTreeSet` rather than a count: a count
+/// cannot tell "one closed, one opened" from "nothing happened", and that pair
+/// of events in one interval is exactly when a fresh instance needs telling.
+pub fn pipe_set() -> std::collections::BTreeSet<std::ffi::OsString> {
+    nvim_pipes()
+        .into_iter()
+        .filter_map(|p| p.file_name().map(std::ffi::OsStr::to_os_string))
+        .collect()
+}
+
 /// What a call actually did, so the caller can log honestly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Applied {
@@ -230,6 +246,24 @@ mod tests {
         assert_eq!(b[21], 0xD9, "str8 marker");
         assert_eq!(b[22] as usize, cmd.len());
         assert_eq!(&b[23..], cmd.as_bytes());
+    }
+
+    /// The catch-up in the main loop compares this set between ticks, so it has
+    /// to be callable when no Neovim is running and report that as "none"
+    /// rather than panicking or erroring -- the same "not a fault" stance
+    /// `apply` takes.
+    #[test]
+    fn the_pipe_set_is_readable_with_nothing_running() {
+        let s = pipe_set();
+        // Whatever is running on the machine under test, every name this
+        // returns is an nvim pipe -- that filter is what makes a set difference
+        // mean "a Neovim appeared" rather than "some pipe somewhere changed".
+        for name in &s {
+            assert!(
+                name.to_string_lossy().starts_with("nvim"),
+                "pipe_set must only ever report nvim pipes, got {name:?}"
+            );
+        }
     }
 
     #[test]

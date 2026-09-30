@@ -28,9 +28,11 @@ pub mod light {
     pub const FIELD_BG: Color32 = Color32::from_rgb(255, 255, 255);
     pub const GUTTER_BG: Color32 = Color32::from_rgb(228, 228, 228);
     pub const GUTTER_TEXT: Color32 = Color32::from_rgb(128, 128, 128);
+    pub const LAVENDER: Color32 = Color32::from_rgb(111, 106, 133);
     pub const MUTED: Color32 = Color32::from_rgb(74, 74, 74);
     pub const NAVY: Color32 = Color32::from_rgb(0, 0, 128);
     pub const OK: Color32 = Color32::from_rgb(0, 122, 0);
+    pub const ORCHID: Color32 = Color32::from_rgb(109, 79, 168);
     pub const PANEL_BG: Color32 = Color32::from_rgb(212, 208, 200);
     pub const TITLE_END: Color32 = Color32::from_rgb(16, 132, 208);
     pub const TITLE_INACTIVE: Color32 = Color32::from_rgb(128, 128, 128);
@@ -58,9 +60,11 @@ pub mod dark {
     pub const FIELD_BG: Color32 = Color32::from_rgb(10, 14, 20);
     pub const GUTTER_BG: Color32 = Color32::from_rgb(10, 14, 20);
     pub const GUTTER_TEXT: Color32 = Color32::from_rgb(92, 100, 112);
+    pub const LAVENDER: Color32 = Color32::from_rgb(172, 164, 200);
     pub const MUTED: Color32 = Color32::from_rgb(139, 135, 120);
     pub const NAVY: Color32 = Color32::from_rgb(26, 36, 48);
     pub const OK: Color32 = Color32::from_rgb(98, 230, 112);
+    pub const ORCHID: Color32 = Color32::from_rgb(187, 155, 247);
     pub const PANEL_BG: Color32 = Color32::from_rgb(17, 24, 35);
     pub const TITLE_END: Color32 = Color32::from_rgb(26, 36, 48);
     pub const TITLE_INACTIVE: Color32 = Color32::from_rgb(10, 14, 20);
