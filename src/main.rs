@@ -112,11 +112,11 @@ mod tests {
     use super::*;
 
     /// The GUI must be findable from where the DAEMON runs, not just from
-    /// ~in.
+    /// ~\bin.
     ///
     /// This is the bug this test exists for: GlazeWM starts the daemon from
     /// ~\.glzr\glazewm\scripts\, build.ps1 installed the GUI only to
-    /// ~in, and the tray looked only beside itself. "Open panefx" spawned a
+    /// ~\bin, and the tray looked only beside itself. "Open panefx" spawned a
     /// path that did not exist and failed silently -- the click did nothing at
     /// all, with no error anywhere.
     ///
@@ -214,12 +214,12 @@ WM rather than an independent service.
 ///
 /// Looking only beside the daemon is NOT enough, and assuming otherwise was a
 /// real bug: GlazeWM starts the daemon from `~\.glzr\glazewm\scripts\`,
-/// while `build.ps1` installs the GUI only to `~in\`. The tray's "open
+/// while `build.ps1` installs the GUI only to `~\bin\`. The tray's "open
 /// panefx" spawned a path that did not exist and failed silently -- a click
 /// that did nothing at all, with no error anywhere.
 ///
 /// Order: beside us (a self-contained folder, which is how the beta zip ships),
-/// then `~in` (the normal install), then PATH.
+/// then `~\bin` (the normal install), then PATH.
 fn find_gui() -> Option<std::path::PathBuf> {
     const NAME: &str = "panefx-gui.exe";
 
@@ -522,7 +522,7 @@ fn main() -> anyhow::Result<()> {
                         None => {
                             // This was a real bug: GlazeWM starts the daemon
                             // from ~\.glzr\glazewm\scripts\, but build.ps1
-                            // installs the GUI only to ~in\. Looking only
+                            // installs the GUI only to ~\bin\. Looking only
                             // beside ourselves found nothing and the tray
                             // click did nothing at all, silently.
                             panefx::log_warn!(
