@@ -65,11 +65,27 @@ impl Drop for InstanceLock {
 /// `Ok(lock)` means this process owns it and must keep `lock` alive.
 /// `Err(())` means another daemon already has it and this one should exit.
 pub fn acquire() -> Result<InstanceLock, ()> {
+    acquire_named(w!("Local\\panefx-daemon"))
+}
+
+/// The same lock for the GUI: one control panel per logon session.
+///
+/// Exists because the GUI's old guard looked for an existing panefx-gui WINDOW,
+/// and a GUI takes a moment to open its window. Clicking the tray icon five
+/// times quickly started five processes before any of them had a window, so
+/// every one passed the check and five control panels opened (Michael,
+/// 2026-09-30). The kernel object exists from the first instruction of the
+/// first instance, so there is no window to wait for.
+pub fn acquire_gui() -> Result<InstanceLock, ()> {
+    acquire_named(w!("Local\\panefx-gui"))
+}
+
+fn acquire_named(name: windows::core::PCWSTR) -> Result<InstanceLock, ()> {
     unsafe {
         // `binitialowner: false` — ownership of the mutex is irrelevant here.
         // Its mere existence is the signal, and not taking ownership means an
         // abandoned-mutex state can never arise.
-        let handle = match CreateMutexW(None, false, w!("Local\\panefx-daemon")) {
+        let handle = match CreateMutexW(None, false, name) {
             Ok(h) => h,
             // If the mutex cannot be created at all, do NOT refuse to start:
             // that would turn an unexpected OS failure into "panefx no longer
@@ -113,4 +129,21 @@ pub fn report_refused_to_incumbent(port: u16) {
     );
     let _ = sock.write_all(line.as_bytes());
     let _ = sock.flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The GUI bug: five quick tray clicks opened five panels. With the lock,
+    /// a second holder of the same name is refused while the first is alive,
+    /// and the name is free again the moment the first lets go.
+    #[test]
+    fn a_second_instance_is_refused_until_the_first_is_gone() {
+        let name = w!("Local\\panefx-test-single-instance");
+        let first = acquire_named(name).expect("the first instance gets the lock");
+        assert!(acquire_named(name).is_err(), "a second instance must be refused");
+        drop(first);
+        assert!(acquire_named(name).is_ok(), "and the lock is free once the first exits");
+    }
 }

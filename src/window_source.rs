@@ -108,7 +108,31 @@ impl WindowSource for NativeSource {
 }
 
 /// Pick a backend according to `pref`, and say which one won.
+/// Which backend is live, for the snapshot (`"glazewm"` / `"native"`).
+static ACTIVE: std::sync::Mutex<&'static str> = std::sync::Mutex::new("");
+
+pub fn active() -> &'static str {
+    ACTIVE.lock().map(|a| *a).unwrap_or("")
+}
+
+pub fn set_active(name: &'static str) {
+    if let Ok(mut a) = ACTIVE.lock() {
+        *a = name;
+    }
+}
+
+/// GlazeWM, if it answers right now. For picking it back up after it went away.
+pub fn try_glazewm() -> Option<Box<dyn WindowSource>> {
+    ipc::IpcThread::spawn().ok().map(|t| Box::new(GlazeSource(t)) as Box<dyn WindowSource>)
+}
+
 pub fn connect(pref: Preference) -> anyhow::Result<Box<dyn WindowSource>> {
+    let s = connect_inner(pref)?;
+    set_active(s.name());
+    Ok(s)
+}
+
+fn connect_inner(pref: Preference) -> anyhow::Result<Box<dyn WindowSource>> {
     match pref {
         Preference::Native => {
             crate::log_info!("[panefx] window source: native (Win32), by configuration");

@@ -193,6 +193,9 @@ pub struct Snapshot {
     /// The live theme's id (`slop` = the house look).
     #[serde(default)]
     pub theme: String,
+    /// Where window geometry is coming from right now: `glazewm` or `native`.
+    #[serde(default)]
+    pub window_backend: String,
     /// Every theme, in menu order, with what it looks like.
     #[serde(default)]
     pub themes: Vec<ThemeView>,

@@ -31,9 +31,23 @@ fn main() -> eframe::Result<()> {
     // this binary is also started directly: from the tray, from a shortcut, or
     // by someone running panefx-gui.exe. Guarding only the launcher leaves
     // every one of those paths able to open a duplicate.
-    if panefx::desktop::focus_existing_gui() {
-        return Ok(());
-    }
+    //
+    // A named kernel lock, not a window search: the first instance may not have
+    // a window yet (see `single_instance::acquire_gui`). A second instance waits
+    // up to three seconds for the first one's window to exist, brings it to the
+    // front, and exits either way.
+    let _instance = match panefx::single_instance::acquire_gui() {
+        Ok(lock) => lock,
+        Err(()) => {
+            for _ in 0..30 {
+                if panefx::desktop::focus_existing_gui() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            return Ok(());
+        }
+    };
 
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -151,7 +165,8 @@ enum Daemon {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
-    /// The backdrops behind Alacritty windows. Needs GlazeWM.
+    /// The backdrops behind Alacritty / Neovide windows. Follows windows through
+    /// GlazeWM when it runs, through Win32 when it does not.
     Panes,
     /// The desktop wallpaper, per monitor. Needs nothing.
     Wallpaper,
@@ -229,8 +244,6 @@ struct App {
     /// The copy-to-displays sheet is open for this monitor.
     copy_from: Option<usize>,
     about: bool,
-    /// Cached: probing the filesystem every frame would be silly.
-    glazewm: bool,
     last_poll: std::time::Instant,
     /// The theme list with palettes, for building the chrome's colours. Read
     /// from the same files the daemon reads; re-read when the daemon names a
@@ -283,7 +296,6 @@ impl App {
             pending_close: false,
             copy_from: None,
             about: false,
-            glazewm: glazewm_path().is_some(),
             last_poll: std::time::Instant::now(),
             themes: panefx::themes::catalog::load(&panefx::themes::catalog::Dirs::from_env()),
             applied: None,
@@ -368,12 +380,53 @@ impl App {
     }
 }
 
+/// Start the daemon so it outlives this window, and say how.
+///
+/// In order: the `panefx` logon task (what INSTALL.exe registers, and how it
+/// starts at logon); GlazeWM's `shell-exec`, for a GlazeWM machine set up by
+/// hand; and only then a direct, detached launch. GlazeWM used to be the ONLY
+/// way, so on a machine without it the button was replaced by "cannot be
+/// started here".
+fn start_daemon() -> String {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    let task = std::process::Command::new("schtasks")
+        .args(["/Run", "/TN", "panefx"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    if matches!(&task, Ok(o) if o.status.success()) {
+        return "started the daemon through its logon task".into();
+    }
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("panefx.exe")))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| std::path::PathBuf::from("panefx.exe"));
+    if let Some(glaze) = glazewm_path() {
+        if std::process::Command::new(glaze)
+            .args(["command", "shell-exec", &format!("{} --daemon", exe.display())])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .is_ok()
+        {
+            return "asked GlazeWM to start the daemon".into();
+        }
+    }
+    match std::process::Command::new(&exe)
+        .arg("--daemon")
+        .creation_flags(DETACHED_PROCESS)
+        .spawn()
+    {
+        Ok(_) => "started the daemon".into(),
+        Err(e) => format!("could not start {}: {e}", exe.display()),
+    }
+}
+
 /// GlazeWM's CLI, if it is installed.
 ///
-/// The TUI-fx panes follow Alacritty windows through GlazeWM's IPC and are
-/// **useless without it** — so the GUI has to say so rather than showing dead
-/// controls. Also the path the daemon is started through: a process started
-/// directly by a GUI can die with it, so GlazeWM owns it instead.
+/// One of the ways `start_daemon` can launch the daemon. Nothing else in the GUI
+/// depends on GlazeWM any more.
 fn glazewm_path() -> Option<std::path::PathBuf> {
     // Program Files as Windows reports it (not a hard-coded C:), then PATH.
     let pf = std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into());
@@ -561,35 +614,26 @@ impl App {
         ui.label(egui::RichText::new(format!("127.0.0.1:{} — {why}", self.port)).color(p.muted));
         ui.add_space(12.0);
 
-        if let Some(glaze) = glazewm_path() {
-            if ui.button("  start the daemon  ").clicked() {
-                // Through GlazeWM, not directly: a process started by a GUI can
-                // die with it. This is the same path the deploy script uses.
-                let exe = std::env::current_exe()
-                    .ok()
-                    .and_then(|p| p.parent().map(|d| d.join("panefx.exe")))
-                    .unwrap_or_else(|| std::path::PathBuf::from("panefx.exe"));
-                let _ = std::process::Command::new(glaze)
-                    .args(["command", "shell-exec", &format!("{} --daemon", exe.display())])
-                    .spawn();
-                self.status = "asked GlazeWM to start the daemon".into();
-            }
-        } else {
-            ui.label(
-                egui::RichText::new("GlazeWM is not installed, so panefx cannot be started here.")
-                    .color(p.warn),
-            );
+        if ui.button("  start the daemon  ").clicked() {
+            self.status = start_daemon();
         }
         ui.add_space(8.0);
         ui.label(egui::RichText::new("retrying every two seconds.").color(p.muted));
     }
 
-    /// The backdrops behind Alacritty. **This is the half that needs GlazeWM.**
+    /// The backdrops behind Alacritty and Neovide.
+    ///
+    /// No GlazeWM gate: this tab used to say "TUI-fx needs GlazeWM" and hide its
+    /// controls without it, long after the daemon learned to follow windows
+    /// through Win32 (`window_source.rs`). What the backdrops really need is a
+    /// see-through terminal, so that is what the tab says.
     fn panes_tab(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        if !self.glazewm {
-            self.needs_glazewm(ui, p);
-            return;
-        }
+        let source = self
+            .snap
+            .get("window_backend")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let effect = self
             .snap
             .get("effect")
@@ -597,6 +641,20 @@ impl App {
             .unwrap_or("—")
             .to_string();
         ui.label(egui::RichText::new("terminal backdrops").size(16.0));
+        ui.label(
+            egui::RichText::new(match source.as_str() {
+                "glazewm" => "following your windows through GlazeWM",
+                "native" => "following your windows through Windows itself -- no window manager needed",
+                _ => "",
+            })
+            .size(11.0)
+            .color(p.muted),
+        );
+        ui.label(
+            egui::RichText::new("drawn behind Alacritty and Neovide; they need to be see-through (opacity is in settings)")
+                .size(11.0)
+                .color(p.muted),
+        );
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.label("effect:");
@@ -624,32 +682,6 @@ impl App {
             .show(ui, |ui| {
                 self.params_editor(ui, p, &params, None, &effect, 0);
             });
-    }
-
-    /// What to show when GlazeWM is absent.
-    ///
-    /// Not a disabled control: the panes genuinely cannot work, and a greyed
-    /// slider says "broken" where this says why and what to do about it.
-    fn needs_glazewm(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        ui.label(
-            egui::RichText::new("TUI-fx needs GlazeWM")
-                .color(p.warn)
-                .size(16.0),
-        );
-        ui.add_space(6.0);
-        ui.label("The terminal backdrops follow your windows as the tiling window");
-        ui.label("manager moves them. Without GlazeWM there is nothing to follow,");
-        ui.label("so these effects cannot run.");
-        ui.add_space(10.0);
-        ui.hyperlink_to("get GlazeWM — glzr.io", "https://glzr.io");
-        ui.add_space(4.0);
-        ui.label(egui::RichText::new("and Alacritty, if you do not have a terminal yet:").color(p.muted));
-        ui.hyperlink_to("alacritty.org", "https://alacritty.org");
-        ui.add_space(12.0);
-        ui.label(
-            egui::RichText::new("The wallpaper tab works without either — it draws on the desktop.")
-                .color(p.muted),
-        );
     }
 
     /// Monitor list on the left, the selected monitor's detail on the right.

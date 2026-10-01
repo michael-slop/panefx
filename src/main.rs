@@ -52,6 +52,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Short enough to feel live against Alacritty's own ~2s reload latency.
 const OPACITY_DEBOUNCE: Duration = Duration::from_millis(150);
 
+/// How often to look for GlazeWM again after it went away. Its absence is not
+/// an error -- the native source covers it -- so a slow, quiet retry.
+const GLAZE_RETRY: Duration = Duration::from_secs(10);
+
 /// How often to look for a Neovide that has appeared since the last push.
 ///
 /// Neovide is push-only over its RPC pipe, so an instance that starts after the
@@ -368,7 +372,7 @@ fn main() -> anyhow::Result<()> {
     // does a non-blocking try_recv. See `ipc::IpcThread` for why.
     let pref = panefx::window_source::Preference::parse(&cfg.window_source)
         .unwrap_or(panefx::window_source::Preference::Auto);
-    let client = panefx::window_source::connect(pref)?;
+    let mut client = panefx::window_source::connect(pref)?;
 
     // WinEvent hooks, and ONLY for the native backend: GlazeWM already tells us
     // when to re-query, and running both would double every update.
@@ -377,7 +381,10 @@ fn main() -> anyhow::Result<()> {
     // a WINEVENT_OUTOFCONTEXT hook is delivered through the message queue, so
     // one installed on a thread that never pumps silently never fires.
     #[cfg(windows)]
-    let _win_events = (client.name() == "native").then(panefx::native_windows::install_hooks);
+    let mut _win_events = (client.name() == "native").then(panefx::native_windows::install_hooks);
+    // Set when GlazeWM went away and the native source took over; while set,
+    // GlazeWM is retried every `GLAZE_RETRY` so a restarted WM is picked up.
+    let mut glaze_lost: Option<Instant> = None;
 
     // Tray icon: the daemon has no window and no console, so without this it is
     // completely invisible -- no way to tell it is running, reach the TUI, or
@@ -570,6 +577,7 @@ fn main() -> anyhow::Result<()> {
 
         // --- drain IPC (non-blocking; the socket lives on its own thread) ---
         let mut needs_query = false;
+        let mut lost_glaze = false;
         while let Some(msg) = client.try_recv() {
             match msg {
                 ipc::IpcMessage::Windows(windows) => {
@@ -597,8 +605,38 @@ fn main() -> anyhow::Result<()> {
                     needs_query = true;
                 }
                 ipc::IpcMessage::Closed => {
-                    panefx::log_warn!("[panefx] GlazeWM closed the IPC connection; exiting.");
-                    return Ok(());
+                    // Fall back, do not exit. This used to `return`, so quitting
+                    // or restarting GlazeWM took the WALLPAPER down with it --
+                    // which never needed GlazeWM at all -- and left a machine
+                    // with no panefx until the next logon.
+                    panefx::log_warn!(
+                        "[panefx] GlazeWM closed the IPC connection; following windows through Win32 until it is back"
+                    );
+                    lost_glaze = true;
+                }
+            }
+        }
+
+        // GlazeWM went away: switch to the native source now, and keep trying
+        // GlazeWM so a restarted WM is used again (it knows workspaces).
+        if lost_glaze {
+            client = panefx::window_source::connect(panefx::window_source::Preference::Native)?;
+            _win_events = Some(panefx::native_windows::install_hooks());
+            glaze_lost = Some(Instant::now());
+            needs_query = true;
+        }
+        if let Some(since) = glaze_lost {
+            if since.elapsed() >= GLAZE_RETRY && pref != panefx::window_source::Preference::Native {
+                match panefx::window_source::try_glazewm() {
+                    Some(g) => {
+                        client = g;
+                        panefx::window_source::set_active("glazewm");
+                        _win_events = None;
+                        glaze_lost = None;
+                        needs_query = true;
+                        panefx::log_info!("[panefx] GlazeWM is back; following windows through it again");
+                    }
+                    None => glaze_lost = Some(Instant::now()),
                 }
             }
         }
@@ -955,6 +993,7 @@ fn handle_command(
                     wall: &wallpaper::WallpaperSet,
                     ts: &ThemeState| Snapshot {
         theme: cfg.theme.clone(),
+        window_backend: panefx::window_source::active().to_string(),
         themes: ts.views(),
         theme_targets: ThemeState::target_views(cfg),
         theme_report: ts.report.clone(),
