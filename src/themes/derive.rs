@@ -77,17 +77,9 @@ pub fn effect_colours(r: &Roles, effect: &str) -> BTreeMap<&'static str, Rgb> {
         // highlight, so it stays well down toward the background.
         "waves" => vec![("ink", mix(r.warm, r.bg, 0.6))],
         "fire" => vec![("ramp_lo", r.dim), ("ramp_hi", r.hot)],
-        "wizardtorch" | "tgevil" | "wzfire" | "raalien" => vec![("ink", r.warm)],
         "plasma" | "donut" | "sphere" | "cube" | "galaxy" => vec![("lo", r.dim), ("hi", r.warm)],
         "tunnel" | "starfield" => vec![("near", r.hot), ("far", r.cool)],
         "skullspin" => vec![("bone", r.fg), ("dark", shadow)],
-        "warlockspin" => vec![
-            ("bone", r.fg),
-            ("shade", r.muted),
-            ("robe", r.magenta),
-            ("wand", r.warm),
-            ("dark", shadow),
-        ],
         _ => vec![],
     };
     let mut out: BTreeMap<&'static str, Rgb> = pairs.into_iter().collect();

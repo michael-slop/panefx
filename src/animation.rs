@@ -212,15 +212,6 @@ pub const EFFECTS: &[&str] = &[
     "rain",
     "waves",
     "fire",
-    // Traced third-party art: only with the `third-party-art` feature.
-    #[cfg(feature = "third-party-art")]
-    "wizardtorch",
-    #[cfg(feature = "third-party-art")]
-    "tgevil",
-    #[cfg(feature = "third-party-art")]
-    "wzfire",
-    #[cfg(feature = "third-party-art")]
-    "raalien",
     "plasma",
     "tunnel",
     "starfield",
@@ -231,15 +222,8 @@ pub const EFFECTS: &[&str] = &[
     "sphere",
     "cube",
     "galaxy",
-    // Stored frame sequences, played rather than computed -- see `frameplay`.
-    #[cfg(feature = "third-party-art")]
-    "fishloop",
     // The michael.slop mascot, spinning ghostty-style.
     "skullspin",
-    // The warlock: a hooded skeleton in sunglasses. Rocks rather than spins --
-    // it faces right, so a full turn would show a back the sprite lacks.
-    #[cfg(feature = "third-party-art")]
-    "warlockspin",
 ];
 
 /// Construct an effect by name. Unknown names fall back to the first entry in
@@ -264,49 +248,10 @@ pub fn build(
             Box::new(w)
         }
         "fire" => Box::new(crate::fire::Fire::new(cols, rows, seed)),
-        // Still ASCII-art pieces, all through one effect: the art and its
-        // defaults are data, so a new piece is a `Piece`, not a new module.
-        #[cfg(feature = "third-party-art")]
-        "wizardtorch" | "tgevil" | "wzfire" | "raalien" => {
-            use crate::wizardtorch::pieces;
-            let (name, piece) = match name.trim().to_lowercase().as_str() {
-                "tgevil" => ("tgevil", pieces::tgevil()),
-                "wzfire" => ("wzfire", pieces::wzfire()),
-                "raalien" => ("raalien", pieces::raalien()),
-                _ => ("wizardtorch", pieces::wizardtorch()),
-            };
-            let mut w = crate::wizardtorch::WizardTorch::new(name, piece, cols, rows);
-            w.set_frame_ms(cfg.frame_time().as_millis() as u64);
-            Box::new(w)
-        }
-        #[cfg(feature = "third-party-art")]
-        "fishloop" => {
-            let mut f = crate::frameplay::FramePlay::new(
-                "fishloop",
-                crate::frameplay::Reel {
-                    cols: crate::fishloop_art::COLS,
-                    rows: crate::fishloop_art::ROWS,
-                    fps: crate::fishloop_art::FPS,
-                    bg: crate::fishloop_art::BG,
-                    palette: &crate::fishloop_art::PALETTE,
-                    frames: &crate::fishloop_art::FRAMES,
-                },
-                cols,
-                rows,
-            );
-            f.set_frame_ms(cfg.frame_time().as_millis() as u64);
-            Box::new(f)
-        }
         "skullspin" => {
             let mut s = crate::skullspin::SkullSpin::new(cols, rows);
             s.set_frame_ms(cfg.frame_time().as_millis() as u64);
             Box::new(s)
-        }
-        #[cfg(feature = "third-party-art")]
-        "warlockspin" => {
-            let mut w = crate::warlockspin::WarlockSpin::new(cols, rows);
-            w.set_frame_ms(cfg.frame_time().as_millis() as u64);
-            Box::new(w)
         }
         "plasma" => {
             let mut p = crate::plasma::Plasma::new(cols, rows, cfg.chars_override.as_deref());

@@ -104,10 +104,7 @@ $glzrDir   = Join-Path $env:USERPROFILE '.glzr\glazewm\scripts'
 
 if ($Test) {
     Write-Host 'running tests ...'
-    # Both ways: the shipped build (no art) and pHub's (with it).
     & $cargoExe @cargoArgs test
-    if ($LASTEXITCODE -ne 0) { throw 'tests failed' }
-    & $cargoExe @cargoArgs test --features third-party-art
     if ($LASTEXITCODE -ne 0) { throw 'tests failed' }
     return
 }
@@ -132,9 +129,7 @@ if (Get-Process -Name panefx-gui -ErrorAction SilentlyContinue) {
 }
 
 Write-Host 'building release ...'
-# pHub's own copy keeps the third-party art effects (see Cargo.toml
-# [features]); the portable -Beta build below -- what ships -- does not.
-& $cargoExe @cargoArgs build --release --features third-party-art
+& $cargoExe @cargoArgs build --release
 if ($LASTEXITCODE -ne 0) { throw 'build failed' }
 
 $exe    = Join-Path $PSScriptRoot 'target\release\panefx.exe'
