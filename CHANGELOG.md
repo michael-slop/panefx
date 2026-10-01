@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 -- themes (unreleased)
+## 0.2.0 -- themes (2026-09-30)
 
 ### Added
 - **The theme driver.** 27 colour themes plus *house* (the look you dialled in by
@@ -23,6 +23,14 @@
 - `panefx --tui` no longer trips panefx-ctl's unknown-option check.
 - `build.ps1 -Install` restarts the daemon through the `panefx` logon task rather
   than as a child of the build shell.
+- Only one GUI opens, however fast the tray icon is clicked.
+- GlazeWM is optional everywhere: the daemon no longer exits when GlazeWM quits
+  (it follows windows through Win32 and picks GlazeWM back up), and the GUI no
+  longer claims the terminal backdrops need it.
+
+### Removed
+- The effects built from other people's art: wizardtorch, tgevil, wzfire,
+  raalien, fishloop, warlockspin.
 
 ## 0.1.0
 
