@@ -59,9 +59,6 @@ Two problems make the follower harder than it sounds, both solved here:
 | `tunnel` `starfield` | The two other demoscene classics. | |
 | `donut` `sphere` `cube` `galaxy` | Spinning shaded 3D shapes in characters, after the famous `donut.c`. | |
 | `skullspin` | The michael.slop mascot skull, spinning. | ported from michaelslop.org |
-| `warlockspin` | A hooded skeleton in sunglasses, rocking. | traced from a sprite |
-| `wizardtorch` `tgevil` `wzfire` `raalien` | Classic CP437 ANSI art, re-lit by the effect: a torch that flickers, fire that breathes. | traced from `.ANS` files -- see *Credits* |
-| `fishloop` | A frame-by-frame ASCII animation, played back sparse. | an [ascii-motion](https://ascii-motion.app) project -- see *Credits* |
 
 ---
 
@@ -293,11 +290,15 @@ repository is a fair thing to skip.
 
 * **Ports** -- the effects table above names each source; each port's module
   header records what was kept, what was changed, and why.
+* **Not in release builds** -- six effects made from other people's art are in
+  the source but compiled only with `--features third-party-art`, and no
+  release, zip or installer carries them:
 * **ANSI art** -- `wizardtorch`, `tgevil`, `wzfire` and `raalien` are traced
   from the `.ANS` files `AXB-WIZARDTORCH.ANS`, `TG-EVIL.ANS`, `WZ-FIRE.ANS` and
   `ra-alien.ans`, by their original artists of the ANSI art scene. They are
   reproduced as shade maps with the colour discarded. If one of them is yours
   and you want it credited differently, or removed, open an issue.
+* **warlockspin** -- traced from a sprite whose source is not recorded.
 * **fishloop** -- *Fish Loop*, a published [ascii-motion](https://ascii-motion.app)
   project (`424d1127-7ab4-449a-ac73-a543524a4141`), by its author.
 * **Themes** -- see [THEMES.md](THEMES.md).
