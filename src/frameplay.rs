@@ -348,7 +348,9 @@ impl AsciiAnimation for FramePlay {
     }
 }
 
-#[cfg(test)]
+// The tests drive the player with the fishloop reel, which only exists with
+// the `third-party-art` feature (see Cargo.toml).
+#[cfg(all(test, feature = "third-party-art"))]
 mod tests {
     use super::*;
     use crate::fishloop_art as art;

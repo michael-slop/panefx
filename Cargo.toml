@@ -36,6 +36,21 @@ path = "src/bin/panefx-setup.rs"
 name = "panefx-report"
 path = "src/bin/panefx-report.rs"
 
+[features]
+# Effects built from art that is not ours to redistribute: the four pieces
+# traced from ANSI-scene .ANS files (wizardtorch, tgevil, wzfire, raalien),
+# fishloop (someone else's ascii-motion project) and the warlock sprite.
+# OFF by default, so a release, the beta zip and any machine but pHub never
+# carry them. Michael, 2026-09-30: "no wizard torch no tg evil no ra alien no
+# warlock sprite none of that needs to be added". build.ps1 -Install turns it
+# on for pHub's own copy, whose config already has sections for them.
+third-party-art = []
+
+# Renders the warlock, so it needs the art.
+[[example]]
+name = "warlock_frames"
+required-features = ["third-party-art"]
+
 [dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

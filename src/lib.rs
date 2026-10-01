@@ -44,6 +44,7 @@ pub mod fire;
 pub mod flames;
 pub mod palette;
 pub mod rain;
+#[cfg(feature = "third-party-art")]
 pub mod fishloop_art;
 pub mod frameplay;
 pub mod plasma;
@@ -59,13 +60,20 @@ pub mod theme_gen;
 // Colour themes: one choice, recoloured everywhere panefx can reach -- its own
 // effects and GUI, and every app in `themes::targets`. color.mesh's Windows half.
 pub mod themes;
+#[cfg(feature = "third-party-art")]
 pub mod warlock_art;
+#[cfg(feature = "third-party-art")]
 pub mod warlockspin;
 pub mod win98;
+#[cfg(feature = "third-party-art")]
 pub mod wizardtorch;
+#[cfg(feature = "third-party-art")]
 pub mod raalien_art;
+#[cfg(feature = "third-party-art")]
 pub mod tgevil_art;
+#[cfg(feature = "third-party-art")]
 pub mod wizardtorch_art;
+#[cfg(feature = "third-party-art")]
 pub mod wzfire_art;
 
 // Windows-only: the daemon's panel/render/IPC layer. The TUI does not need it,

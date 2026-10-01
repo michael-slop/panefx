@@ -212,9 +212,14 @@ pub const EFFECTS: &[&str] = &[
     "rain",
     "waves",
     "fire",
+    // Traced third-party art: only with the `third-party-art` feature.
+    #[cfg(feature = "third-party-art")]
     "wizardtorch",
+    #[cfg(feature = "third-party-art")]
     "tgevil",
+    #[cfg(feature = "third-party-art")]
     "wzfire",
+    #[cfg(feature = "third-party-art")]
     "raalien",
     "plasma",
     "tunnel",
@@ -227,11 +232,13 @@ pub const EFFECTS: &[&str] = &[
     "cube",
     "galaxy",
     // Stored frame sequences, played rather than computed -- see `frameplay`.
+    #[cfg(feature = "third-party-art")]
     "fishloop",
     // The michael.slop mascot, spinning ghostty-style.
     "skullspin",
     // The warlock: a hooded skeleton in sunglasses. Rocks rather than spins --
     // it faces right, so a full turn would show a back the sprite lacks.
+    #[cfg(feature = "third-party-art")]
     "warlockspin",
 ];
 
@@ -259,6 +266,7 @@ pub fn build(
         "fire" => Box::new(crate::fire::Fire::new(cols, rows, seed)),
         // Still ASCII-art pieces, all through one effect: the art and its
         // defaults are data, so a new piece is a `Piece`, not a new module.
+        #[cfg(feature = "third-party-art")]
         "wizardtorch" | "tgevil" | "wzfire" | "raalien" => {
             use crate::wizardtorch::pieces;
             let (name, piece) = match name.trim().to_lowercase().as_str() {
@@ -271,6 +279,7 @@ pub fn build(
             w.set_frame_ms(cfg.frame_time().as_millis() as u64);
             Box::new(w)
         }
+        #[cfg(feature = "third-party-art")]
         "fishloop" => {
             let mut f = crate::frameplay::FramePlay::new(
                 "fishloop",
@@ -293,6 +302,7 @@ pub fn build(
             s.set_frame_ms(cfg.frame_time().as_millis() as u64);
             Box::new(s)
         }
+        #[cfg(feature = "third-party-art")]
         "warlockspin" => {
             let mut w = crate::warlockspin::WarlockSpin::new(cols, rows);
             w.set_frame_ms(cfg.frame_time().as_millis() as u64);
