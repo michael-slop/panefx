@@ -731,6 +731,61 @@ impl Config {
         if self.rotation.is_empty() {
             self.rotation = DEFAULT_ROTATION.iter().map(|s| s.to_string()).collect();
         }
+        // Configs written before the layer fix can hold a stack the UIs cannot
+        // reach (see `normalise_layers`). Repair them as they load.
+        let monitors: Vec<usize> = self.wallpaper_layers.keys().copied().collect();
+        for m in monitors {
+            self.normalise_layers(m);
+        }
+    }
+
+    /// Keep one monitor's extra layers numbered 1, 2, 3... with no gaps, and
+    /// drop them entirely when the base is off.
+    ///
+    /// Every UI addresses a layer by its POSITION in `wallpaper_stack`, and
+    /// that list skips an `off` base and closes gaps. The stored keys did
+    /// neither, so the two drifted apart: on Michael's BenQ the config held
+    /// `wallpaper_3_effect = "off"` with `wallpaper_3_layer2 = "plasma"`. The
+    /// stack showed plasma at position 0, "remove" asked for layer 0 (the
+    /// already-off base), and the plasma could never be removed -- and every
+    /// base he picked drew under it. With the keys always equal to positions,
+    /// a number from a UI always names the layer it shows.
+    ///
+    /// Layers over an `off` base are dropped rather than kept: `off` means no
+    /// surface at all, so they can never be drawn, and kept they would come
+    /// back on top of whatever base is chosen next.
+    pub fn normalise_layers(&mut self, monitor: usize) {
+        let base_on = self
+            .wallpaper_effects
+            .get(&monitor)
+            .is_some_and(|e| e != "off");
+        let Some(layers) = self.wallpaper_layers.remove(&monitor) else {
+            return;
+        };
+        if !base_on {
+            if !layers.is_empty() {
+                crate::log_info!(
+                    "[panefx] DISPLAY{monitor} is off; dropped its {} stacked layer(s)",
+                    layers.len()
+                );
+            }
+            return;
+        }
+        let kept: std::collections::BTreeMap<usize, String> = layers
+            .into_values()
+            .filter(|e| e != "off")
+            .enumerate()
+            .map(|(i, e)| (i + 1, e))
+            .collect();
+        if !kept.is_empty() {
+            self.wallpaper_layers.insert(monitor, kept);
+        }
+    }
+
+    /// Set one monitor's base effect (layer 0). `off` also clears its layers.
+    pub fn set_wallpaper_base(&mut self, monitor: usize, effect: &str) {
+        self.wallpaper_effects.insert(monitor, effect.trim().to_lowercase());
+        self.normalise_layers(monitor);
     }
 
     pub fn frame_time(&self) -> Duration {
@@ -1020,25 +1075,35 @@ impl Config {
     /// about what the bottom of the stack is.
     pub fn set_wallpaper_layer(&mut self, monitor: usize, layer: usize, effect: &str) {
         let e = effect.trim().to_lowercase();
-        if layer == 0 {
-            self.wallpaper_effects.insert(monitor, e);
+        let base_on = self
+            .wallpaper_effects
+            .get(&monitor)
+            .is_some_and(|b| b != "off");
+        // Layer 0 is the base. So is a layer added to a screen that is off:
+        // there is nothing to stack it on, and dropping the click silently
+        // would look exactly like the bug this replaced.
+        if layer == 0 || (!base_on && e != "off") {
+            self.set_wallpaper_base(monitor, &e);
             return;
         }
+        // Past the top means "on top": the stack has no gaps.
+        let layer = layer.min(self.wallpaper_layers.get(&monitor).map_or(0, |m| m.len()) + 1);
         if e == "off" {
             // Removed, not stored as "off": a stack with holes in it is a
-            // different thing to reason about, and nothing needs one.
+            // different thing to reason about, and nothing needs one. The
+            // layers above move down a place (`normalise_layers`), so the
+            // numbers the UIs show stay the numbers they send.
             if let Some(m) = self.wallpaper_layers.get_mut(&monitor) {
                 m.remove(&layer);
-                if m.is_empty() {
-                    self.wallpaper_layers.remove(&monitor);
-                }
             }
+            self.normalise_layers(monitor);
             return;
         }
         self.wallpaper_layers
             .entry(monitor)
             .or_default()
             .insert(layer, e);
+        self.normalise_layers(monitor);
     }
 
     pub fn set_wallpaper_effect_param(&mut self, effect: &str, key: &str, value: String) {
@@ -1884,9 +1949,75 @@ ink = \"#0000ff\"");
             vec!["waves".to_string(), "plasma".to_string()],
             "removing a middle layer must close the gap, not leave a hole"
         );
-        // And the map itself is cleaned up when the last extra layer goes.
-        c.set_wallpaper_layer(1, 2, "off");
-        assert!(c.wallpaper_layers.get(&1).is_none());
+        // Plasma is now SHOWN at position 1, so position 1 is what a UI sends
+        // to remove it. This test used to remove it as layer 2 -- its old
+        // stored number -- which is the drift that stuck plasma on the BenQ.
+        c.set_wallpaper_layer(1, 1, "off");
+        assert_eq!(c.wallpaper_stack(1), vec!["waves".to_string()]);
+        assert!(c.wallpaper_layers.get(&1).is_none(), "the map is cleaned up");
+    }
+
+    /// Michael's BenQ, 2026-10-08: base off, plasma stored as layer 2.
+    #[test]
+    fn the_stuck_plasma_config_loads_repaired() {
+        let mut c = Config::default();
+        c.apply_toml("wallpaper_3_effect = \"off\"\nwallpaper_3_layer2 = \"plasma\"\n");
+        c.normalise();
+        assert!(c.wallpaper_stack(3).is_empty(), "an off screen draws nothing");
+        assert!(c.wallpaper_layers.get(&3).is_none(), "and keeps no layer to resurface later");
+        c.set_wallpaper_layer(3, 0, "flames");
+        assert_eq!(c.wallpaper_stack(3), vec!["flames".to_string()], "no plasma under the new base");
+    }
+
+    #[test]
+    fn every_shown_position_removes_the_layer_shown_there() {
+        // For every way to build a stack, removing position p takes out
+        // exactly the effect wallpaper_stack showed at p.
+        let effects = ["rain", "plasma", "skullspin", "tunnel"];
+        for remove_at in 1..effects.len() {
+            let mut c = Config::default();
+            c.set_wallpaper_layer(2, 0, "waves");
+            for (i, e) in effects.iter().enumerate() {
+                c.set_wallpaper_layer(2, i + 1, e);
+            }
+            c.set_wallpaper_layer(2, 2, "off"); // a hole first, as the old code left one
+            let before = c.wallpaper_stack(2);
+            c.set_wallpaper_layer(2, remove_at, "off");
+            let mut want = before.clone();
+            want.remove(remove_at);
+            assert_eq!(c.wallpaper_stack(2), want, "removing position {remove_at} of {before:?}");
+        }
+    }
+
+    #[test]
+    fn switching_a_screen_off_clears_its_layers() {
+        let mut c = Config::default();
+        c.set_wallpaper_layer(4, 0, "flames");
+        c.set_wallpaper_layer(4, 1, "skullspin");
+        c.set_wallpaper_base(4, "off");
+        assert!(c.wallpaper_stack(4).is_empty());
+        c.set_wallpaper_base(4, "rain");
+        assert_eq!(c.wallpaper_stack(4), vec!["rain".to_string()], "the skull does not come back");
+    }
+
+    #[test]
+    fn a_layer_added_to_an_off_screen_becomes_its_base() {
+        let mut c = Config::default();
+        c.set_wallpaper_layer(1, 1, "plasma");
+        assert_eq!(c.wallpaper_stack(1), vec!["plasma".to_string()]);
+        assert_eq!(c.wallpaper_effects.get(&1).map(String::as_str), Some("plasma"));
+    }
+
+    #[test]
+    fn a_layer_far_past_the_top_lands_on_top() {
+        let mut c = Config::default();
+        c.set_wallpaper_layer(1, 0, "waves");
+        c.set_wallpaper_layer(1, 9, "rain");
+        assert_eq!(c.wallpaper_layers[&1].keys().copied().collect::<Vec<_>>(), vec![1]);
+        let mut back = Config::default();
+        back.apply_toml(&c.to_toml());
+        back.normalise();
+        assert_eq!(back.wallpaper_stack(1), c.wallpaper_stack(1), "round-trips through the file");
     }
 
     #[test]

@@ -121,6 +121,14 @@ pub fn set_active(name: &'static str) {
     }
 }
 
+/// The native source, taken over from a GlazeWM that went away. Its own
+/// function so the log says "fallback", not "by configuration".
+pub fn native_fallback() -> Box<dyn WindowSource> {
+    crate::log_info!("[panefx] window source: native (Win32), standing in for GlazeWM");
+    set_active("native");
+    Box::new(NativeSource)
+}
+
 /// GlazeWM, if it answers right now. For picking it back up after it went away.
 pub fn try_glazewm() -> Option<Box<dyn WindowSource>> {
     ipc::IpcThread::spawn().ok().map(|t| Box::new(GlazeSource(t)) as Box<dyn WindowSource>)

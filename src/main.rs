@@ -620,7 +620,7 @@ fn main() -> anyhow::Result<()> {
         // GlazeWM went away: switch to the native source now, and keep trying
         // GlazeWM so a restarted WM is used again (it knows workspaces).
         if lost_glaze {
-            client = panefx::window_source::connect(panefx::window_source::Preference::Native)?;
+            client = panefx::window_source::native_fallback();
             _win_events = Some(panefx::native_windows::install_hooks());
             glaze_lost = Some(Instant::now());
             needs_query = true;
@@ -1035,6 +1035,7 @@ fn handle_command(
                 effect: m.effect.clone(),
                 occluded: m.occluded,
                 layers: cfg.wallpaper_stack(m.monitor.index),
+                drawing: m.sims.iter().map(|k| k.effect.clone()).collect(),
                 geometry: m.panel.as_ref().map(|p| {
                     let (sw, sh) = p
                         .surface
@@ -1334,24 +1335,25 @@ fn handle_command(
             if wanted != wallpaper::OFF && !animation::EFFECTS.contains(&wanted.as_str()) {
                 return Reply::err(format!("unknown effect '{name}' (or 'off')"));
             }
-            // Apply FIRST, mirror into config only on success.
+            // Config FIRST, then the surface -- and roll the config back if the
+            // surface refuses.
             //
-            // The other order leaves a rejected value in the config — where it
-            // saves to disk and comes back on the next load — which is the
-            // behaviour `set_field_rejects_bad_values` already forbids for every
-            // other setting.
-            if let Err(e) = wall.set_effect(monitor, &wanted, cfg) {
-                return Reply::err(e);
+            // It used to be surface first, so a rejected value never reached
+            // the config. But `set_effect` builds the screen from the config's
+            // stack, so it rebuilt from the OLD one: switching plasma -> flames
+            // kept drawing plasma (BenQ, 2026-10-08). The rollback keeps the old
+            // guarantee that a rejected value is never saved.
+            let before = (cfg.wallpaper_effects.clone(), cfg.wallpaper_layers.clone());
+            let targets = match monitor {
+                Some(i) => vec![i],
+                None => wall.monitor_indices(),
+            };
+            for m in &targets {
+                cfg.set_wallpaper_base(*m, &wanted);
             }
-            match monitor {
-                Some(i) => {
-                    cfg.wallpaper_effects.insert(i, wanted.clone());
-                }
-                None => {
-                    for m in wall.monitor_indices() {
-                        cfg.wallpaper_effects.insert(m, wanted.clone());
-                    }
-                }
+            if let Err(e) = wall.set_effect(monitor, &wanted, cfg) {
+                (cfg.wallpaper_effects, cfg.wallpaper_layers) = before;
+                return Reply::err(e);
             }
             Reply::with(snapshot(sim, cfg, wall, ts))
         }

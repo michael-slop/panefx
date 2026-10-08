@@ -1,6 +1,6 @@
 [package]
 name = "panefx"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Animated backdrops pinned behind windows, following a tiling WM's layout"
 

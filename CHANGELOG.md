@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.2.1 -- wallpaper layers (unreleased)
+
+### Fixed
+- **A wallpaper layer could get stuck on a screen.** The UIs address a layer by
+  its position in the stack, but the stored layer numbers kept gaps and kept
+  layers above a screen that was switched off, so the two drifted apart: a
+  plasma layer stored as "layer 2" over an `off` base showed at position 0,
+  "remove" asked for the base instead, and the plasma could never be removed --
+  every base chosen afterwards drew under it. Layers are now always numbered
+  1, 2, 3... with no gaps, switching a screen off clears its layers, adding a
+  layer to an off screen makes it the base, and a config written before this is
+  repaired as it loads.
+- **Changing a screen's base effect drew the old one.** The screen was rebuilt
+  from the config before the new choice was saved into it, so switching
+  plasma -> flames kept drawing plasma. The config is now updated first (and
+  rolled back if the screen refuses), and the base is always the effect chosen.
+- The log says "standing in for GlazeWM" when GlazeWM goes away, not "by
+  configuration".
+
+### Added
+- `drawing` in each monitor's snapshot: the simulations the screen is really
+  running, beside `layers`, the config's view of them.
+
 ## 0.2.0 -- themes (2026-09-30)
 
 ### Added

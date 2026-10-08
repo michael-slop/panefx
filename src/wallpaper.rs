@@ -533,15 +533,14 @@ impl WallpaperSet {
         // layer's own: the layers composite cell-for-cell into one panel, so a
         // second grid would have nothing to align to. An upper layer that wants
         // chunkier cells than the base simply draws at the base's resolution.
-        let stack = cfg.wallpaper_stack(s.monitor.index);
-        let stack = if stack.is_empty() {
-            // `effect` is the bottom layer and `is_on` already passed, so this
-            // only happens if the config and the surface disagree -- fall back
-            // to the surface's own effect rather than drawing nothing.
-            vec![s.effect.clone()]
-        } else {
-            stack
-        };
+        // The base is ALWAYS the surface's own effect; only the layers above it
+        // come from the config. Taking the whole stack from the config let a
+        // stale base win over the one just chosen (see the WallpaperEffect
+        // handler in main.rs).
+        let mut stack = vec![s.effect.clone()];
+        if let Some(extra) = cfg.wallpaper_layers.get(&s.monitor.index) {
+            stack.extend(extra.values().filter(|e| *e != OFF).cloned());
+        }
         s.sims.clear();
         for effect in stack {
             let key = SimKey {

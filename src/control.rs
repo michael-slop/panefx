@@ -246,6 +246,14 @@ pub struct WallpaperMonitorView {
     /// show the whole stack.
     #[serde(default)]
     pub layers: Vec<String>,
+    /// The simulations this screen is ACTUALLY running, bottom first.
+    ///
+    /// `layers` is the config's view; this is the surface's. They are meant to
+    /// match, and when they did not -- a base change rebuilt from the old stack
+    /// and kept drawing plasma (2026-10-08) -- nothing outside the process could
+    /// tell. Empty when the screen is off.
+    #[serde(default)]
+    pub drawing: Vec<String>,
 
     /// The monitor rect, the panel, the DIB and the composition surface --
     /// the four sizes that must agree.
