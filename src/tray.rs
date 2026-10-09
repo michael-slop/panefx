@@ -98,6 +98,9 @@ const ID_RELOAD: usize = 2;
 const ID_EXIT: usize = 3;
 const ID_THEME_NEXT: usize = 4;
 const ID_THEME_PREV: usize = 5;
+const ID_SW_BACKDROPS: usize = 6;
+const ID_SW_TRANSPARENCY: usize = 7;
+const ID_SW_PAUSE: usize = 8;
 /// Theme `i` in the menu is `ID_THEME_BASE + i`. The range is bounded so an
 /// unrelated WM_COMMAND id can never read as a theme pick.
 const ID_THEME_BASE: usize = 100;
@@ -119,6 +122,19 @@ pub enum TrayAction {
     Theme(usize),
     ThemeNext,
     ThemePrev,
+    /// Flip one of the three switches (a config key: `pane_off`,
+    /// `transparency`, `pause_when_covered`).
+    Switch(&'static str),
+}
+
+/// The three switches as the daemon last reported them: backdrops on,
+/// transparency on, pause when covered. Ticked in the menu.
+static SWITCHES: std::sync::Mutex<[bool; 3]> = std::sync::Mutex::new([true, true, true]);
+
+pub fn set_switches(backdrops: bool, transparency: bool, pause: bool) {
+    if let Ok(mut s) = SWITCHES.lock() {
+        *s = [backdrops, transparency, pause];
+    }
 }
 
 /// The theme menu as the daemon last described it: `(group, name)` per theme
@@ -146,6 +162,9 @@ pub fn action_for(id: usize) -> Option<TrayAction> {
         ID_EXIT => Some(TrayAction::Exit),
         ID_THEME_NEXT => Some(TrayAction::ThemeNext),
         ID_THEME_PREV => Some(TrayAction::ThemePrev),
+        ID_SW_BACKDROPS => Some(TrayAction::Switch("pane_off")),
+        ID_SW_TRANSPARENCY => Some(TrayAction::Switch("transparency")),
+        ID_SW_PAUSE => Some(TrayAction::Switch("pause_when_covered")),
         i if (ID_THEME_BASE..ID_THEME_BASE + MAX_THEMES).contains(&i) => {
             Some(TrayAction::Theme(i - ID_THEME_BASE))
         }
@@ -245,6 +264,14 @@ unsafe fn show_menu(hwnd: HWND) {
     }
     let _ = AppendMenuW(menu, MF_STRING, ID_THEME_NEXT, windows::core::w!("Next theme"));
     let _ = AppendMenuW(menu, MF_STRING, ID_THEME_PREV, windows::core::w!("Previous theme"));
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+
+    // The three switches, ticked when on -- the quickest way to them.
+    let sw = SWITCHES.lock().map(|s| *s).unwrap_or([true, true, true]);
+    let tick = |on: bool| if on { MF_STRING | MF_CHECKED } else { MF_STRING };
+    let _ = AppendMenuW(menu, tick(sw[0]), ID_SW_BACKDROPS, windows::core::w!("Backdrops behind windows"));
+    let _ = AppendMenuW(menu, tick(sw[1]), ID_SW_TRANSPARENCY, windows::core::w!("Window transparency"));
+    let _ = AppendMenuW(menu, tick(sw[2]), ID_SW_PAUSE, windows::core::w!("Pause wallpaper when covered"));
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     let _ = AppendMenuW(menu, MF_STRING, ID_RELOAD, reload);
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
@@ -358,6 +385,9 @@ mod tests {
         assert_eq!(action_for(ID_EXIT), Some(TrayAction::Exit));
         assert_eq!(action_for(ID_THEME_NEXT), Some(TrayAction::ThemeNext));
         assert_eq!(action_for(ID_THEME_PREV), Some(TrayAction::ThemePrev));
+        assert_eq!(action_for(ID_SW_BACKDROPS), Some(TrayAction::Switch("pane_off")));
+        assert_eq!(action_for(ID_SW_TRANSPARENCY), Some(TrayAction::Switch("transparency")));
+        assert_eq!(action_for(ID_SW_PAUSE), Some(TrayAction::Switch("pause_when_covered")));
         assert_eq!(action_for(ID_THEME_BASE), Some(TrayAction::Theme(0)));
         assert_eq!(action_for(ID_THEME_BASE + 26), Some(TrayAction::Theme(26)));
     }
@@ -378,7 +408,7 @@ mod tests {
 
     #[test]
     fn the_ids_are_distinct() {
-        let ids = [ID_OPEN_GUI, ID_RELOAD, ID_EXIT, ID_THEME_NEXT, ID_THEME_PREV, ID_THEME_BASE];
+        let ids = [ID_OPEN_GUI, ID_RELOAD, ID_EXIT, ID_THEME_NEXT, ID_THEME_PREV, ID_SW_BACKDROPS, ID_SW_TRANSPARENCY, ID_SW_PAUSE, ID_THEME_BASE];
         let mut sorted = ids.to_vec();
         sorted.sort_unstable();
         sorted.dedup();

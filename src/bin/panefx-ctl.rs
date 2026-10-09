@@ -383,6 +383,14 @@ impl App {
             min: 0,
             max: 1,
         });
+        // 1 = on, 0 = off. Both default ON. They save themselves.
+        rows.push(Row::Config {
+            key: "transparency",
+            label: "transparency (1 = on)",
+            value: ci("transparency"),
+            min: 0,
+            max: 1,
+        });
         rows.push(Row::Config {
             key: "fps",
             label: "fps",
@@ -545,7 +553,23 @@ impl App {
                 return;
             }
             Row::WallpaperMonitor { index, effect, .. } => {
-                let cycle = self.wallpaper_cycle();
+                // A screen with stacked layers skips `off` while cycling:
+                // passing through it clears the layers (the layer fix), and
+                // one arrow key too many must not wipe a stack. Off stays one
+                // ←→ away on a single-layer screen, as before.
+                let layered = self
+                    .last_snap
+                    .get("wallpaper")
+                    .and_then(|w| w.as_array())
+                    .and_then(|a| a.iter().find(|m| m.get("index").and_then(|v| v.as_u64()) == Some(index as u64)))
+                    .and_then(|m| m.get("layers"))
+                    .and_then(|l| l.as_array())
+                    .is_some_and(|l| l.len() > 1);
+                let cycle: Vec<String> = self
+                    .wallpaper_cycle()
+                    .into_iter()
+                    .filter(|e| !(layered && e == "off"))
+                    .collect();
                 if cycle.is_empty() {
                     return;
                 }
@@ -614,12 +638,11 @@ impl App {
             skip.push(id.clone());
         }
         self.dispatch(serde_json::json!({"cmd":"set","key":"theme_skip","val":skip.join(",")}));
-        self.dirty = false; // written through to config.toml by the daemon
         self.status = format!("{id} {}", if on { "left alone from now on" } else { "follows the theme again" });
     }
 
     fn dispatch(&mut self, msg: serde_json::Value) {
-        match self.conn.send(msg) {
+        match self.conn.send(msg.clone()) {
             Ok(reply) => {
                 if reply.get("ok").and_then(|v| v.as_bool()) == Some(false) {
                     self.status = reply
@@ -628,7 +651,14 @@ impl App {
                         .unwrap_or("rejected")
                         .to_string();
                 } else {
-                    self.dirty = true;
+                    // The switches and theme_skip save themselves in the daemon,
+                    // so they do not make the TUI "*modified".
+                    let key = msg.get("key").and_then(|v| v.as_str()).unwrap_or("");
+                    let writes_through = msg.get("cmd").and_then(|v| v.as_str()) == Some("set")
+                        && matches!(key, "pane_off" | "transparency" | "pause_when_covered" | "theme_skip");
+                    if !writes_through {
+                        self.dirty = true;
+                    }
                     self.status = "applied".into();
                     self.absorb(&reply);
                 }
@@ -944,6 +974,13 @@ fn build_wallpaper_rows(
         value: asked,
         min: 1,
         max: 120,
+    });
+    rows.push(Row::Config {
+        key: "pause_when_covered",
+        label: "pause covered (1=on)",
+        value: ci("pause_when_covered"),
+        min: 0,
+        max: 1,
     });
     rows.push(Row::Config {
         key: "wallpaper_freeze_at",

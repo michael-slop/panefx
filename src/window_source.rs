@@ -131,7 +131,29 @@ pub fn native_fallback() -> Box<dyn WindowSource> {
 
 /// GlazeWM, if it answers right now. For picking it back up after it went away.
 pub fn try_glazewm() -> Option<Box<dyn WindowSource>> {
+    if !glazewm_running() {
+        return None;
+    }
     ipc::IpcThread::spawn().ok().map(|t| Box::new(GlazeSource(t)) as Box<dyn WindowSource>)
+}
+
+/// Is a GlazeWM process running? Asked BEFORE any connect attempt.
+///
+/// Measured on pHub, 2026-10-08: a TCP connect to a localhost port nobody
+/// listens on takes 4 s to be refused (Windows retries, once per address, and
+/// `localhost` is two addresses). The IPC connect runs on the render thread,
+/// so without this the retry froze every backdrop and wallpaper for 4 s every
+/// 10 s once GlazeWM had gone -- and every machine without GlazeWM waited 4 s
+/// at startup. A process list is milliseconds.
+pub fn glazewm_running() -> bool {
+    #[cfg(windows)]
+    {
+        crate::proc_name::map().values().any(|n| n == "glazewm")
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 pub fn connect(pref: Preference) -> anyhow::Result<Box<dyn WindowSource>> {
@@ -159,6 +181,10 @@ fn connect_inner(pref: Preference) -> anyhow::Result<Box<dyn WindowSource>> {
                 ipc::IPC_URL
             )),
         },
+        Preference::Auto if !glazewm_running() => {
+            crate::log_info!("[panefx] window source: native (Win32) -- GlazeWM is not running");
+            Ok(Box::new(NativeSource))
+        }
         Preference::Auto => match ipc::IpcThread::spawn() {
             Ok(t) => {
                 crate::log_info!("[panefx] window source: glazewm");

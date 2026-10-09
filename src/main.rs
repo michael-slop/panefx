@@ -332,7 +332,19 @@ fn main() -> anyhow::Result<()> {
     // The loser tells the winner on its way out, because a guard nobody can
     // observe is how the duplicate problem stayed a mystery. See
     // `single_instance` for the whole argument.
-    let _instance = match panefx::single_instance::acquire() {
+    // Retried for up to 3 s before giving up: the tray's Reload starts the new
+    // daemon while the old one is still exiting, and without the wait the new
+    // one was refused by its own predecessor's lock -- leaving NO daemon. A real
+    // duplicate still exits, just 3 s later.
+    let mut acquired = panefx::single_instance::acquire();
+    for _ in 0..30 {
+        if acquired.is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        acquired = panefx::single_instance::acquire();
+    }
+    let _instance = match acquired {
         Ok(lock) => lock,
         Err(()) => {
             panefx::single_instance::report_refused_to_incumbent(control::DEFAULT_PORT);
@@ -399,6 +411,7 @@ fn main() -> anyhow::Result<()> {
 
     // Themes: the menu, and the tray's copy of it.
     let mut themes = ThemeState::new(&cfg);
+    tray::set_switches(!cfg.pane_off, cfg.transparency, cfg.pause_when_covered);
 
     let mut panels: HashMap<isize, Panel> = HashMap::new();
 
@@ -557,6 +570,18 @@ fn main() -> anyhow::Result<()> {
                     panefx::log_info!("[panefx] exiting on request from the tray");
                     return Ok(());
                 }
+                tray::TrayAction::Switch(key) => {
+                    let now = match key {
+                        "pane_off" => !cfg.pane_off,
+                        "transparency" => !cfg.transparency,
+                        _ => !cfg.pause_when_covered,
+                    };
+                    cfg.set_field(key, &serde_json::json!(now));
+                    if let Err(e) = after_switch(key, &mut cfg, &mut wall, &mut pending_opacity) {
+                        panefx::log_warn!("[panefx] {key}: {e}");
+                    }
+                    force_redraw = true;
+                }
                 tray::TrayAction::Theme(_)
                 | tray::TrayAction::ThemeNext
                 | tray::TrayAction::ThemePrev => {
@@ -598,7 +623,7 @@ fn main() -> anyhow::Result<()> {
                     // Occlusion needs the UNFILTERED list: `reconcile` keeps only
                     // terminals, but a browser or file manager covering the
                     // screen is exactly what should freeze the wallpaper.
-                    wall.observe_windows(&windows, cfg.wallpaper_freeze_at);
+                    wall.observe_windows(&windows, cfg.pause_when_covered.then_some(cfg.wallpaper_freeze_at));
                 }
                 ipc::IpcMessage::LayoutMayHaveChanged => {
                     // No geometry in the event — must ask.
@@ -676,7 +701,21 @@ fn main() -> anyhow::Result<()> {
             wall.poll_monitors(&cfg);
         }
         if needs_query {
-            client.request_windows()?;
+            // Not `?`: GlazeWM quitting between this frame's drain and here
+            // makes the send fail, and `?` returned from main -- the whole
+            // daemon, wallpaper included, gone because a WM exited. Fall back
+            // the same way the `Closed` message does.
+            if let Err(e) = client.request_windows() {
+                if client.name() == "glazewm" {
+                    panefx::log_warn!("[panefx] GlazeWM stopped answering ({e}); following windows through Win32");
+                    client = panefx::window_source::native_fallback();
+                    _win_events = Some(panefx::native_windows::install_hooks());
+                    glaze_lost = Some(Instant::now());
+                    let _ = client.request_windows();
+                } else {
+                    return Err(e);
+                }
+            }
         }
 
         // --- rotate effects, if configured ---
@@ -862,6 +901,44 @@ fn main() -> anyhow::Result<()> {
 // unchanged.
 use animation::{apply_saved_params, rebuild};
 
+/// What a changed setting needs beyond being stored. One place, so the GUI,
+/// the TUI and the tray's switches all behave the same.
+///
+/// The three on/off switches are also WRITTEN THROUGH to config.toml -- just
+/// those keys, not every unsaved tweak -- because a switch flipped from the
+/// tray has no save button next to it, and losing it at the next restart would
+/// make the switch look broken. `theme_skip` is written through for the same
+/// reason.
+fn after_switch(
+    key: &str,
+    cfg: &mut config::Config,
+    wall: &mut wallpaper::WallpaperSet,
+    pending_opacity: &mut Option<(u8, Instant)>,
+) -> Result<(), String> {
+    // Opacity goes out to the terminal's OWN config, which means a file write.
+    // Queued rather than written per keypress: holding L to drag would
+    // otherwise rewrite alacritty.toml ~90 times. `pane_off` and
+    // `transparency` queue one too -- they decide `effective_opacity`.
+    if matches!(key, "opacity" | "pane_off" | "transparency") {
+        *pending_opacity = Some((cfg.effective_opacity(), Instant::now()));
+    }
+    // Pausing switched off: un-freeze every screen now rather than at the next
+    // window event, which may be minutes away.
+    if key == "pause_when_covered" && !cfg.pause_when_covered {
+        wall.observe_windows(&[], None);
+    }
+    if matches!(key, "pane_off" | "transparency" | "pause_when_covered" | "theme_skip") {
+        let mut disk = config::Config::load_file();
+        disk.pane_off = cfg.pane_off;
+        disk.transparency = cfg.transparency;
+        disk.pause_when_covered = cfg.pause_when_covered;
+        disk.theme_skip = cfg.theme_skip.clone();
+        disk.save().map_err(|e| format!("could not save {key}: {e}"))?;
+    }
+    tray::set_switches(!cfg.pane_off, cfg.transparency, cfg.pause_when_covered);
+    Ok(())
+}
+
 /// The daemon's side of themes: the menu, where the apps live, what the last
 /// change did, and which apps are still waiting to be recoloured.
 struct ThemeState {
@@ -950,7 +1027,7 @@ fn apply_theme(
         return Err("no USERPROFILE, so there is nowhere to write themes".into());
     };
     ts.reload(cfg);
-    let mut disk = config::Config::load();
+    let mut disk = config::Config::load_file();
     let report = panefx::themes::switch(&mut disk, &ts.themes, name, &env)?;
     disk.save().map_err(|e| format!("could not save config.toml: {e}"))?;
 
@@ -1166,18 +1243,8 @@ fn handle_command(
             // give me my normal terminal back. `effective_opacity` decides the
             // number; the stored `opacity` is never overwritten, so switching
             // the backdrops back on restores the exact value that was chosen.
-            if key == "opacity" || key == "pane_off" {
-                *pending_opacity = Some((cfg.effective_opacity(), Instant::now()));
-            }
-            // Which apps a theme may touch is decided against the SAVED config
-            // (a theme change starts from disk), so a switch flipped in the GUI
-            // is written through now -- just that key, not every unsaved tweak.
-            if key == "theme_skip" {
-                let mut disk = config::Config::load();
-                disk.theme_skip = cfg.theme_skip.clone();
-                if let Err(e) = disk.save() {
-                    return Reply::err(format!("could not save theme_skip: {e}"));
-                }
+            if let Err(e) = after_switch(&key, cfg, wall, pending_opacity) {
+                return Reply::err(e);
             }
             // The wallpaper grid changed. Without this the new value is stored
             // and read back correctly by `cell_for` -- but the live surfaces
@@ -1187,6 +1254,9 @@ fn handle_command(
             // Rebuild rather than resize in place: `SimKey` includes cols/rows,
             // so a changed grid is a different sim by construction, and
             // `rebuild_surfaces` already tears down and recreates cleanly.
+            if config::parse_wallpaper_effect_key(&key).is_some() {
+                wall.rebuild_surfaces(cfg);
+            }
             if wallpaper::changes_the_grid(&key) {
                 wall.rebuild_surfaces(cfg);
                 panefx::log_info!(
@@ -1253,7 +1323,10 @@ fn handle_command(
             // silently half-works — which is worse than not working.
             wall.rebuild_surfaces(cfg);
             // Same for opacity: the reloaded config may carry a different one.
-            *pending_opacity = Some((cfg.opacity, Instant::now()));
+            // EFFECTIVE, not stored: with transparency or the backdrops off,
+            // reverting must not make the windows see-through again.
+            *pending_opacity = Some((cfg.effective_opacity(), Instant::now()));
+            tray::set_switches(!cfg.pane_off, cfg.transparency, cfg.pause_when_covered);
             Reply::with(snapshot(sim, cfg, wall, ts))
         }
 

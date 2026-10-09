@@ -323,6 +323,10 @@ pub struct ConfigView {
     pub opacity: u8,
     /// Terminal backdrops switched off entirely. The wallpaper is unaffected.
     pub pane_off: bool,
+    #[serde(default)]
+    pub transparency: bool,
+    #[serde(default)]
+    pub pause_when_covered: bool,
     pub wallpaper_fps: u64,
     /// Where window geometry is coming from: `"auto"`, `"glazewm"`, `"native"`.
     ///
@@ -359,6 +363,8 @@ impl ConfigView {
             rotate_secs: cfg.rotate_every.map(|d| d.as_secs()).unwrap_or(0),
             opacity: cfg.opacity,
             pane_off: cfg.pane_off,
+            transparency: cfg.transparency,
+            pause_when_covered: cfg.pause_when_covered,
             wallpaper_fps: cfg.wallpaper_fps,
             window_source: cfg.window_source.clone(),
             wallpaper_freeze_at: cfg.wallpaper_freeze_at,

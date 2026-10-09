@@ -1,6 +1,17 @@
 # Changelog
 
-## 0.2.1 -- wallpaper layers (unreleased)
+## 0.2.1 -- switches and wallpaper layers (unreleased)
+
+### Added
+- **Three switches**, in the GUI's settings tab, the TUI, and ticked in the tray
+  menu. Each saves itself the moment it is flipped:
+  - **backdrops** -- the effects behind your terminal windows (as before).
+  - **transparency** -- see-through windows everywhere, on or off. Off makes
+    Alacritty and Neovide solid while the backdrops keep running; your chosen
+    opacity is kept for when it goes back on.
+  - **pause when covered** -- stop animating a screen while windows cover it
+    (saves CPU), or keep it animating always.
+- Default window opacity is 70% (was 60%). Existing configs keep their value.
 
 ### Fixed
 - **A wallpaper layer could get stuck on a screen.** The UIs address a layer by
@@ -16,6 +27,27 @@
   from the config before the new choice was saved into it, so switching
   plasma -> flames kept drawing plasma. The config is now updated first (and
   rolled back if the screen refuses), and the base is always the effect chosen.
+- **Without GlazeWM, panefx no longer freezes for 4 seconds at a time.** It
+  tried to reconnect to a GlazeWM that was not running every 10 s, on the thread
+  that draws everything, and a refused localhost connection takes 4 s on
+  Windows. It now only connects when a GlazeWM process exists -- which also
+  takes 4 s off every startup on a machine without GlazeWM.
+- GlazeWM quitting at the wrong moment could stop the whole daemon; it now
+  falls back to following windows through Windows itself, as it already did
+  otherwise.
+- `revert` made the windows see-through even with transparency or the
+  backdrops switched off.
+- Clicking a switch in the GUI hid any unsaved changes (the save/revert buttons
+  vanished), and the TUI marked self-saving switches as "*modified".
+- The tray's Reload could leave no daemon running: the new one was refused by
+  the old one's lock while it was still exiting.
+- Saving a switch or a theme could write `PANEFX_*` environment overrides into
+  config.toml; config.toml is now written atomically.
+- In the TUI, cycling a layered screen's effect no longer passes through `off`
+  (which would clear its layers).
+- Explorer's desktop window can never count as covering a screen.
+- The settings tab's hints for "freeze at %" and "bg opacity %" carried stray
+  line breaks and indentation.
 - The log says "standing in for GlazeWM" when GlazeWM goes away, not "by
   configuration".
 

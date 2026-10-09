@@ -145,6 +145,18 @@ pub struct Config {
     /// through keeps animating, and one reduced to a sliver stops.
     pub wallpaper_freeze_at: u32,
 
+    /// Pause a monitor's wallpaper when windows cover it (`wallpaper_freeze_at`
+    /// says how much). Off = animate always, covered or not -- costs CPU for
+    /// frames nobody sees, but some people want the wallpaper to keep moving
+    /// behind a translucent window.
+    pub pause_when_covered: bool,
+
+    /// Make the target windows (Alacritty, Neovide) see-through at `opacity`.
+    /// Off = solid windows everywhere while the backdrops keep running. One of
+    /// two ways to a solid terminal: `pane_off` also forces it, because
+    /// transparency over no backdrop is not what anyone means by "off".
+    pub transparency: bool,
+
     /// Where window geometry comes from: `"auto"`, `"glazewm"` or `"native"`.
     ///
     /// `auto` prefers GlazeWM and falls back to Win32, which is what makes the
@@ -220,11 +232,13 @@ impl Default for Config {
             pad_x: 10,
             pad_y: 8,
             chars_override: None,
-            // 60%: what alacritty.toml used to carry, so the look is unchanged
-            // on first run after this became panefx's job.
-            opacity: 60,
+            // 70%: Michael, 2026-10-08 -- "transparency set at 70% ig". Was 60,
+            // what alacritty.toml carried before opacity became panefx's job.
+            opacity: 70,
             effect_params: Default::default(),
             pane_off: false,
+            pause_when_covered: true,
+            transparency: true,
             wallpaper_effect_params: Default::default(),
             wallpaper_monitor_params: Default::default(),
             // Half the terminal rate. The desktop is scenery.
@@ -374,7 +388,7 @@ impl Config {
     /// backdrops off, switch them back on, and the carefully chosen 80% would
     /// have become 100% with no way to know what it used to be.
     pub fn effective_opacity(&self) -> u8 {
-        if self.pane_off {
+        if self.pane_off || !self.transparency {
             100
         } else {
             self.opacity
@@ -386,6 +400,22 @@ impl Config {
         std::env::var("USERPROFILE")
             .ok()
             .map(|h| std::path::PathBuf::from(h).join(".config\\panefx\\config.toml"))
+    }
+
+    /// The config FILE only -- no `PANEFX_*` environment layer.
+    ///
+    /// For read-modify-write of config.toml (a switch or a theme written
+    /// through). `load()` would fold in any env overrides, and saving that
+    /// would write them into the file as if the user had chosen them.
+    pub fn load_file() -> Self {
+        let mut cfg = Config::default();
+        if let Some(p) = Config::path() {
+            if let Ok(text) = std::fs::read_to_string(&p) {
+                cfg.apply_toml(&text);
+            }
+        }
+        cfg.normalise();
+        cfg
     }
 
     pub fn load() -> Self {
@@ -620,6 +650,8 @@ impl Config {
                     }
                 }
                 "pane_off" => self.pane_off = v.eq_ignore_ascii_case("true"),
+                "pause_when_covered" => self.pause_when_covered = !v.eq_ignore_ascii_case("false"),
+                "transparency" => self.transparency = !v.eq_ignore_ascii_case("false"),
                 "wallpaper_fps" => {
                     if let Ok(n) = v.parse::<u64>() {
                         if n > 0 && n <= 120 {
@@ -815,7 +847,7 @@ impl Config {
         s.push_str("# the window manager optional rather than required.\n");
         s.push_str(&format!("window_source = \"{}\"\n", self.window_source));
 
-        s.push_str("\n# Backdrop behind a 60%-opaque terminal: extra frames are close to\n");
+        s.push_str("\n# Backdrop behind a see-through terminal: extra frames are close to\n");
         s.push_str("# invisible, and renderer cost is per-frame per-panel.\n");
         s.push_str(&format!("fps = {}\n", self.fps));
 
@@ -867,6 +899,8 @@ impl Config {
         s.push_str(&format!("opacity = {}\n", self.opacity));
         s.push_str(&format!("pane_off = {}
 ", self.pane_off));
+        s.push_str("\n# Off = solid windows everywhere; the backdrops keep running behind them.\n");
+        s.push_str(&format!("transparency = {}\n", self.transparency));
 
         // Written only when they say something: on the house theme with every
         // target on, the file is exactly what it was before themes existed.
@@ -903,6 +937,8 @@ impl Config {
             "wallpaper_freeze_at = {}\n",
             self.wallpaper_freeze_at
         ));
+        s.push_str("# Off = keep animating even when covered (costs CPU for frames nobody sees).\n");
+        s.push_str(&format!("pause_when_covered = {}\n", self.pause_when_covered));
         s.push_str("\n# A wallpaper has no terminal text to line up with, so it does NOT\n");
         s.push_str("# use cell_w/cell_h above. 15x23 keeps a 1440x2560 portrait at ~10k\n");
         s.push_str("# cells instead of ~24k.\n");
@@ -1034,7 +1070,11 @@ impl Config {
         if let Some(dir) = p.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        std::fs::write(&p, self.to_toml())?;
+        // Temp file + rename: a crash or a second writer mid-save must never
+        // leave a half-written config, which loads as defaults.
+        let tmp = p.with_extension("toml.panefx-tmp");
+        std::fs::write(&tmp, self.to_toml())?;
+        std::fs::rename(&tmp, &p)?;
         Ok(p)
     }
 
@@ -1266,6 +1306,27 @@ impl Config {
                 }
                 None => false,
             },
+            // Strict: a bool, 0/1, or the words true/false. Anything else is
+            // refused rather than quietly read as "off".
+            "pause_when_covered" | "transparency" => match v
+                .as_bool()
+                .or_else(|| as_i64().filter(|n| *n == 0 || *n == 1).map(|n| n == 1))
+                .or_else(|| match as_str()?.trim().to_lowercase().as_str() {
+                    "true" => Some(true),
+                    "false" => Some(false),
+                    _ => None,
+                })
+            {
+                Some(b) => {
+                    if key == "transparency" {
+                        self.transparency = b;
+                    } else {
+                        self.pause_when_covered = b;
+                    }
+                    true
+                }
+                None => false,
+            },
             "wallpaper_fps" => matches!(as_i64(), Some(n) if n > 0 && n <= 120).then(|| {
                 self.wallpaper_fps = as_i64().unwrap() as u64;
             }).is_some(),
@@ -1311,8 +1372,9 @@ impl Config {
                     if s != "off" && !crate::animation::EFFECTS.contains(&s.as_str()) {
                         return false;
                     }
-                    self.wallpaper_effects
-                        .insert(parse_wallpaper_effect_key(k).unwrap(), s);
+                    // Through set_wallpaper_base, so the layer rules hold here
+                    // too (an `off` base clears its layers).
+                    self.set_wallpaper_base(parse_wallpaper_effect_key(k).unwrap(), &s);
                     true
                 }
                 _ => false,
@@ -1808,6 +1870,35 @@ ink = \"#0000ff\"");
     }
 
     #[test]
+    fn the_switches_default_on_and_round_trip() {
+        let c = Config::default();
+        assert!(c.pause_when_covered && c.transparency, "both default ON: nothing changes for anyone");
+        assert_eq!(c.opacity, 70);
+        let mut c = Config::default();
+        assert!(c.set_field("transparency", &serde_json::json!(false)));
+        assert!(c.set_field("pause_when_covered", &serde_json::json!(0)));
+        let mut back = Config::default();
+        back.apply_toml(&c.to_toml());
+        assert!(!back.transparency && !back.pause_when_covered, "{}", c.to_toml());
+        assert!(c.set_field("transparency", &serde_json::json!("true")));
+        assert!(c.transparency);
+        assert!(!c.set_field("transparency", &serde_json::json!("maybe")), "nonsense is refused");
+    }
+
+    #[test]
+    fn transparency_off_makes_windows_solid_but_keeps_the_chosen_opacity() {
+        let mut c = Config::default();
+        c.opacity = 55;
+        c.transparency = false;
+        assert_eq!(c.effective_opacity(), 100);
+        assert_eq!(c.opacity, 55, "the chosen value is kept for when it is switched back on");
+        c.transparency = true;
+        assert_eq!(c.effective_opacity(), 55);
+        c.pane_off = true;
+        assert_eq!(c.effective_opacity(), 100, "backdrops off still means solid");
+    }
+
+    #[test]
     fn pane_off_round_trips_and_accepts_an_int() {
         // The TUI renders it as an ordinary numeric row, so 0/1 has to work as
         // well as a bool -- otherwise the switch silently does nothing.
@@ -1998,6 +2089,16 @@ ink = \"#0000ff\"");
         assert!(c.wallpaper_stack(4).is_empty());
         c.set_wallpaper_base(4, "rain");
         assert_eq!(c.wallpaper_stack(4), vec!["rain".to_string()], "the skull does not come back");
+    }
+
+    #[test]
+    fn setting_a_screen_off_by_key_follows_the_layer_rules() {
+        let mut c = Config::default();
+        c.set_wallpaper_layer(2, 0, "flames");
+        c.set_wallpaper_layer(2, 1, "rain");
+        assert!(c.set_field("wallpaper_2_effect", &serde_json::json!("off")));
+        assert!(c.wallpaper_stack(2).is_empty());
+        assert!(c.wallpaper_layers.get(&2).is_none(), "no layer left to resurface under the next base");
     }
 
     #[test]

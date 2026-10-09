@@ -342,7 +342,13 @@ impl App {
                 // Anything that is not a read or a write-to-disk leaves the
                 // daemon's live state ahead of config.toml.
                 let cmd = msg.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
+                // The switches and theme_skip save themselves in the daemon:
+                // they neither create nor clear unsaved changes.
+                let key = msg.get("key").and_then(|v| v.as_str()).unwrap_or("");
+                let writes_through = cmd == "set"
+                    && matches!(key, "pane_off" | "transparency" | "pause_when_covered" | "theme_skip");
                 match cmd {
+                    _ if writes_through => {}
                     // A theme change saves itself.
                     "get" | "logs" | "theme" => {}
                     "save" | "revert" => self.dirty = false,
@@ -1302,16 +1308,14 @@ impl App {
             // 1..100, never 0: a zero would freeze an empty desktop, which is
             // the one moment the wallpaper is the only thing on screen.
             ("wallpaper_freeze_at", "freeze at %", 1, 100,
-             "stop animating a screen once windows cover this much of it. 
-              100 means only when every pixel is covered -- which, with any
-              gap configured, never happens."),
+             "when pausing is on: stop animating a screen once windows cover this much of it. 100 = only when every pixel is covered, which with any gap never happens."),
             // Range from the DAEMON's own constants, not a guess. It rejects
             // anything below the floor rather than clamping, so a slider that
             // went lower would move and change nothing -- which is exactly how
             // this looked "locked at 35%".
             ("opacity", "bg opacity %", panefx::opacity::MIN_PERCENT as i64,
              panefx::opacity::MAX_PERCENT as i64,
-             "background of the windows panefx draws behind. Text stays solid. \n              Below the floor, DWM re-composites continuously and the display tears."),
+             "how see-through the windows are when transparency is on. Text stays solid. Below the floor the display tears."),
             ("cell_w", "cell width", 1, 64, "the character cell. Effects that want their own size are overridden by this."),
             ("cell_h", "cell height", 1, 64, ""),
             ("pad_x", "pad x", 0, 100, ""),
@@ -1420,40 +1424,60 @@ impl App {
         }
 
         ui.add_space(12.0);
-        // backdrops on/off is a toggle, not a range -- a 0..1 fader would be a
-        // strange way to spell a switch.
-        let off = self
-            .snap
-            .get("config")
-            .and_then(|c| c.get("pane_off"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        ui.horizontal(|ui| {
-            ui.allocate_ui(Vec2::new(label_w, 22.0), |ui| {
-                ui.label(egui::RichText::new("backdrops").size(12.0));
+        // The switches are toggles, not ranges -- a 0..1 fader would be a
+        // strange way to spell a switch. They save themselves (the daemon
+        // writes them through), so they do not mark the window unsaved.
+        let flag = |k: &str, d: bool| {
+            self.snap
+                .get("config")
+                .and_then(|c| c.get(k))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(d)
+        };
+        // (key, label, is ON, value to send when clicked, hint)
+        let backdrops_on = !flag("pane_off", false);
+        let transparency_on = flag("transparency", true);
+        let pause_on = flag("pause_when_covered", true);
+        let switches = [
+            ("pane_off", "backdrops", backdrops_on, backdrops_on,
+             "the effects drawn behind your terminal windows. Off also makes the windows solid."),
+            ("transparency", "transparency", transparency_on, !transparency_on,
+             "see-through windows at the opacity above. Off = solid windows, backdrops keep running."),
+            ("pause_when_covered", "pause when covered", pause_on, !pause_on,
+             "stop animating a screen while windows cover it (saves CPU). Off = always animate."),
+        ];
+        for (key, label, on, send, hint) in switches {
+            ui.horizontal(|ui| {
+                ui.allocate_ui(Vec2::new(label_w, 22.0), |ui| {
+                    ui.label(egui::RichText::new(label).size(12.0));
+                });
+                let (rect, resp) =
+                    ui.allocate_exact_size(Vec2::new(90.0, 22.0), egui::Sense::click());
+                // Pushed in when ON, matching every other toggle in the window.
+                win98::bevel(
+                    ui.painter(),
+                    rect,
+                    win98::toggle_bevel(on),
+                    p,
+                    Some(win98::toggle_face(on, p)),
+                );
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    if on { "on" } else { "off" },
+                    egui::FontId::new(win98::size::TEXT, egui::FontFamily::Monospace),
+                    p.text,
+                );
+                if resp.clicked() {
+                    self.send(serde_json::json!({"cmd":"set","key":key,"val": send}));
+                }
             });
-            let (rect, resp) =
-                ui.allocate_exact_size(Vec2::new(90.0, 22.0), egui::Sense::click());
-            // Pushed in when ON, matching every other toggle in the window.
-            win98::bevel(
-                ui.painter(),
-                rect,
-                win98::toggle_bevel(!off),
-                p,
-                Some(win98::toggle_face(!off, p)),
-            );
-            ui.painter().text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                if off { "off" } else { "on" },
-                egui::FontId::new(win98::size::TEXT, egui::FontFamily::Monospace),
-                p.text,
-            );
-            if resp.clicked() {
-                self.send(serde_json::json!({"cmd":"set","key":"pane_off","val": !off}));
-                self.dirty = true;
-            }
-        });
+            ui.horizontal(|ui| {
+                ui.add_space(label_w + 4.0);
+                ui.label(egui::RichText::new(hint).size(10.0).color(p.muted));
+            });
+            ui.add_space(4.0);
+        }
     }
 
     fn on_house(&self) -> bool {
@@ -1628,9 +1652,9 @@ impl App {
             } else {
                 skip.push(id);
             }
+            // Written through to config.toml by the daemon; `send` leaves the
+            // unsaved flag alone for it.
             self.send(serde_json::json!({"cmd":"set","key":"theme_skip","val":skip.join(",")}));
-            // Written through to config.toml by the daemon.
-            self.dirty = false;
         }
     }
 

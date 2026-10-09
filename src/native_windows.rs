@@ -76,6 +76,14 @@ pub fn keeps(w: &RawWindow) -> bool {
     if !w.visible {
         return false;
     }
+    // Explorer's desktop itself. Measured 2026-10-08: Progman spans the whole
+    // virtual screen (6400x1800 on pHub) and is excluded today only because it
+    // carries WS_EX_TOOLWINDOW. If a Windows update dropped that bit, every
+    // monitor would read 100% covered and the wallpaper would freeze forever
+    // -- named here so it cannot.
+    if matches!(w.class_name.as_str(), "Progman" | "WorkerW") {
+        return false;
+    }
     // Owned: a helper belonging to a real window, never a window in its own
     // right. Both IME entries are caught here as well.
     if w.owned {
@@ -371,6 +379,15 @@ mod tests {
             width: 2398,
             height: 1556,
         }
+    }
+
+    /// Explorer's desktop must never count as a window covering a screen,
+    /// even if a Windows update drops the tool-window bit it carries today.
+    #[test]
+    fn the_desktop_itself_never_covers_a_screen() {
+        assert!(!keeps(&raw("Progman", true, false, false)));
+        assert!(!keeps(&raw("WorkerW", true, false, false)));
+        assert!(keeps(&raw("Window Class", true, false, false)), "a real window still counts");
     }
 
     /// The measured capture from the module header, as a test.

@@ -651,7 +651,7 @@ impl WallpaperSet {
     /// Must be handed the UNFILTERED list: a terminal-only view would miss every
     /// browser and file manager, which are exactly the windows that cover a
     /// desktop.
-    pub fn observe_windows(&mut self, windows: &[ipc::Window], freeze_at: u32) {
+    pub fn observe_windows(&mut self, windows: &[ipc::Window], freeze_at: Option<u32>) {
         for s in self.surfaces.iter_mut() {
             // An `off` monitor has no panel and no simulation, so whether it is
             // covered is a question with no consumer. Skip the scanline entirely
@@ -661,7 +661,8 @@ impl WallpaperSet {
                 s.occluded = false;
                 continue;
             }
-            let now = is_occluded_at(&s.monitor, windows, freeze_at);
+            // `None` = pausing is switched off: never covered, always drawn.
+            let now = freeze_at.is_some_and(|at| is_occluded_at(&s.monitor, windows, at));
             if s.occluded && !now {
                 // Coming back into view: force one draw, because the sim may
                 // report unchanged on this frame and leave a stale bitmap.
@@ -1075,7 +1076,7 @@ mod tests {
         set.surfaces[0].effect = OFF.to_string();
         set.surfaces[0].panel = None;
         let covering = [win(0, 0, 1920, 1080, "tiling", "shown")];
-        set.observe_windows(&covering, 100);
+        set.observe_windows(&covering, Some(100));
         assert!(
             !set.surfaces[0].occluded,
             "an off monitor has no surface to freeze"
