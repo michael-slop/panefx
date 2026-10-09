@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.1 -- switches and wallpaper layers (unreleased)
+## 0.2.1 -- switches and wallpaper layers (2026-10-08)
 
 ### Added
 - **Three switches**, in the GUI's settings tab, the TUI, and ticked in the tray
